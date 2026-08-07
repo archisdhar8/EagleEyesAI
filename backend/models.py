@@ -76,7 +76,7 @@ class Scenario(BaseModel):
 
 
 class AnalysisRequest(BaseModel):
-    portfolio_id: int | None = None
+    portfolio_id: str | int | None = None
     portfolio: PortfolioPayload | None = None
     profile: InvestorProfile | None = None
 
@@ -85,4 +85,3 @@ class ExplanationRequest(BaseModel):
     provider: Literal["disabled", "ollama", "openai_compatible"] = "disabled"
     endpoint: str | None = None
     model: str | None = None
-

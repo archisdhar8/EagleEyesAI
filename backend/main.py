@@ -52,7 +52,8 @@ class CsvImport(BaseModel):
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "mode": "local-only", "trading_enabled": False}
+    mode = database.storage_mode()
+    return {"status": "ok", "mode": mode, "storage": mode, "trading_enabled": False}
 
 
 @app.get("/api/overview")
@@ -64,7 +65,7 @@ def overview() -> dict[str, Any]:
     holdings = portfolio["holdings"] if portfolio else []
     tickers = [holding["ticker"] for holding in holdings] + profile.get("watchlist", [])
     research = security_research(tickers)
-    return {"portfolio": portfolio, "profile": profile, "macro": latest_macro(), "scenarios": scenarios, "research": research}
+    return {"portfolio": portfolio, "profile": profile, "macro": latest_macro(), "scenarios": scenarios, "research": research, "storage": database.storage_mode()}
 
 
 @app.get("/api/portfolios")
@@ -78,7 +79,7 @@ def create_portfolio(payload: PortfolioPayload) -> dict[str, Any]:
 
 
 @app.put("/api/portfolios/{portfolio_id}")
-def update_portfolio(portfolio_id: int, payload: PortfolioPayload) -> dict[str, Any]:
+def update_portfolio(portfolio_id: str, payload: PortfolioPayload) -> dict[str, Any]:
     try:
         return database.save_portfolio(payload.name, [item.model_dump(mode="json") for item in payload.holdings], portfolio_id)
     except KeyError as exc:

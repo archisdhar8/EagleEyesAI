@@ -43,7 +43,7 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
-  const [portfolioId, setPortfolioId] = useState<number | null>(null);
+  const [portfolioId, setPortfolioId] = useState<string | number | null>(null);
   const [portfolioName, setPortfolioName] = useState("Primary portfolio");
   const [holdings, setHoldings] = useState<Holding[]>([
     { ticker: "AAPL", weight: .28, account_type: "taxable" }, { ticker: "MU", weight: .22, account_type: "taxable" },
@@ -93,7 +93,7 @@ export default function Dashboard() {
       const url = portfolioId ? `${API}/portfolios/${portfolioId}` : `${API}/portfolios`;
       const response = await fetch(url, { method: portfolioId ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: portfolioName, holdings: holdings.map(cleanHolding) }) });
       if (!response.ok) throw new Error(await response.text());
-      const saved = await response.json(); setPortfolioId(saved.id); setConnected(true); setNotice("Portfolio saved locally.");
+      const saved = await response.json(); setPortfolioId(saved.id); setConnected(true); setNotice("Portfolio saved.");
     } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to save portfolio."); }
     finally { setBusy(""); }
   }
@@ -104,7 +104,7 @@ export default function Dashboard() {
     try {
       const response = await fetch(`${API}/portfolios/import`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: file.name.replace(/\.csv$/i, ""), csv_text: await file.text() }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.detail || "CSV validation failed");
-      setPortfolioId(data.portfolio.id); setPortfolioName(data.portfolio.name); setHoldings(data.portfolio.holdings); setNotice(`${data.validated_rows} holdings validated and saved locally.`); setConnected(true);
+      setPortfolioId(data.portfolio.id); setPortfolioName(data.portfolio.name); setHoldings(data.portfolio.holdings); setNotice(`${data.validated_rows} holdings validated and saved.`); setConnected(true);
     } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to import CSV."); }
     finally { setBusy(""); event.target.value = ""; }
   }
@@ -151,7 +151,7 @@ export default function Dashboard() {
           {nav.map(([key, icon, label]) => <button key={key} className={tab === key ? "active" : ""} onClick={() => setTab(key)}><span aria-hidden>{icon}</span>{label}</button>)}
         </nav>
         <div className="sidebar-foot">
-          <div className={`connection ${connected ? "online" : ""}`}><i />{connected ? "Local engine connected" : "Local engine offline"}</div>
+          <div className={`connection ${connected ? "online" : ""}`}><i />{connected ? "Research engine connected" : "Research engine offline"}</div>
           <button className="theme-button" onClick={toggleTheme}>{dark ? "☀" : "◐"} {dark ? "Light mode" : "Dark mode"}</button>
           <p>Research sandbox<br />Trading is disabled</p>
         </div>
@@ -207,7 +207,7 @@ function PanelHead({ eyebrow, title, action, onClick }: { eyebrow: string; title
 function Portfolio({ holdings, setHoldings, name, setName, total, onSave, onImport }: { holdings: Holding[]; setHoldings: (rows: Holding[]) => void; name: string; setName: (v:string) => void; total: number; onSave: () => void; onImport: (e: ChangeEvent<HTMLInputElement>) => void }) {
   const update = (index: number, key: keyof Holding, value: string) => setHoldings(holdings.map((row, i) => i === index ? { ...row, [key]: key === "ticker" || key === "account_type" || key === "acquisition_date" ? value : value === "" ? null : Number(value) } : row));
   return <section className="workspace"><div className="section-intro"><div><span className="kicker">Your source of truth</span><h2>Build the portfolio you want to examine.</h2><p>Use weights for a quick analysis, or add market value and aggregate cost basis for tax estimates.</p></div><div className={`weight-status ${Math.abs(total - 1) < .001 ? "valid" : ""}`}><span>Entered weights</span><strong>{pct(total, 1)}</strong><small>{Math.abs(total - 1) < .001 ? "Ready" : "Weights will be normalized"}</small></div></div>
-    <div className="panel portfolio-panel"><div className="portfolio-toolbar"><label>Portfolio name<input value={name} onChange={e => setName(e.target.value)} /></label><div><label className="upload-button">Import CSV<input type="file" accept=".csv,text/csv" onChange={onImport} /></label><button className="secondary" onClick={() => setHoldings([...holdings, { ticker: "", weight: 0, account_type: "taxable" }])}>+ Add holding</button><button className="primary" onClick={onSave}>Save locally</button></div></div>
+    <div className="panel portfolio-panel"><div className="portfolio-toolbar"><label>Portfolio name<input value={name} onChange={e => setName(e.target.value)} /></label><div><label className="upload-button">Import CSV<input type="file" accept=".csv,text/csv" onChange={onImport} /></label><button className="secondary" onClick={() => setHoldings([...holdings, { ticker: "", weight: 0, account_type: "taxable" }])}>+ Add holding</button><button className="primary" onClick={onSave}>Save portfolio</button></div></div>
       <div className="table-scroll"><table className="holdings-table"><thead><tr><th>Ticker</th><th>Weight</th><th>Market value</th><th>Cost basis</th><th>Account</th><th>Acquired</th><th /></tr></thead><tbody>{holdings.map((row, i) => <tr key={`${row.ticker}-${i}`}><td><input className="ticker-input" value={row.ticker} onChange={e => update(i, "ticker", e.target.value.toUpperCase())} placeholder="Ticker" /></td><td><input type="number" step="0.01" value={row.weight ?? ""} onChange={e => update(i, "weight", e.target.value)} placeholder="0.10" /></td><td><input type="number" value={row.market_value ?? ""} onChange={e => update(i, "market_value", e.target.value)} placeholder="$" /></td><td><input type="number" value={row.cost_basis ?? ""} onChange={e => update(i, "cost_basis", e.target.value)} placeholder="Optional" /></td><td><select value={row.account_type} onChange={e => update(i, "account_type", e.target.value)}><option value="taxable">Taxable</option><option value="traditional_ira">Traditional IRA</option><option value="roth_ira">Roth IRA</option><option value="401k">401(k)</option><option value="other">Other</option></select></td><td><input type="date" value={row.acquisition_date || ""} onChange={e => update(i, "acquisition_date", e.target.value)} /></td><td><button className="remove" onClick={() => setHoldings(holdings.filter((_, idx) => idx !== i))} aria-label={`Remove ${row.ticker}`}>×</button></td></tr>)}</tbody></table></div>
       <div className="csv-hint"><strong>CSV columns</strong><code>ticker, weight, market_value, cost_basis, account_type, acquisition_date</code><span>Provide shares, weight, or market value for each row.</span></div>
     </div>
