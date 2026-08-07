@@ -442,3 +442,158 @@ def load_analysis(run_id: str) -> dict[str, Any]:
     if row is None:
         raise KeyError(run_id)
     return json.loads(row["result_json"])
+
+
+def latest_analysis() -> dict[str, Any] | None:
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                """SELECT result_snapshot FROM public.analysis_runs
+                WHERE status = 'completed' ORDER BY created_at DESC LIMIT 1"""
+            ).fetchone()
+        return None if row is None else row["result_snapshot"]
+
+    with sqlite_connection() as conn:
+        row = conn.execute(
+            "SELECT result_json FROM analysis_runs ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    return None if row is None else json.loads(row["result_json"])
+
+
+def provider_data_status() -> dict[str, Any]:
+    if not DATABASE_URL:
+        return {"storage": "sqlite", "counts": {}, "freshness": {}, "providers": []}
+    with postgres_connection() as conn:
+        counts = conn.execute(
+            """SELECT
+            (SELECT count(*) FROM public.price_bars) AS price_bars,
+            (SELECT count(*) FROM public.macro_observations) AS macro_observations,
+            (SELECT count(*) FROM public.fundamental_periods) AS fundamental_periods,
+            (SELECT count(*) FROM public.documents WHERE document_type='news') AS news_documents,
+            (SELECT count(*) FROM public.prediction_market_snapshots) AS market_snapshots"""
+        ).fetchone()
+        freshness = conn.execute(
+            """SELECT
+            (SELECT max(ts) FROM public.price_bars) AS prices,
+            (SELECT max(observation_date) FROM public.macro_observations) AS macro,
+            (SELECT max(period_end) FROM public.fundamental_periods) AS fundamentals,
+            (SELECT max(published_at) FROM public.documents WHERE document_type='news') AS news,
+            (SELECT max(observed_at) FROM public.prediction_market_snapshots) AS markets"""
+        ).fetchone()
+        providers = conn.execute(
+            """SELECT DISTINCT ON (provider) provider, status, fetched_at, as_of,
+            metadata, error_message FROM public.provider_fetches
+            ORDER BY provider, fetched_at DESC"""
+        ).fetchall()
+    return {
+        "storage": "supabase",
+        "counts": {key: int(value or 0) for key, value in counts.items()},
+        "freshness": {key: _iso(value) for key, value in freshness.items()},
+        "providers": [
+            {
+                "provider": row["provider"], "status": row["status"],
+                "fetched_at": _iso(row["fetched_at"]), "as_of": _iso(row["as_of"]),
+                "metadata": row["metadata"] or {}, "error": row["error_message"],
+            }
+            for row in providers
+        ],
+    }
+
+
+def macro_observation_history(series_ids: list[str], limit_per_series: int = 18) -> list[dict[str, Any]]:
+    if not DATABASE_URL or not series_ids:
+        return []
+    with postgres_connection() as conn:
+        rows = conn.execute(
+            """SELECT series_id, observation_date, vintage_date, value, provider, source_url
+            FROM (
+              SELECT series_id, observation_date, vintage_date, value, provider, source_url,
+              row_number() OVER (
+                PARTITION BY series_id ORDER BY observation_date DESC, vintage_date DESC,
+                CASE WHEN provider='FRED' THEN 0 ELSE 1 END
+              ) AS position
+              FROM public.macro_observations WHERE series_id = ANY(%s)
+            ) observations WHERE position <= %s
+            ORDER BY series_id, observation_date DESC, vintage_date DESC""",
+            (series_ids, limit_per_series),
+        ).fetchall()
+    return [
+        {
+            "series_id": row["series_id"], "date": _iso(row["observation_date"]),
+            "vintage_date": _iso(row["vintage_date"]), "value": _number(row["value"]),
+            "provider": row["provider"], "source_url": row["source_url"],
+        }
+        for row in rows
+    ]
+
+
+def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
+    normalized = sorted({ticker.strip().upper() for ticker in tickers if ticker.strip() and ticker.upper() != "CASH"})
+    if not DATABASE_URL or not normalized:
+        return {"securities": [], "fundamentals": [], "prices": [], "news": []}
+    with postgres_connection() as conn:
+        securities = conn.execute(
+            """SELECT id, ticker, asset_type, company_name, sector, industry, updated_at
+            FROM public.securities WHERE ticker = ANY(%s) AND active=true""",
+            (normalized,),
+        ).fetchall()
+        fundamentals = conn.execute(
+            """SELECT ticker, period_end, fiscal_period, fiscal_year, metrics,
+            data_quality_score, source_url, fetched_at FROM (
+              SELECT s.ticker, f.period_end, f.fiscal_period, f.fiscal_year, f.metrics,
+              f.data_quality_score, f.source_url, f.fetched_at,
+              row_number() OVER (PARTITION BY s.ticker ORDER BY f.period_end DESC, f.fetched_at DESC) AS position
+              FROM public.fundamental_periods f JOIN public.securities s ON s.id=f.security_id
+              WHERE s.ticker = ANY(%s)
+            ) periods WHERE position <= 8 ORDER BY ticker, period_end DESC""",
+            (normalized,),
+        ).fetchall()
+        prices = conn.execute(
+            """SELECT ticker, ts, close, volume, fetched_at FROM (
+              SELECT s.ticker, p.ts, p.close, p.volume, p.fetched_at,
+              row_number() OVER (PARTITION BY s.ticker ORDER BY p.ts DESC) AS position
+              FROM public.price_bars p JOIN public.securities s ON s.id=p.security_id
+              WHERE s.ticker = ANY(%s) AND p.interval='1d'
+            ) bars WHERE position <= %s ORDER BY ticker, ts""",
+            (normalized, price_limit),
+        ).fetchall()
+        news = conn.execute(
+            """SELECT ticker, title, source_url, published_at, metadata, fetched_at FROM (
+              SELECT s.ticker, d.title, d.source_url, d.published_at, d.metadata, d.fetched_at,
+              row_number() OVER (PARTITION BY s.ticker ORDER BY d.published_at DESC NULLS LAST) AS position
+              FROM public.document_securities ds
+              JOIN public.securities s ON s.id=ds.security_id
+              JOIN public.documents d ON d.id=ds.document_id
+              WHERE s.ticker = ANY(%s) AND d.document_type='news'
+            ) items WHERE position <= 25 ORDER BY ticker, published_at DESC NULLS LAST""",
+            (normalized,),
+        ).fetchall()
+    return {
+        "securities": [
+            {**dict(row), "id": str(row["id"]), "updated_at": _iso(row["updated_at"])}
+            for row in securities
+        ],
+        "fundamentals": [
+            {
+                **dict(row), "period_end": _iso(row["period_end"]),
+                "fetched_at": _iso(row["fetched_at"]),
+                "data_quality_score": _number(row["data_quality_score"]),
+            }
+            for row in fundamentals
+        ],
+        "prices": [
+            {
+                "ticker": row["ticker"], "date": _iso(row["ts"]),
+                "close": _number(row["close"]), "volume": _number(row["volume"]),
+                "fetched_at": _iso(row["fetched_at"]),
+            }
+            for row in prices
+        ],
+        "news": [
+            {
+                **dict(row), "published_at": _iso(row["published_at"]),
+                "fetched_at": _iso(row["fetched_at"]),
+            }
+            for row in news
+        ],
+    }

@@ -9,6 +9,13 @@ def test_health_reports_storage_and_disables_trading() -> None:
     assert payload == {"status": "ok", "mode": "sqlite", "storage": "sqlite", "trading_enabled": False}
 
 
+def test_provider_status_has_safe_sqlite_fallback() -> None:
+    with TestClient(app) as client:
+        response = client.get("/api/providers/status")
+    assert response.status_code == 200
+    assert response.json() == {"storage": "sqlite", "counts": {}, "freshness": {}, "providers": []}
+
+
 def test_csv_import_validation() -> None:
     with TestClient(app) as client:
         response = client.post("/api/portfolios/import", json={"name": "Test", "csv_text": "ticker,weight,account_type\nSPY,0.6,taxable\nBND,0.4,traditional_ira\n"})

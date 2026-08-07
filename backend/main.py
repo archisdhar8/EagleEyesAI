@@ -65,7 +65,11 @@ def overview() -> dict[str, Any]:
     holdings = portfolio["holdings"] if portfolio else []
     tickers = [holding["ticker"] for holding in holdings] + profile.get("watchlist", [])
     research = security_research(tickers)
-    return {"portfolio": portfolio, "profile": profile, "macro": latest_macro(), "scenarios": scenarios, "research": research, "storage": database.storage_mode()}
+    return {
+        "portfolio": portfolio, "profile": profile, "macro": latest_macro(),
+        "scenarios": scenarios, "research": research, "storage": database.storage_mode(),
+        "data_status": database.provider_data_status(), "latest_analysis": database.latest_analysis(),
+    }
 
 
 @app.get("/api/portfolios")
@@ -127,6 +131,11 @@ def put_profile(profile: InvestorProfile) -> dict[str, Any]:
 @app.post("/api/providers/refresh")
 def refresh_providers(force: bool = Query(default=True)) -> dict[str, Any]:
     return refresh_scenarios(force=force)
+
+
+@app.get("/api/providers/status")
+def provider_status() -> dict[str, Any]:
+    return database.provider_data_status()
 
 
 @app.get("/api/scenarios")

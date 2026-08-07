@@ -7,10 +7,13 @@ const API = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
 type Tab = "overview" | "portfolio" | "scenarios" | "research" | "optimize";
 type Holding = { ticker: string; shares?: number | null; weight?: number | null; market_value?: number | null; cost_basis?: number | null; account_type: string; acquisition_date?: string | null };
 type Scenario = { key: string; label: string; probability: number; confidence: number; change_1d?: number | null; change_1w?: number | null; change_1m?: number | null; indicators: string[]; sources: string[]; as_of: string; is_prior: boolean };
-type Research = { ticker: string; company: string; sector: string; industry: string; final_score: number; growth_rating: number; valuation_score: number; fundamental_score: number; industry_score: number; technical_score: number; news_score: number; confidence: number; data_quality: string; risk_flags: string[]; source?: string };
+type Research = { ticker: string; company: string; sector: string; industry: string; final_score: number; growth_rating: number; valuation_score: number; fundamental_score: number; industry_score: number; technical_score: number; news_score: number; confidence: number; data_quality: string; risk_flags: string[]; source?: string; price?: number | null; price_change_1y?: number | null; price_as_of?: string | null; fundamentals_as_of?: string | null; revenue_growth?: number | null; net_margin?: number | null; news_count?: number; latest_news?: { title: string; source_url?: string | null; published_at?: string | null } | null; data_source?: string };
 type Profile = { age: number; retirement_age: number; horizon_years: number; account_type: string; annual_contribution: number; annual_withdrawal: number; target_value: number; tax_rate: number; risk_tolerance: number; preset: string; restrictions: string[]; watchlist: string[]; objectives: Record<string, number>; llm_provider: string; llm_endpoint?: string | null; llm_model?: string | null };
 type Alternative = { name: string; expected_return: number; volatility: number; drawdown_range: number[]; turnover: number; effective_holdings: number; tradeoff: string; constraint_status: string; conflicts: string[]; allocations: Array<{ ticker: string; current_weight: number; target_weight: number; target_min: number; target_max: number; delta: number; reason: string }>; scenario_outcomes: Array<{ label: string; probability: number; estimated_return: number }>; projection: { nominal_p10: number; nominal_p50: number; nominal_p90: number; real_p50: number; goal_probability: number; assumptions: string }; tax: { available: boolean; estimated_realized_gain: number | null; estimated_tax: number | null; note: string } };
-type Analysis = { id: string; created_at: string; macro: { regime: string; score: number; as_of: string | null }; scenarios: Scenario[]; research: Research[]; alternatives: Alternative[]; portfolio_value: number; warnings: string[]; scenario_warnings: string[] };
+type Macro = { regime: string; score: number; as_of: string | null; source?: string; metrics?: Record<string, number | null> };
+type Contract = { provider: string; id: string; title: string; scenario: string; indicator: string; probability: number; confidence: number; volume?: number; open_interest?: number; source?: string };
+type DataStatus = { storage: string; counts: Record<string, number>; freshness: Record<string, string | null>; providers: Array<{ provider: string; status: string; fetched_at: string; metadata: Record<string, unknown> }> };
+type Analysis = { id: string; created_at: string; macro: Macro; scenarios: Scenario[]; research: Research[]; alternatives: Alternative[]; portfolio_value: number; warnings: string[]; scenario_warnings: string[]; data_lineage?: Record<string, string> };
 
 const defaultProfile: Profile = {
   age: 35, retirement_age: 65, horizon_years: 20, account_type: "taxable", annual_contribution: 12000,
@@ -34,6 +37,8 @@ const nav: Array<[Tab, string, string]> = [
 
 function pct(value?: number | null, digits = 0) { return value == null ? "—" : `${(value * 100).toFixed(digits)}%`; }
 function money(value?: number | null) { return value == null ? "—" : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(value); }
+function compact(value?: number | null) { return value == null ? "—" : new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value); }
+function dateLabel(value?: string | null) { return value ? new Date(value).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "Awaiting data"; }
 function scoreTone(value: number) { return value >= 75 ? "good" : value >= 55 ? "neutral" : "risk"; }
 
 export default function Dashboard() {
@@ -51,10 +56,13 @@ export default function Dashboard() {
     { ticker: "CASH", weight: .10, account_type: "taxable" },
   ]);
   const [profile, setProfile] = useState<Profile>(defaultProfile);
-  const [macro, setMacro] = useState({ regime: "neutral", score: 50, as_of: null as string | null });
+  const [macro, setMacro] = useState<Macro>({ regime: "neutral", score: 50, as_of: null });
   const [scenarios, setScenarios] = useState<Scenario[]>(seededScenarios);
+  const [contracts, setContracts] = useState<Contract[]>([]);
+  const [scenarioFetchedAt, setScenarioFetchedAt] = useState<string | null>(null);
   const [scenarioWarnings, setScenarioWarnings] = useState<string[]>(["Connect the local data service to refresh live prediction markets."]);
   const [research, setResearch] = useState<Research[]>([]);
+  const [dataStatus, setDataStatus] = useState<DataStatus>({ storage: "pending", counts: {}, freshness: {}, providers: [] });
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [selectedAlternative, setSelectedAlternative] = useState(1);
   const [narrative, setNarrative] = useState("");
@@ -77,7 +85,8 @@ export default function Dashboard() {
       if (data.portfolio) {
         setPortfolioId(data.portfolio.id); setPortfolioName(data.portfolio.name); setHoldings(data.portfolio.holdings);
       }
-      setProfile(data.profile); setMacro(data.macro); setScenarios(data.scenarios.scenarios); setScenarioWarnings(data.scenarios.warnings); setResearch(data.research);
+      setProfile(data.profile); setMacro(data.macro); setScenarios(data.scenarios.scenarios); setContracts(data.scenarios.contracts || []); setScenarioFetchedAt(data.scenarios.fetched_at || null); setScenarioWarnings(data.scenarios.warnings); setResearch(data.research); setDataStatus(data.data_status);
+      if (data.latest_analysis?.alternatives?.length) setAnalysis(data.latest_analysis);
     } catch {
       setConnected(false);
     } finally { setLoading(false); }
@@ -114,7 +123,7 @@ export default function Dashboard() {
     try {
       const response = await fetch(`${API}/providers/refresh?force=true`, { method: "POST" }); const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Refresh failed");
-      setScenarios(data.scenarios); setScenarioWarnings(data.warnings); setNotice(data.cached ? "Using the latest validated snapshot." : "Prediction-market scenarios refreshed."); setConnected(true);
+      setScenarios(data.scenarios); setContracts(data.contracts || []); setScenarioFetchedAt(data.fetched_at || null); setScenarioWarnings(data.warnings); setNotice(data.cached ? "Using the latest validated snapshot." : "Prediction-market scenarios refreshed."); setConnected(true);
     } catch (error) { setNotice(error instanceof Error ? error.message : "Refresh unavailable."); }
     finally { setBusy(""); }
   }
@@ -165,9 +174,9 @@ export default function Dashboard() {
         {busy && <div className="progress" role="status"><span />{busy}…</div>}
         {notice && <div className="notice"><span>i</span>{notice}<button onClick={() => setNotice("")} aria-label="Dismiss">×</button></div>}
 
-        {tab === "overview" && <Overview loading={loading} portfolioName={portfolioName} holdings={holdings} macro={macro} scenarios={scenarios} research={research} topScenario={topScenario} analysis={analysis} onNavigate={setTab} />}
+        {tab === "overview" && <Overview loading={loading} portfolioName={portfolioName} holdings={holdings} macro={macro} scenarios={scenarios} research={research} topScenario={topScenario} analysis={analysis} dataStatus={dataStatus} onNavigate={setTab} />}
         {tab === "portfolio" && <Portfolio holdings={holdings} setHoldings={setHoldings} name={portfolioName} setName={setPortfolioName} total={currentWeightTotal} onSave={savePortfolio} onImport={importCsv} />}
-        {tab === "scenarios" && <Scenarios scenarios={scenarios} warnings={scenarioWarnings} onRefresh={refreshMarkets} />}
+        {tab === "scenarios" && <Scenarios scenarios={scenarios} contracts={contracts} fetchedAt={scenarioFetchedAt} warnings={scenarioWarnings} onRefresh={refreshMarkets} />}
         {tab === "research" && <ResearchTable rows={sortedResearch} sortKey={sortKey} setSortKey={setSortKey} onNavigate={setTab} />}
         {tab === "optimize" && <Optimize profile={profile} setProfile={setProfile} analysis={analysis} selected={selectedAlternative} setSelected={setSelectedAlternative} onRun={runOptimization} narrative={narrative} onNarrative={generateNarrative} />}
       </main>
@@ -175,7 +184,7 @@ export default function Dashboard() {
   );
 }
 
-function Overview({ loading, portfolioName, holdings, macro, scenarios, research, topScenario, analysis, onNavigate }: { loading: boolean; portfolioName: string; holdings: Holding[]; macro: { regime: string; score: number; as_of: string | null }; scenarios: Scenario[]; research: Research[]; topScenario?: Scenario; analysis: Analysis | null; onNavigate: (tab: Tab) => void }) {
+function Overview({ loading, portfolioName, holdings, macro, scenarios, research, topScenario, analysis, dataStatus, onNavigate }: { loading: boolean; portfolioName: string; holdings: Holding[]; macro: Macro; scenarios: Scenario[]; research: Research[]; topScenario?: Scenario; analysis: Analysis | null; dataStatus: DataStatus; onNavigate: (tab: Tab) => void }) {
   const score = research.length ? research.reduce((sum, row) => sum + row.final_score, 0) / research.length : 0;
   return <section className="workspace overview-workspace">
     <div className="hero-panel">
@@ -198,10 +207,21 @@ function Overview({ loading, portfolioName, holdings, macro, scenarios, research
         </div>
       </div>
     </div>
+    <div className="data-lineage-panel">
+      <div><span className="kicker">Supabase evidence base</span><h3>Stored research inputs</h3><p>These records—not browser samples—feed the scenario model, security ratings, and optimization covariance.</p></div>
+      <div className="data-source-grid">
+        <DataSource label="Prices" count={dataStatus.counts.price_bars} date={dataStatus.freshness.prices} />
+        <DataSource label="Macro" count={dataStatus.counts.macro_observations} date={dataStatus.freshness.macro} />
+        <DataSource label="Fundamentals" count={dataStatus.counts.fundamental_periods} date={dataStatus.freshness.fundamentals} />
+        <DataSource label="News" count={dataStatus.counts.news_documents} date={dataStatus.freshness.news} />
+        <DataSource label="Markets" count={dataStatus.counts.market_snapshots} date={dataStatus.freshness.markets} />
+      </div>
+    </div>
   </section>;
 }
 
 function Metric({ label, value, meta, tone = "neutral" }: { label: string; value: string; meta: string; tone?: string }) { return <div className="metric-card"><span>{label}</span><strong className={tone}>{value}</strong><small>{meta}</small></div>; }
+function DataSource({ label, count, date }: { label: string; count?: number; date?: string | null }) { return <div><span>{label}</span><strong>{compact(count)}</strong><small>through {dateLabel(date)}</small></div>; }
 function PanelHead({ eyebrow, title, action, onClick }: { eyebrow: string; title: string; action: string; onClick: () => void }) { return <div className="panel-head"><div><span>{eyebrow}</span><h3>{title}</h3></div><button onClick={onClick}>{action} →</button></div>; }
 
 function Portfolio({ holdings, setHoldings, name, setName, total, onSave, onImport }: { holdings: Holding[]; setHoldings: (rows: Holding[]) => void; name: string; setName: (v:string) => void; total: number; onSave: () => void; onImport: (e: ChangeEvent<HTMLInputElement>) => void }) {
@@ -214,10 +234,13 @@ function Portfolio({ holdings, setHoldings, name, setName, total, onSave, onImpo
   </section>;
 }
 
-function Scenarios({ scenarios, warnings, onRefresh }: { scenarios: Scenario[]; warnings: string[]; onRefresh: () => void }) {
+function Scenarios({ scenarios, contracts, fetchedAt, warnings, onRefresh }: { scenarios: Scenario[]; contracts: Contract[]; fetchedAt: string | null; warnings: string[]; onRefresh: () => void }) {
   return <section className="workspace"><div className="section-intro"><div><span className="kicker">Prediction markets first</span><h2>Probabilities, with their confidence attached.</h2><p>Contracts are deduplicated, weighted by market quality, and shrunk toward disclosed priors when evidence is thin.</p></div><button className="primary refresh-button" onClick={onRefresh}>↻ Refresh markets</button></div>
     {warnings.length > 0 && <div className="warning-strip">{warnings.map(w => <span key={w}>△ {w}</span>)}</div>}
     <div className="scenario-grid">{scenarios.map((scenario, index) => <article className="scenario-card" key={scenario.key}><div className="scenario-number">0{index + 1}</div><span className="confidence-dot"><i style={{ opacity: scenario.confidence }} /> {pct(scenario.confidence)} signal confidence</span><h3>{scenario.label}</h3><div className="big-probability">{pct(scenario.probability)}</div><div className="prob-track"><i style={{ width: `${scenario.probability * 100}%` }} /></div><div className="change-grid"><span>1 day<b className={(scenario.change_1d || 0) >= 0 ? "up" : "down"}>{scenario.change_1d == null ? "—" : `${scenario.change_1d > 0 ? "+" : ""}${pct(scenario.change_1d, 1)}`}</b></span><span>1 week<b>{scenario.change_1w == null ? "—" : pct(scenario.change_1w, 1)}</b></span><span>1 month<b>{scenario.change_1m == null ? "—" : pct(scenario.change_1m, 1)}</b></span></div><div className="indicator-tags">{scenario.indicators.length ? scenario.indicators.map(i => <span key={i}>{i}</span>) : <span>disclosed prior</span>}</div><footer>{scenario.is_prior ? "Market coverage unavailable or weak" : `${scenario.sources.length} linked source${scenario.sources.length === 1 ? "" : "s"}`}</footer></article>)}</div>
+    <div className="panel contract-panel"><div className="panel-head"><div><span>Stored market evidence</span><h3>Contracts behind the probabilities</h3></div><small>Snapshot {dateLabel(fetchedAt)}</small></div>
+      {contracts.length === 0 ? <EmptyState title="No matching contracts in this snapshot" body="The scenario cards above disclose when a prior is being used instead of prediction-market evidence." /> : <div className="table-scroll"><table className="contract-table"><thead><tr><th>Venue</th><th>Question</th><th>Indicator</th><th>Probability</th><th>Confidence</th><th>Activity</th></tr></thead><tbody>{[...contracts].sort((a,b) => b.confidence - a.confidence).slice(0,20).map(contract => <tr key={`${contract.provider}-${contract.id}`}><td><span className={`venue ${contract.provider.toLowerCase()}`}>{contract.provider}</span></td><td><a href={contract.source} target="_blank" rel="noreferrer">{contract.title}</a><small>{contract.scenario.replaceAll("_", " ")}</small></td><td>{contract.indicator}</td><td><strong>{pct(contract.probability,1)}</strong></td><td>{pct(contract.confidence,0)}</td><td>{compact((contract.volume || 0) + (contract.open_interest || 0))}</td></tr>)}</tbody></table></div>}
+    </div>
     <div className="method-note"><span>Method</span><p>Scenario weights are normalized across five mutually interpretable states. They influence expected outcomes, but company quality, valuation, diversification, and hard risk controls remain independent checks.</p></div>
   </section>;
 }
@@ -226,7 +249,7 @@ function ResearchTable({ rows, sortKey, setSortKey, onNavigate }: { rows: Resear
   const headers: Array<[keyof Research, string]> = [["final_score", "Composite"], ["growth_rating", "Growth"], ["valuation_score", "Value"], ["fundamental_score", "Quality"], ["industry_score", "Industry"], ["technical_score", "Technical"], ["confidence", "Confidence"]];
   return <section className="workspace"><div className="section-intro"><div><span className="kicker">Evidence before narrative</span><h2>Every rating keeps its components visible.</h2><p>Scores are comparative research signals—not price targets or instructions to buy or sell.</p></div><button className="secondary" onClick={() => onNavigate("portfolio")}>Manage universe</button></div>
     <div className="panel research-panel"><div className="research-toolbar"><span>{rows.length} securities</span><div>Sort by {headers.map(([key, label]) => <button key={key} className={sortKey === key ? "active" : ""} onClick={() => setSortKey(key)}>{label}</button>)}</div></div>
-      {rows.length === 0 ? <EmptyState title="Research data is waiting" body="Start the local engine or run an analysis to load holdings, watchlist names, and ETF coverage." /> : <div className="table-scroll"><table className="research-table"><thead><tr><th>Security</th>{headers.map(([,label]) => <th key={label}>{label}</th>)}<th>Data</th><th>Primary risk</th></tr></thead><tbody>{rows.map(row => <tr key={row.ticker}><td><div className="security-cell"><span>{row.ticker.slice(0,2)}</span><p><strong>{row.ticker}</strong><small>{row.company}<br />{row.sector}</small></p></div></td>{headers.map(([key]) => <td key={key}><Score value={Number(row[key])} /></td>)}<td><span className={`quality ${row.data_quality}`}>{row.data_quality}</span></td><td className="risk-copy">{row.risk_flags[0]?.replaceAll("_", " ") || "No hard flag"}</td></tr>)}</tbody></table></div>}
+      {rows.length === 0 ? <EmptyState title="Research data is waiting" body="Start the local engine or run an analysis to load holdings, watchlist names, and ETF coverage." /> : <div className="table-scroll"><table className="research-table"><thead><tr><th>Security</th><th>Price / 1Y</th>{headers.map(([,label]) => <th key={label}>{label}</th>)}<th>Data</th><th>Evidence</th><th>Primary risk</th></tr></thead><tbody>{rows.map(row => <tr key={row.ticker}><td><div className="security-cell"><span>{row.ticker.slice(0,2)}</span><p><strong>{row.ticker}</strong><small>{row.company}<br />{row.sector}</small></p></div></td><td><div className="market-cell"><strong>{row.price == null ? "—" : money(row.price)}</strong><small className={(row.price_change_1y || 0) >= 0 ? "up" : "down"}>{row.price_change_1y == null ? "No history" : `${row.price_change_1y >= 0 ? "+" : ""}${pct(row.price_change_1y,1)}`}</small></div></td>{headers.map(([key]) => <td key={key}><Score value={Number(row[key])} /></td>)}<td><span className={`quality ${row.data_quality}`}>{row.data_quality}</span></td><td><div className="evidence-cell"><span>Price {dateLabel(row.price_as_of)}</span><span>Fund. {dateLabel(row.fundamentals_as_of)}</span><span>{row.news_count || 0} recent articles</span>{row.latest_news?.source_url && <a href={row.latest_news.source_url} target="_blank" rel="noreferrer">Latest source ↗</a>}</div></td><td className="risk-copy">{row.risk_flags[0]?.replaceAll("_", " ") || "No hard flag"}</td></tr>)}</tbody></table></div>}
     </div>
   </section>;
 }
@@ -249,6 +272,8 @@ function Optimize({ profile, setProfile, analysis, selected, setSelected, onRun,
       <div className="alternative-tabs">{analysis.alternatives.map((alt,i) => <button key={alt.name} className={selected === i ? "active" : ""} onClick={() => setSelected(i)}><span>0{i+1}</span><strong>{alt.name}</strong><small>{pct(alt.expected_return,1)} modeled return</small></button>)}</div>
       <div className="result-summary"><div><span>Modeled return</span><strong>{pct(alternative.expected_return,1)}</strong></div><div><span>Volatility</span><strong>{pct(alternative.volatility,1)}</strong></div><div><span>Est. turnover</span><strong>{pct(alternative.turnover,1)}</strong></div><div><span>Effective holdings</span><strong>{alternative.effective_holdings}</strong></div></div>
       <div className="tradeoff"><span>Tradeoff</span><p>{alternative.tradeoff}</p><b className={alternative.constraint_status === "satisfied" ? "good" : "risk"}>{alternative.constraint_status}</b></div>
+      <div className="model-lineage"><span>Model inputs</span><p>Prices: <b>{analysis.data_lineage?.prices || "validated history"}</b></p><p>Research: <b>{analysis.data_lineage?.research || "validated scores"}</b></p><p>Macro: <b>{analysis.data_lineage?.macro || "FRED"}</b></p></div>
+      <div className="panel scenario-outcome-panel"><div className="panel-head"><div><span>Scenario test</span><h3>Modeled return by macro state</h3></div><small>Probability-weighted inputs</small></div><div className="scenario-outcome-grid">{alternative.scenario_outcomes.map(outcome => <div key={outcome.label}><span>{outcome.label}</span><strong className={outcome.estimated_return >= 0 ? "good" : "risk"}>{outcome.estimated_return >= 0 ? "+" : ""}{pct(outcome.estimated_return,1)}</strong><small>{pct(outcome.probability)} scenario probability</small></div>)}</div></div>
       <div className="panel allocation-panel"><div className="panel-head"><div><span>Target ranges</span><h3>Allocation changes</h3></div><small>Current → target</small></div><div className="allocation-list">{alternative.allocations.map(item => <div key={item.ticker}><span className="ticker-badge neutral">{item.ticker.slice(0,4)}</span><p><strong>{item.ticker}</strong><small>{item.reason}</small></p><div className="allocation-values"><span>{pct(item.current_weight)}</span><b>→</b><strong>{pct(item.target_weight)}</strong><small>{pct(item.target_min)}–{pct(item.target_max)}</small></div><em className={item.delta >= 0 ? "up" : "down"}>{item.delta >= 0 ? "+" : ""}{pct(item.delta,1)}</em></div>)}</div></div>
       <div className="projection-grid"><div className="panel"><span className="kicker">Retirement range</span><h3>{money(alternative.projection.nominal_p50)}</h3><p>Median nominal value in {profile.horizon_years} years</p><div className="range-line"><i /><span style={{ left: "10%" }}>P10 {money(alternative.projection.nominal_p10)}</span><span style={{ right: "8%" }}>P90 {money(alternative.projection.nominal_p90)}</span></div><footer>{pct(alternative.projection.goal_probability)} modeled goal frequency</footer></div><div className="panel"><span className="kicker">Tax & turnover</span><h3>{alternative.tax.available ? money(alternative.tax.estimated_tax) : "Inputs needed"}</h3><p>{alternative.tax.note}</p><footer>{pct(alternative.turnover)} one-way turnover</footer></div></div>
       <div className="narrative-panel"><div><span>Optional explanation</span><h3>Validated facts in plain language</h3></div><button className="secondary" onClick={onNarrative}>Generate explanation</button>{narrative && <p>{narrative}</p>}</div>

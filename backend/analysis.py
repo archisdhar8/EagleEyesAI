@@ -53,6 +53,10 @@ def _num(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _clip(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    return max(low, min(high, value))
+
+
 def load_rankings() -> pd.DataFrame:
     if not RANKINGS_PATH.exists():
         return pd.DataFrame()
@@ -60,6 +64,50 @@ def load_rankings() -> pd.DataFrame:
 
 
 def latest_macro() -> dict[str, Any]:
+    if database.DATABASE_URL:
+        observations = database.macro_observation_history(
+            ["CPIAUCSL", "PCEPI", "UNRATE", "T10Y2Y", "BAMLH0A0HYM2", "FEDFUNDS"],
+            limit_per_series=36,
+        )
+        by_series: dict[str, list[dict[str, Any]]] = {}
+        for observation in observations:
+            values = by_series.setdefault(observation["series_id"], [])
+            if not any(item["date"] == observation["date"] for item in values):
+                values.append(observation)
+        latest = {key: values[0] for key, values in by_series.items() if values}
+        if latest:
+            inflation_values = by_series.get("CPIAUCSL") or by_series.get("PCEPI") or []
+            inflation_yoy = None
+            if len(inflation_values) >= 13 and _num(inflation_values[12]["value"]) > 0:
+                inflation_yoy = (_num(inflation_values[0]["value"]) / _num(inflation_values[12]["value"]) - 1) * 100
+            unemployment = _num(latest.get("UNRATE", {}).get("value"), 4.5)
+            curve = _num(latest.get("T10Y2Y", {}).get("value"), 0)
+            credit_spread = _num(latest.get("BAMLH0A0HYM2", {}).get("value"), 4.5)
+            policy_rate = _num(latest.get("FEDFUNDS", {}).get("value"), 4.0)
+            score = 50.0
+            if inflation_yoy is not None:
+                score += 8 if inflation_yoy <= 2.5 else -10 if inflation_yoy >= 3.5 else 0
+            score += 8 if unemployment < 4.5 else -12 if unemployment >= 5.0 else 0
+            score += 6 if curve >= 0 else -6
+            score += 5 if credit_spread < 4.0 else -10 if credit_spread >= 6.0 else 0
+            if inflation_yoy is not None and inflation_yoy >= 3.5:
+                regime = "sticky_inflation"
+            elif unemployment >= 5.0 or credit_spread >= 6.0:
+                regime = "recession_risk"
+            elif inflation_yoy is not None and inflation_yoy <= 2.8 and unemployment < 4.5 and curve >= 0:
+                regime = "supportive_growth"
+            else:
+                regime = "neutral"
+            as_of = max(item["date"] for item in latest.values())
+            return {
+                "regime": regime, "score": round(_clip(score), 1), "as_of": as_of,
+                "source": "Supabase · FRED",
+                "metrics": {
+                    "inflation_yoy": None if inflation_yoy is None else round(inflation_yoy, 2),
+                    "unemployment": round(unemployment, 2), "yield_curve": round(curve, 2),
+                    "credit_spread": round(credit_spread, 2), "policy_rate": round(policy_rate, 2),
+                },
+            }
     if not MACRO_PATH.exists():
         return {"regime": "neutral", "score": 50, "as_of": None}
     frame = pd.read_parquet(MACRO_PATH).sort_values("date")
@@ -72,6 +120,19 @@ def latest_macro() -> dict[str, Any]:
 def security_research(tickers: list[str]) -> list[dict[str, Any]]:
     rankings = load_rankings()
     indexed = rankings.set_index(rankings["ticker"].astype(str).str.upper()) if not rankings.empty else pd.DataFrame()
+    stored = database.security_data(tickers) if database.DATABASE_URL else {
+        "securities": [], "fundamentals": [], "prices": [], "news": []
+    }
+    stored_securities = {row["ticker"]: row for row in stored["securities"]}
+    stored_fundamentals: dict[str, list[dict[str, Any]]] = {}
+    stored_prices: dict[str, list[dict[str, Any]]] = {}
+    stored_news: dict[str, list[dict[str, Any]]] = {}
+    for row in stored["fundamentals"]:
+        stored_fundamentals.setdefault(row["ticker"], []).append(row)
+    for row in stored["prices"]:
+        stored_prices.setdefault(row["ticker"], []).append(row)
+    for row in stored["news"]:
+        stored_news.setdefault(row["ticker"], []).append(row)
     rows: list[dict[str, Any]] = []
     for ticker in dict.fromkeys(t.upper() for t in tickers):
         if not rankings.empty and ticker in indexed.index:
@@ -98,7 +159,58 @@ def security_research(tickers: list[str]) -> list[dict[str, Any]]:
             risks = [] if ticker in ETF_META else ["limited_research_coverage"]
             quality = "medium" if ticker in ETF_META else "low"
             source = ""
-        growth = max(0.0, min(100.0, fundamental * 0.40 + industry_score * 0.25 + technical * 0.20 + news * 0.15))
+        security = stored_securities.get(ticker)
+        fundamentals = stored_fundamentals.get(ticker, [])
+        prices = stored_prices.get(ticker, [])
+        news_items = stored_news.get(ticker, [])
+        price = _num(prices[-1]["close"]) if prices else None
+        price_change_1y = None
+        if len(prices) >= 2 and _num(prices[max(0, len(prices) - 252)]["close"]) > 0:
+            price_change_1y = price / _num(prices[max(0, len(prices) - 252)]["close"]) - 1
+            technical = _clip(50 + price_change_1y * 65)
+        revenue_growth = None
+        latest_metrics = fundamentals[0].get("metrics", {}) if fundamentals else {}
+        current_revenue = _num(latest_metrics.get("revenue"))
+        comparable = next(
+            (
+                period for period in fundamentals[1:]
+                if period.get("fiscal_period") == fundamentals[0].get("fiscal_period")
+                and period.get("fiscal_year") != fundamentals[0].get("fiscal_year")
+            ),
+            fundamentals[1] if len(fundamentals) > 1 else None,
+        ) if fundamentals else None
+        prior_revenue = _num((comparable or {}).get("metrics", {}).get("revenue"))
+        if current_revenue and prior_revenue:
+            revenue_growth = current_revenue / prior_revenue - 1
+            fundamental = _clip(fundamental * 0.65 + _clip(50 + revenue_growth * 140) * 0.35)
+        net_income = _num(latest_metrics.get("net_income"))
+        net_margin = net_income / current_revenue if current_revenue else None
+        debt = _num(latest_metrics.get("total_debt"))
+        assets = _num(latest_metrics.get("total_assets"))
+        if net_margin is not None:
+            fundamental = _clip(fundamental + max(-8, min(8, net_margin * 40)))
+        if assets and debt / assets > 0.55:
+            risks = list(dict.fromkeys([*risks, "elevated_balance_sheet_leverage"]))
+            fundamental = _clip(fundamental - 7)
+        sentiment_values = []
+        for item in news_items:
+            metadata = item.get("metadata") or {}
+            sentiment_values.append(_num(metadata.get("sentiment_score")))
+        if sentiment_values:
+            news = _clip(50 + float(np.mean(sentiment_values)) * 35)
+        growth = _clip(fundamental * 0.40 + industry_score * 0.25 + technical * 0.20 + news * 0.15)
+        coverage = (30 if len(prices) >= 252 else 15 if prices else 0) + (30 if fundamentals else 0) + (20 if news_items else 0) + (10 if security else 0)
+        if database.DATABASE_URL:
+            confidence = _clip(confidence * 0.35 + coverage * 0.65)
+            quality = "high" if confidence >= 80 else "medium" if confidence >= 60 else "low"
+            if security:
+                company = security.get("company_name") or company
+                sector = security.get("sector") or sector
+                industry = security.get("industry") or industry
+        final = _clip(
+            fundamental * 0.28 + valuation * 0.20 + industry_score * 0.14
+            + technical * 0.18 + news * 0.10 + growth * 0.10
+        ) if database.DATABASE_URL and (prices or fundamentals or news_items) else final
         expected_return = max(-0.03, min(0.18, 0.035 + (final - 50) * 0.0015 + (valuation - 50) * 0.0005))
         rows.append({
             "ticker": ticker, "company": company, "sector": sector, "industry": industry,
@@ -106,11 +218,26 @@ def security_research(tickers: list[str]) -> list[dict[str, Any]]:
             "fundamental_score": round(fundamental, 1), "industry_score": round(industry_score, 1),
             "technical_score": round(technical, 1), "news_score": round(news, 1), "confidence": round(confidence, 1),
             "data_quality": quality, "risk_flags": risks, "source": source, "expected_return": expected_return,
+            "price": None if price is None else round(price, 2),
+            "price_change_1y": None if price_change_1y is None else round(price_change_1y, 4),
+            "price_as_of": prices[-1]["date"] if prices else None,
+            "fundamentals_as_of": fundamentals[0]["period_end"] if fundamentals else None,
+            "revenue_growth": None if revenue_growth is None else round(revenue_growth, 4),
+            "net_margin": None if net_margin is None else round(net_margin, 4),
+            "news_count": len(news_items),
+            "latest_news": news_items[0] if news_items else None,
+            "data_source": "supabase" if database.DATABASE_URL and (prices or fundamentals or news_items) else "local_fallback",
         })
     return rows
 
 
 def _price_matrix(tickers: list[str]) -> pd.DataFrame:
+    if database.DATABASE_URL:
+        stored = database.security_data(tickers, price_limit=756)["prices"]
+        if stored:
+            frame = pd.DataFrame(stored)
+            frame["date"] = pd.to_datetime(frame["date"], utc=True).dt.date
+            return frame.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index()
     if not PRICES_PATH.exists():
         return pd.DataFrame()
     frame = pd.read_parquet(PRICES_PATH, columns=["ticker", "date", "close"])
@@ -344,7 +471,12 @@ def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> di
         "portfolio_value": round(portfolio_value, 2), "current_weights": {row["ticker"]: round(float(current[i]), 4) for i, row in enumerate(research) if current[i] > 0},
         "research": research, "alternatives": alternatives,
         "warnings": ["Decision-support research only; no trades are submitted.", "Expected returns and projections are model estimates, not guarantees."],
-        "data_lineage": {"rankings": str(RANKINGS_PATH), "prices": str(PRICES_PATH), "scenario_fetched_at": scenario_payload["fetched_at"]},
+        "data_lineage": {
+            "research": "supabase" if database.DATABASE_URL else str(RANKINGS_PATH),
+            "prices": "supabase.price_bars" if database.DATABASE_URL else str(PRICES_PATH),
+            "macro": "supabase.macro_observations" if database.DATABASE_URL else str(MACRO_PATH),
+            "scenario_fetched_at": scenario_payload["fetched_at"],
+        },
     }
     return result
 
