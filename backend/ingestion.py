@@ -593,6 +593,8 @@ def refresh_sec() -> int:
         if not cik:
             continue
         response = session.get(SEC_FACTS_URL.format(cik=cik), headers=headers, timeout=30)
+        if response.status_code == 404:
+            continue
         response.raise_for_status()
         frame = normalize_sec_payload(ticker, response.json())
         if not frame.empty:
