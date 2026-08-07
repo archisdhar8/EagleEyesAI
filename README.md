@@ -1,4 +1,6 @@
-# InvestmentDashboard
+# EagleEyesAI
+
+## InvestmentDashboard
 
 A local, single-user portfolio research sandbox. Prediction-market probabilities set macro scenario weights; existing company research and an explainable statistical model test portfolio alternatives against those scenarios.
 
