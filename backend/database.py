@@ -412,7 +412,7 @@ def save_analysis(run_id: str, request: dict[str, Any], result: dict[str, Any]) 
                 ON CONFLICT (id) DO UPDATE SET result_snapshot=excluded.result_snapshot""",
                 (
                     run_id, portfolio_id, profile["id"] if profile else None,
-                    result.get("model_version", "scenario-shrinkage-v1"), _jsonb(request),
+                    result.get("model_version", "walk-forward-regime-shrinkage-v2"), _jsonb(request),
                     _jsonb(result.get("data_lineage", {})), _jsonb(result.get("current_weights", {})),
                     _jsonb(result.get("alternatives", [])), _jsonb(result.get("warnings", [])),
                     _jsonb(result), result.get("created_at", utc_now()),
@@ -470,7 +470,8 @@ def provider_data_status() -> dict[str, Any]:
             (SELECT count(*) FROM public.macro_observations) AS macro_observations,
             (SELECT count(*) FROM public.fundamental_periods) AS fundamental_periods,
             (SELECT count(*) FROM public.documents WHERE document_type='news') AS news_documents,
-            (SELECT count(*) FROM public.prediction_market_snapshots) AS market_snapshots"""
+            (SELECT count(*) FROM public.prediction_market_snapshots) AS market_snapshots,
+            (SELECT count(*) FROM public.macro_regime_labels) AS macro_regimes"""
         ).fetchone()
         freshness = conn.execute(
             """SELECT
@@ -478,7 +479,8 @@ def provider_data_status() -> dict[str, Any]:
             (SELECT max(observation_date) FROM public.macro_observations) AS macro,
             (SELECT max(period_end) FROM public.fundamental_periods) AS fundamentals,
             (SELECT max(published_at) FROM public.documents WHERE document_type='news') AS news,
-            (SELECT max(observed_at) FROM public.prediction_market_snapshots) AS markets"""
+            (SELECT max(observed_at) FROM public.prediction_market_snapshots) AS markets,
+            (SELECT max(as_of_date) FROM public.macro_regime_labels) AS regimes"""
         ).fetchone()
         providers = conn.execute(
             """SELECT DISTINCT ON (provider) provider, status, fetched_at, as_of,
@@ -597,3 +599,46 @@ def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
             for row in news
         ],
     }
+
+
+def price_history(tickers: list[str], limit_per_ticker: int = 5000) -> list[dict[str, Any]]:
+    normalized = sorted({
+        ticker.strip().upper() for ticker in tickers
+        if ticker.strip() and ticker.upper() != "CASH"
+    })
+    if not DATABASE_URL or not normalized:
+        return []
+    with postgres_connection() as conn:
+        rows = conn.execute(
+            """SELECT ticker, ts, close FROM (
+              SELECT s.ticker, p.ts, p.close,
+              row_number() OVER (PARTITION BY s.ticker ORDER BY p.ts DESC) AS position
+              FROM public.price_bars p JOIN public.securities s ON s.id=p.security_id
+              WHERE s.ticker = ANY(%s) AND p.interval='1d' AND p.close IS NOT NULL
+            ) bars WHERE position <= %s ORDER BY ticker, ts""",
+            (normalized, max(1, min(limit_per_ticker, 10000))),
+        ).fetchall()
+    return [
+        {"ticker": row["ticker"], "date": _iso(row["ts"]), "close": _number(row["close"])}
+        for row in rows
+    ]
+
+
+def regime_history(limit: int = 240) -> list[dict[str, Any]]:
+    if not DATABASE_URL:
+        return []
+    with postgres_connection() as conn:
+        rows = conn.execute(
+            """SELECT as_of_date, model_version, dominant_regime, probabilities,
+            inputs, confidence, data_quality, is_point_in_time
+            FROM public.macro_regime_labels ORDER BY as_of_date DESC LIMIT %s""",
+            (max(1, min(limit, 1000)),),
+        ).fetchall()
+    return [
+        {
+            **dict(row), "as_of_date": _iso(row["as_of_date"]),
+            "confidence": _number(row["confidence"]),
+            "data_quality": _number(row["data_quality"]),
+        }
+        for row in rows
+    ]

@@ -50,6 +50,15 @@ class CsvImport(BaseModel):
     csv_text: str
 
 
+def regime_summary() -> dict[str, Any]:
+    history = database.regime_history(1000)
+    counts: dict[str, int] = {}
+    for row in history:
+        key = row["dominant_regime"]
+        counts[key] = counts.get(key, 0) + 1
+    return {"latest": history[0] if history else None, "sample_counts": counts, "total_samples": len(history)}
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     mode = database.storage_mode()
@@ -69,6 +78,7 @@ def overview() -> dict[str, Any]:
         "portfolio": portfolio, "profile": profile, "macro": latest_macro(),
         "scenarios": scenarios, "research": research, "storage": database.storage_mode(),
         "data_status": database.provider_data_status(), "latest_analysis": database.latest_analysis(),
+        "regime_history": regime_summary(),
     }
 
 
@@ -141,6 +151,11 @@ def provider_status() -> dict[str, Any]:
 @app.get("/api/scenarios")
 def scenarios() -> dict[str, Any]:
     return refresh_scenarios(force=False)
+
+
+@app.get("/api/regimes")
+def regimes(limit: int = Query(default=240, ge=1, le=1000)) -> dict[str, Any]:
+    return {"model_version": "macro-regime-rules-v1", "history": database.regime_history(limit)}
 
 
 @app.get("/api/research")

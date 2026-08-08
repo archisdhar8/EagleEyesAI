@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import hashlib
 import json
 import math
 import os
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -14,16 +16,17 @@ import requests
 from dotenv import load_dotenv
 
 from . import database
+from .regimes import generate_and_store_regimes, month_ends
 from .scenarios import refresh as refresh_scenarios
 
 
 APP_DIR = Path(__file__).resolve().parents[1]
-SOURCE_ROOT = APP_DIR.parent
-PRICE_CACHE = SOURCE_ROOT / "data" / "raw" / "polygon" / "prices_daily.parquet"
-FRED_CACHE = SOURCE_ROOT / "data" / "raw" / "fred" / "fred_observations.parquet"
-FUNDAMENTALS_CACHE = SOURCE_ROOT / "data" / "processed" / "sec_fundamentals.parquet"
-NEWS_CACHE = SOURCE_ROOT / "data" / "raw" / "news" / "news_raw.parquet"
-RANKINGS_CACHE = SOURCE_ROOT / "data" / "outputs" / "stock_rankings.csv"
+CACHE_ROOT = APP_DIR / "data"
+PRICE_CACHE = CACHE_ROOT / "raw" / "polygon" / "prices_daily.parquet"
+FRED_CACHE = CACHE_ROOT / "raw" / "fred" / "fred_observations.parquet"
+FUNDAMENTALS_CACHE = CACHE_ROOT / "processed" / "sec_fundamentals.parquet"
+NEWS_CACHE = CACHE_ROOT / "raw" / "news" / "news_raw.parquet"
+RANKINGS_CACHE = CACHE_ROOT / "outputs" / "stock_rankings.csv"
 
 POLYGON_BARS_URL = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
 POLYGON_NEWS_URL = "https://api.polygon.io/v2/reference/news"
@@ -35,12 +38,24 @@ ETF_TICKERS = {
     "SPY", "QQQ", "VTI", "IWM", "DIA", "BND", "AGG", "TLT", "SHY", "IEF",
     "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU", "XLV", "XLY",
 }
+HISTORY_START = date(2005, 1, 1)
+ALFRED_SERIES = {
+    "CPIAUCSL": "eop",
+    "UNRATE": "eop",
+    "T10Y2Y": "eop",
+    "BAMLH0A0HYM2": "eop",
+    "FEDFUNDS": "eop",
+    "DCOILWTICO": "avg",
+    "INDPRO": "eop",
+    "PAYEMS": "eop",
+}
+ALFRED_DAILY_SERIES = {"T10Y2Y", "BAMLH0A0HYM2", "DCOILWTICO"}
 FRED_SERIES = [
     "DGS3MO", "DGS2", "DGS10", "DGS30", "T10Y2Y", "T10Y3M",
     "CPIAUCSL", "CPILFESL", "PCEPI", "PCEPILFE", "T5YIE", "T10YIE",
     "PCE", "RSAFS", "PSAVERT", "UMCSENT", "UNRATE", "PAYEMS", "ICSA", "JTSJOL",
     "TOTALSL", "BUSLOANS", "DRCCLACBS", "BAMLH0A0HYM2", "MORTGAGE30US",
-    "FEDFUNDS", "SOFR", "WALCL", "M2SL", "RRPONTSYD",
+    "FEDFUNDS", "SOFR", "WALCL", "M2SL", "RRPONTSYD", "DCOILWTICO", "INDPRO",
 ]
 SEC_TAGS = {
     "revenue": ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"],
@@ -60,6 +75,44 @@ SEC_TAGS = {
 
 
 load_dotenv(APP_DIR / "backend" / ".env", override=False)
+
+
+def raise_provider_error(response: requests.Response) -> None:
+    """Raise a useful HTTP error without including credential-bearing request URLs."""
+    if response.ok:
+        return
+    detail = response.reason or "provider request failed"
+    try:
+        payload = response.json()
+        detail = payload.get("error_message") or payload.get("error") or detail
+    except (ValueError, AttributeError):
+        pass
+    raise RuntimeError(f"Provider HTTP {response.status_code}: {str(detail)[:500]}")
+
+
+def request_with_retries(
+    session: requests.Session, url: str, *, params: dict[str, Any], timeout: int = 30,
+    attempts: int = 6,
+) -> requests.Response:
+    response: requests.Response | None = None
+    for attempt in range(attempts):
+        try:
+            response = session.get(url, params=params, timeout=timeout)
+        except requests.RequestException as exc:
+            if attempt + 1 < attempts:
+                time.sleep(min(30, 2 ** attempt))
+                continue
+            raise RuntimeError(f"Provider network request failed: {type(exc).__name__}") from None
+        if response.status_code not in {429, 500, 502, 503, 504}:
+            raise_provider_error(response)
+            return response
+        if attempt + 1 < attempts:
+            retry_after = response.headers.get("Retry-After")
+            delay = float(retry_after) if retry_after and retry_after.isdigit() else min(30, 2 ** attempt)
+            time.sleep(delay)
+    assert response is not None
+    raise_provider_error(response)
+    return response
 
 
 def clean(value: Any) -> Any:
@@ -423,7 +476,7 @@ def refresh_polygon() -> int:
             params={"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": api_key},
             timeout=30,
         )
-        response.raise_for_status()
+        raise_provider_error(response)
         results = response.json().get("results", [])
         if not results:
             continue
@@ -440,6 +493,243 @@ def refresh_polygon() -> int:
             )
         )
     return upsert_price_frame(pd.concat(frames, ignore_index=True), "polygon") if frames else 0
+
+
+def extend_polygon_history() -> int:
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        raise RuntimeError("POLYGON_API_KEY is required")
+    today = datetime.now(timezone.utc).date()
+    tickers = sorted(set(active_tickers()) | ETF_TICKERS)
+    session = requests.Session()
+    frames: list[pd.DataFrame] = []
+    skipped: list[str] = []
+    clipped: list[str] = []
+    for ticker in tickers:
+        if ticker == "CASH":
+            continue
+        start = HISTORY_START if ticker in ETF_TICKERS else today - timedelta(days=365 * 10 + 3)
+        response = session.get(
+            POLYGON_BARS_URL.format(ticker=ticker, start=start.isoformat(), end=today.isoformat()),
+            params={"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": api_key},
+            timeout=30,
+        )
+        if response.status_code in {401, 403}:
+            skipped.append(ticker)
+            continue
+        if response.status_code in {429, 500, 502, 503, 504}:
+            response = request_with_retries(
+                session,
+                POLYGON_BARS_URL.format(ticker=ticker, start=start.isoformat(), end=today.isoformat()),
+                params={"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": api_key},
+            )
+        else:
+            raise_provider_error(response)
+        results = response.json().get("results", [])
+        if not results:
+            continue
+        first_bar = datetime.fromtimestamp(results[0]["t"] / 1000, timezone.utc).date()
+        if first_bar > start + timedelta(days=45):
+            clipped.append(f"{ticker}:{first_bar.isoformat()}")
+        frames.append(
+            pd.DataFrame(
+                {
+                    "ticker": ticker,
+                    "date": [datetime.fromtimestamp(item["t"] / 1000, timezone.utc).date() for item in results],
+                    "open": [item.get("o") for item in results], "high": [item.get("h") for item in results],
+                    "low": [item.get("l") for item in results], "close": [item.get("c") for item in results],
+                    "volume": [item.get("v") for item in results], "vwap": [item.get("vw") for item in results],
+                    "transactions": [item.get("n") for item in results],
+                }
+            )
+        )
+    if skipped:
+        print(f"polygon_history: entitlement unavailable for {','.join(skipped)}")
+    if clipped:
+        print(
+            "polygon_history: requested start was clipped by available provider coverage for "
+            + ",".join(clipped)
+        )
+    if not frames:
+        raise RuntimeError("Polygon returned no extended historical bars")
+    return upsert_price_frame(pd.concat(frames, ignore_index=True), "polygon")
+
+
+def _chunks(values: list[date], size: int) -> Iterable[list[date]]:
+    for index in range(0, len(values), size):
+        yield values[index:index + size]
+
+
+def parse_alfred_observations(
+    series_id: str,
+    vintages: list[date],
+    observations: list[dict[str, Any]],
+    aggregation_method: str,
+) -> list[tuple[Any, ...]]:
+    values: list[tuple[Any, ...]] = []
+    for vintage in vintages:
+        column = f"{series_id}_{vintage.strftime('%Y%m%d')}"
+        cutoff = vintage - timedelta(days=550)
+        by_month: dict[date, list[tuple[date, float]]] = {}
+        for item in observations:
+            raw = item.get(column)
+            if raw in {None, "."}:
+                continue
+            observation_date = date.fromisoformat(item["date"])
+            if observation_date > vintage or observation_date < cutoff:
+                continue
+            month = date(observation_date.year, observation_date.month, 1)
+            by_month.setdefault(month, []).append((observation_date, float(raw)))
+        for observation_month, monthly_values in sorted(by_month.items()):
+            if aggregation_method == "avg":
+                value = sum(item[1] for item in monthly_values) / len(monthly_values)
+            else:
+                value = max(monthly_values, key=lambda item: item[0])[1]
+            values.append(
+                (
+                    "ALFRED", series_id, observation_month, vintage, value,
+                    f"https://fred.stlouisfed.org/series/{series_id}",
+                    json.dumps(
+                        {
+                            "source_frequency": "daily" if series_id in ALFRED_DAILY_SERIES else "monthly",
+                            "stored_frequency": "monthly", "aggregation_method": aggregation_method,
+                            "vintage_sampling": "month_end", "lookback_months": 18,
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+    return values
+
+
+def parse_non_revised_monthly_proxy(
+    series_id: str,
+    observations: list[dict[str, Any]],
+    aggregation_method: str,
+    end: date,
+) -> list[tuple[Any, ...]]:
+    by_month: dict[date, list[tuple[date, float]]] = {}
+    for item in observations:
+        if item.get("value") in {None, "."}:
+            continue
+        observation_date = date.fromisoformat(item["date"])
+        if observation_date > end:
+            continue
+        month = date(observation_date.year, observation_date.month, 1)
+        by_month.setdefault(month, []).append((observation_date, float(item["value"])))
+    values: list[tuple[Any, ...]] = []
+    for observation_month, monthly_values in sorted(by_month.items()):
+        if aggregation_method == "avg":
+            value = sum(item[1] for item in monthly_values) / len(monthly_values)
+        else:
+            value = max(monthly_values, key=lambda item: item[0])[1]
+        vintage_date = date(
+            observation_month.year, observation_month.month,
+            calendar.monthrange(observation_month.year, observation_month.month)[1],
+        )
+        if vintage_date > end:
+            continue
+        values.append(
+            (
+                "FRED_PIT_PROXY", series_id, observation_month, vintage_date, value,
+                f"https://fred.stlouisfed.org/series/{series_id}",
+                json.dumps(
+                    {
+                        "source_frequency": "daily", "stored_frequency": "monthly",
+                        "aggregation_method": aggregation_method,
+                        "point_in_time_method": "non_revised_market_series_month_end_proxy",
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+    return values
+
+
+def backfill_alfred_history() -> int:
+    api_key = os.getenv("FRED_API_KEY")
+    if not api_key:
+        raise RuntimeError("FRED_API_KEY is required")
+    today = datetime.now(timezone.utc).date()
+    vintages = month_ends(HISTORY_START, today)
+    session = requests.Session()
+    values: list[tuple[Any, ...]] = []
+    for series_id, aggregation_method in ALFRED_SERIES.items():
+        if series_id in ALFRED_DAILY_SERIES:
+            continue
+        chunk_size = 48
+        for vintage_chunk in _chunks(vintages, chunk_size):
+            try:
+                response = request_with_retries(
+                    session,
+                    FRED_URL,
+                    params={
+                        "series_id": series_id, "api_key": api_key, "file_type": "json",
+                        "output_type": 2,
+                        "vintage_dates": ",".join(item.isoformat() for item in vintage_chunk),
+                        "observation_start": (vintage_chunk[0] - timedelta(days=730)).isoformat(),
+                        "observation_end": vintage_chunk[-1].isoformat(),
+                        "limit": 100000,
+                    },
+                    timeout=60,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"ALFRED {series_id} vintages {vintage_chunk[0]}..{vintage_chunk[-1]}: {exc}"
+                ) from None
+            observations = response.json().get("observations", [])
+            values.extend(
+                parse_alfred_observations(
+                    series_id, vintage_chunk, observations, aggregation_method
+                )
+            )
+    for series_id in sorted(ALFRED_DAILY_SERIES):
+        response = request_with_retries(
+            session,
+            FRED_URL,
+            params={
+                "series_id": series_id, "api_key": api_key, "file_type": "json",
+                "observation_start": (HISTORY_START - timedelta(days=730)).isoformat(),
+                "observation_end": today.isoformat(), "limit": 100000,
+            },
+            timeout=60,
+        )
+        values.extend(
+            parse_non_revised_monthly_proxy(
+                series_id, response.json().get("observations", []),
+                ALFRED_SERIES[series_id], today,
+            )
+        )
+    if not values:
+        raise RuntimeError("ALFRED returned no point-in-time observations")
+    with database.postgres_connection() as conn:
+        conn.execute(
+            """CREATE TEMP TABLE alfred_stage(
+            provider text, series_id text, observation_date date, vintage_date date,
+            value double precision, source_url text, metadata_text text
+            ) ON COMMIT DROP"""
+        )
+        count = copy_rows(
+            conn,
+            "COPY alfred_stage(provider,series_id,observation_date,vintage_date,value,source_url,metadata_text) FROM STDIN",
+            values,
+            "alfred",
+        )
+        conn.execute(
+            """INSERT INTO public.macro_observations(
+            provider, series_id, observation_date, vintage_date, value, source_url,
+            is_point_in_time, metadata
+            ) SELECT provider, series_id, observation_date, vintage_date, value,
+            source_url, true, metadata_text::jsonb FROM alfred_stage
+            ON CONFLICT (provider, series_id, observation_date, vintage_date) DO UPDATE SET
+            value=excluded.value, source_url=excluded.source_url,
+            is_point_in_time=true, metadata=excluded.metadata, fetched_at=now()"""
+        )
+    return count
+
+
+def refresh_regime_labels() -> int:
+    return generate_and_store_regimes()
 
 
 def refresh_fred() -> int:
@@ -467,7 +757,7 @@ def refresh_fred() -> int:
             },
             timeout=30,
         )
-        response.raise_for_status()
+        raise_provider_error(response)
         for item in response.json().get("observations", []):
             if item.get("value") == ".":
                 continue
@@ -507,7 +797,7 @@ def refresh_news() -> int:
             },
             timeout=30,
         )
-        response.raise_for_status()
+        raise_provider_error(response)
         for item in response.json().get("results", []):
             publisher = item.get("publisher") or {}
             rows.append(
@@ -654,6 +944,12 @@ REFRESH_PROVIDERS: dict[str, Callable[[], int]] = {
     "news": refresh_news,
     "sec": refresh_sec,
     "markets": refresh_markets,
+    "regimes": refresh_regime_labels,
+}
+HISTORY_PROVIDERS: dict[str, Callable[[], int]] = {
+    "polygon": extend_polygon_history,
+    "alfred": backfill_alfred_history,
+    "regimes": refresh_regime_labels,
 }
 
 
@@ -675,7 +971,8 @@ def show_status() -> None:
             (SELECT count(*) FROM public.macro_observations) AS macro_observations,
             (SELECT count(*) FROM public.fundamental_periods) AS fundamental_periods,
             (SELECT count(*) FROM public.documents WHERE document_type='news') AS news_documents,
-            (SELECT count(*) FROM public.prediction_market_snapshots) AS market_snapshots"""
+            (SELECT count(*) FROM public.prediction_market_snapshots) AS market_snapshots,
+            (SELECT count(*) FROM public.macro_regime_labels) AS macro_regimes"""
         ).fetchone()
         latest = conn.execute(
             """SELECT provider, status, fetched_at, metadata
@@ -693,13 +990,19 @@ def main() -> int:
     backfill_parser.add_argument("--providers", default="all")
     refresh_parser = subparsers.add_parser("refresh")
     refresh_parser.add_argument("--providers", default="all")
+    history_parser = subparsers.add_parser("history")
+    history_parser.add_argument("--providers", default="all")
     subparsers.add_parser("status")
     args = parser.parse_args()
 
     if args.command == "status":
         show_status()
         return 0
-    available = BACKFILL_PROVIDERS if args.command == "backfill" else REFRESH_PROVIDERS
+    available = (
+        BACKFILL_PROVIDERS if args.command == "backfill"
+        else HISTORY_PROVIDERS if args.command == "history"
+        else REFRESH_PROVIDERS
+    )
     providers = parse_providers(args.providers, available)
     for provider in providers:
         run_recorded(provider, f"{args.command}:{provider}", available[provider])

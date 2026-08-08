@@ -9,11 +9,15 @@ type Holding = { ticker: string; shares?: number | null; weight?: number | null;
 type Scenario = { key: string; label: string; probability: number; confidence: number; change_1d?: number | null; change_1w?: number | null; change_1m?: number | null; indicators: string[]; sources: string[]; as_of: string; is_prior: boolean };
 type Research = { ticker: string; company: string; sector: string; industry: string; final_score: number; growth_rating: number; valuation_score: number; fundamental_score: number; industry_score: number; technical_score: number; news_score: number; confidence: number; data_quality: string; risk_flags: string[]; source?: string; price?: number | null; price_change_1y?: number | null; price_as_of?: string | null; fundamentals_as_of?: string | null; revenue_growth?: number | null; net_margin?: number | null; news_count?: number; latest_news?: { title: string; source_url?: string | null; published_at?: string | null } | null; data_source?: string };
 type Profile = { age: number; retirement_age: number; horizon_years: number; account_type: string; annual_contribution: number; annual_withdrawal: number; target_value: number; tax_rate: number; risk_tolerance: number; preset: string; restrictions: string[]; watchlist: string[]; objectives: Record<string, number>; llm_provider: string; llm_endpoint?: string | null; llm_model?: string | null };
-type Alternative = { name: string; expected_return: number; volatility: number; drawdown_range: number[]; turnover: number; effective_holdings: number; tradeoff: string; constraint_status: string; conflicts: string[]; allocations: Array<{ ticker: string; current_weight: number; target_weight: number; target_min: number; target_max: number; delta: number; reason: string }>; scenario_outcomes: Array<{ label: string; probability: number; estimated_return: number }>; projection: { nominal_p10: number; nominal_p50: number; nominal_p90: number; real_p50: number; goal_probability: number; assumptions: string }; tax: { available: boolean; estimated_realized_gain: number | null; estimated_tax: number | null; note: string } };
+type Alternative = { name: string; expected_return: number; volatility: number; drawdown_range: number[]; turnover: number; effective_holdings: number; tradeoff: string; constraint_status: string; conflicts: string[]; allocations: Array<{ ticker: string; current_weight: number; target_weight: number; target_min: number; target_max: number; delta: number; reason: string }>; scenario_outcomes: Array<{ label: string; probability: number; estimated_return: number; sample_count?: number; regime_months?: number; shrinkage?: number; method?: string }>; projection: { nominal_p10: number; nominal_p50: number; nominal_p90: number; real_p50: number; goal_probability: number; assumptions: string }; tax: { available: boolean; estimated_realized_gain: number | null; estimated_tax: number | null; note: string }; model_assumptions?: string[] };
 type Macro = { regime: string; score: number; as_of: string | null; source?: string; metrics?: Record<string, number | null> };
 type Contract = { provider: string; id: string; title: string; scenario: string; indicator: string; probability: number; confidence: number; volume?: number; open_interest?: number; source?: string };
 type DataStatus = { storage: string; counts: Record<string, number>; freshness: Record<string, string | null>; providers: Array<{ provider: string; status: string; fetched_at: string; metadata: Record<string, unknown> }> };
-type Analysis = { id: string; created_at: string; macro: Macro; scenarios: Scenario[]; research: Research[]; alternatives: Alternative[]; portfolio_value: number; warnings: string[]; scenario_warnings: string[]; data_lineage?: Record<string, string> };
+type RegimeSummary = { latest: { as_of_date: string; dominant_regime: string; confidence: number; data_quality: number } | null; sample_counts: Record<string, number>; total_samples: number };
+type ValidationMetrics = { name: string; annualized_return?: number | null; annualized_volatility?: number | null; max_drawdown?: number | null; sharpe?: number | null; average_turnover?: number; quarters_beating_equal_weight?: number; quarters_beating_static?: number };
+type WalkForward = { status: string; period_count: number; model?: ValidationMetrics; benchmarks: ValidationMetrics[]; assumptions: string[] };
+type ModelDiagnostics = { covariance: { method: string; sample_count: number; shrinkage_intensity: number; raw_condition_number?: number | null; shrunk_condition_number?: number | null; effective_rank: number; imputed_fraction: number }; regime_returns: { method: string; labelled_forward_months: number; prior_strength_months: number }; expected_return_blend: { empirical_regime_weight: number; company_research_weight: number } };
+type Analysis = { id: string; created_at: string; macro: Macro; scenarios: Scenario[]; research: Research[]; alternatives: Alternative[]; portfolio_value: number; warnings: string[]; scenario_warnings: string[]; data_lineage?: Record<string, string>; model_diagnostics?: ModelDiagnostics; walk_forward?: WalkForward; benchmarks?: ValidationMetrics[] };
 
 const defaultProfile: Profile = {
   age: 35, retirement_age: 65, horizon_years: 20, account_type: "taxable", annual_contribution: 12000,
@@ -43,7 +47,11 @@ function scoreTone(value: number) { return value >= 75 ? "good" : value >= 55 ? 
 
 export default function Dashboard() {
   const [tab, setTab] = useState<Tab>("overview");
-  const [dark, setDark] = useState(true);
+  const [dark, setDark] = useState(() =>
+    typeof window === "undefined"
+      ? true
+      : window.localStorage.getItem("investment-dashboard-theme") !== "light"
+  );
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
@@ -63,34 +71,35 @@ export default function Dashboard() {
   const [scenarioWarnings, setScenarioWarnings] = useState<string[]>(["Connect the local data service to refresh live prediction markets."]);
   const [research, setResearch] = useState<Research[]>([]);
   const [dataStatus, setDataStatus] = useState<DataStatus>({ storage: "pending", counts: {}, freshness: {}, providers: [] });
+  const [regimeHistory, setRegimeHistory] = useState<RegimeSummary>({ latest: null, sample_counts: {}, total_samples: 0 });
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [selectedAlternative, setSelectedAlternative] = useState(1);
   const [narrative, setNarrative] = useState("");
   const [sortKey, setSortKey] = useState<keyof Research>("final_score");
 
   useEffect(() => {
-    const savedTheme = window.localStorage.getItem("investment-dashboard-theme");
-    if (savedTheme) setDark(savedTheme === "dark");
-    loadOverview();
+    let active = true;
+    async function loadOverview() {
+      try {
+        const response = await fetch(`${API}/overview`);
+        if (!response.ok) throw new Error("Local API unavailable");
+        const data = await response.json();
+        if (!active) return;
+        setConnected(true);
+        if (data.portfolio) {
+          setPortfolioId(data.portfolio.id); setPortfolioName(data.portfolio.name); setHoldings(data.portfolio.holdings);
+        }
+        setProfile(data.profile); setMacro(data.macro); setScenarios(data.scenarios.scenarios); setContracts(data.scenarios.contracts || []); setScenarioFetchedAt(data.scenarios.fetched_at || null); setScenarioWarnings(data.scenarios.warnings); setResearch(data.research); setDataStatus(data.data_status); setRegimeHistory(data.regime_history || { latest: null, sample_counts: {}, total_samples: 0 });
+        if (data.latest_analysis?.alternatives?.length) setAnalysis(data.latest_analysis);
+      } catch {
+        if (active) setConnected(false);
+      } finally { if (active) setLoading(false); }
+    }
+    void loadOverview();
+    return () => { active = false; };
   }, []);
 
   useEffect(() => { document.documentElement.dataset.theme = dark ? "dark" : "light"; }, [dark]);
-
-  async function loadOverview() {
-    try {
-      const response = await fetch(`${API}/overview`);
-      if (!response.ok) throw new Error("Local API unavailable");
-      const data = await response.json();
-      setConnected(true);
-      if (data.portfolio) {
-        setPortfolioId(data.portfolio.id); setPortfolioName(data.portfolio.name); setHoldings(data.portfolio.holdings);
-      }
-      setProfile(data.profile); setMacro(data.macro); setScenarios(data.scenarios.scenarios); setContracts(data.scenarios.contracts || []); setScenarioFetchedAt(data.scenarios.fetched_at || null); setScenarioWarnings(data.scenarios.warnings); setResearch(data.research); setDataStatus(data.data_status);
-      if (data.latest_analysis?.alternatives?.length) setAnalysis(data.latest_analysis);
-    } catch {
-      setConnected(false);
-    } finally { setLoading(false); }
-  }
 
   function toggleTheme() {
     const next = !dark; setDark(next); window.localStorage.setItem("investment-dashboard-theme", next ? "dark" : "light");
@@ -176,7 +185,7 @@ export default function Dashboard() {
 
         {tab === "overview" && <Overview loading={loading} portfolioName={portfolioName} holdings={holdings} macro={macro} scenarios={scenarios} research={research} topScenario={topScenario} analysis={analysis} dataStatus={dataStatus} onNavigate={setTab} />}
         {tab === "portfolio" && <Portfolio holdings={holdings} setHoldings={setHoldings} name={portfolioName} setName={setPortfolioName} total={currentWeightTotal} onSave={savePortfolio} onImport={importCsv} />}
-        {tab === "scenarios" && <Scenarios scenarios={scenarios} contracts={contracts} fetchedAt={scenarioFetchedAt} warnings={scenarioWarnings} onRefresh={refreshMarkets} />}
+        {tab === "scenarios" && <Scenarios scenarios={scenarios} contracts={contracts} fetchedAt={scenarioFetchedAt} regimeHistory={regimeHistory} warnings={scenarioWarnings} onRefresh={refreshMarkets} />}
         {tab === "research" && <ResearchTable rows={sortedResearch} sortKey={sortKey} setSortKey={setSortKey} onNavigate={setTab} />}
         {tab === "optimize" && <Optimize profile={profile} setProfile={setProfile} analysis={analysis} selected={selectedAlternative} setSelected={setSelectedAlternative} onRun={runOptimization} narrative={narrative} onNarrative={generateNarrative} />}
       </main>
@@ -215,6 +224,7 @@ function Overview({ loading, portfolioName, holdings, macro, scenarios, research
         <DataSource label="Fundamentals" count={dataStatus.counts.fundamental_periods} date={dataStatus.freshness.fundamentals} />
         <DataSource label="News" count={dataStatus.counts.news_documents} date={dataStatus.freshness.news} />
         <DataSource label="Markets" count={dataStatus.counts.market_snapshots} date={dataStatus.freshness.markets} />
+        <DataSource label="Regimes" count={dataStatus.counts.macro_regimes} date={dataStatus.freshness.regimes} />
       </div>
     </div>
   </section>;
@@ -234,9 +244,10 @@ function Portfolio({ holdings, setHoldings, name, setName, total, onSave, onImpo
   </section>;
 }
 
-function Scenarios({ scenarios, contracts, fetchedAt, warnings, onRefresh }: { scenarios: Scenario[]; contracts: Contract[]; fetchedAt: string | null; warnings: string[]; onRefresh: () => void }) {
+function Scenarios({ scenarios, contracts, fetchedAt, regimeHistory, warnings, onRefresh }: { scenarios: Scenario[]; contracts: Contract[]; fetchedAt: string | null; regimeHistory: RegimeSummary; warnings: string[]; onRefresh: () => void }) {
   return <section className="workspace"><div className="section-intro"><div><span className="kicker">Prediction markets first</span><h2>Probabilities, with their confidence attached.</h2><p>Contracts are deduplicated, weighted by market quality, and shrunk toward disclosed priors when evidence is thin.</p></div><button className="primary refresh-button" onClick={onRefresh}>↻ Refresh markets</button></div>
     {warnings.length > 0 && <div className="warning-strip">{warnings.map(w => <span key={w}>△ {w}</span>)}</div>}
+    <div className="regime-sample-strip"><div><span>Point-in-time regime library</span><strong>{regimeHistory.total_samples} monthly samples</strong><small>{regimeHistory.latest ? `Latest: ${regimeHistory.latest.dominant_regime.replaceAll("_", " ")} · ${dateLabel(regimeHistory.latest.as_of_date)}` : "Historical labeling pending"}</small></div>{Object.entries(regimeHistory.sample_counts).sort((a,b) => b[1]-a[1]).map(([key,count]) => <div key={key}><span>{key.replaceAll("_", " ")}</span><strong>{count}</strong><small>{regimeHistory.total_samples ? pct(count / regimeHistory.total_samples) : "—"} of samples</small></div>)}</div>
     <div className="scenario-grid">{scenarios.map((scenario, index) => <article className="scenario-card" key={scenario.key}><div className="scenario-number">0{index + 1}</div><span className="confidence-dot"><i style={{ opacity: scenario.confidence }} /> {pct(scenario.confidence)} signal confidence</span><h3>{scenario.label}</h3><div className="big-probability">{pct(scenario.probability)}</div><div className="prob-track"><i style={{ width: `${scenario.probability * 100}%` }} /></div><div className="change-grid"><span>1 day<b className={(scenario.change_1d || 0) >= 0 ? "up" : "down"}>{scenario.change_1d == null ? "—" : `${scenario.change_1d > 0 ? "+" : ""}${pct(scenario.change_1d, 1)}`}</b></span><span>1 week<b>{scenario.change_1w == null ? "—" : pct(scenario.change_1w, 1)}</b></span><span>1 month<b>{scenario.change_1m == null ? "—" : pct(scenario.change_1m, 1)}</b></span></div><div className="indicator-tags">{scenario.indicators.length ? scenario.indicators.map(i => <span key={i}>{i}</span>) : <span>disclosed prior</span>}</div><footer>{scenario.is_prior ? "Market coverage unavailable or weak" : `${scenario.sources.length} linked source${scenario.sources.length === 1 ? "" : "s"}`}</footer></article>)}</div>
     <div className="panel contract-panel"><div className="panel-head"><div><span>Stored market evidence</span><h3>Contracts behind the probabilities</h3></div><small>Snapshot {dateLabel(fetchedAt)}</small></div>
       {contracts.length === 0 ? <EmptyState title="No matching contracts in this snapshot" body="The scenario cards above disclose when a prior is being used instead of prediction-market evidence." /> : <div className="table-scroll"><table className="contract-table"><thead><tr><th>Venue</th><th>Question</th><th>Indicator</th><th>Probability</th><th>Confidence</th><th>Activity</th></tr></thead><tbody>{[...contracts].sort((a,b) => b.confidence - a.confidence).slice(0,20).map(contract => <tr key={`${contract.provider}-${contract.id}`}><td><span className={`venue ${contract.provider.toLowerCase()}`}>{contract.provider}</span></td><td><a href={contract.source} target="_blank" rel="noreferrer">{contract.title}</a><small>{contract.scenario.replaceAll("_", " ")}</small></td><td>{contract.indicator}</td><td><strong>{pct(contract.probability,1)}</strong></td><td>{pct(contract.confidence,0)}</td><td>{compact((contract.volume || 0) + (contract.open_interest || 0))}</td></tr>)}</tbody></table></div>}
@@ -273,7 +284,10 @@ function Optimize({ profile, setProfile, analysis, selected, setSelected, onRun,
       <div className="result-summary"><div><span>Modeled return</span><strong>{pct(alternative.expected_return,1)}</strong></div><div><span>Volatility</span><strong>{pct(alternative.volatility,1)}</strong></div><div><span>Est. turnover</span><strong>{pct(alternative.turnover,1)}</strong></div><div><span>Effective holdings</span><strong>{alternative.effective_holdings}</strong></div></div>
       <div className="tradeoff"><span>Tradeoff</span><p>{alternative.tradeoff}</p><b className={alternative.constraint_status === "satisfied" ? "good" : "risk"}>{alternative.constraint_status}</b></div>
       <div className="model-lineage"><span>Model inputs</span><p>Prices: <b>{analysis.data_lineage?.prices || "validated history"}</b></p><p>Research: <b>{analysis.data_lineage?.research || "validated scores"}</b></p><p>Macro: <b>{analysis.data_lineage?.macro || "FRED"}</b></p></div>
-      <div className="panel scenario-outcome-panel"><div className="panel-head"><div><span>Scenario test</span><h3>Modeled return by macro state</h3></div><small>Probability-weighted inputs</small></div><div className="scenario-outcome-grid">{alternative.scenario_outcomes.map(outcome => <div key={outcome.label}><span>{outcome.label}</span><strong className={outcome.estimated_return >= 0 ? "good" : "risk"}>{outcome.estimated_return >= 0 ? "+" : ""}{pct(outcome.estimated_return,1)}</strong><small>{pct(outcome.probability)} scenario probability</small></div>)}</div></div>
+      {analysis.model_diagnostics && <div className="panel diagnostic-panel"><div className="panel-head"><div><span>Estimator diagnostics</span><h3>What the model trusted</h3></div><small>{analysis.model_diagnostics.covariance.sample_count} daily observations</small></div><div className="diagnostic-grid"><div><span>Covariance shrinkage</span><strong>{pct(analysis.model_diagnostics.covariance.shrinkage_intensity,1)}</strong><small>Condition {analysis.model_diagnostics.covariance.raw_condition_number ?? "—"} → {analysis.model_diagnostics.covariance.shrunk_condition_number ?? "—"}</small></div><div><span>Empirical regime weight</span><strong>{pct(analysis.model_diagnostics.expected_return_blend.empirical_regime_weight,1)}</strong><small>{analysis.model_diagnostics.regime_returns.labelled_forward_months} labeled forward months</small></div><div><span>Effective covariance rank</span><strong>{analysis.model_diagnostics.covariance.effective_rank.toFixed(1)}</strong><small>{pct(analysis.model_diagnostics.covariance.imputed_fraction,1)} missing observations imputed</small></div></div></div>}
+      {analysis.walk_forward && <div className="panel validation-panel"><div className="panel-head"><div><span>Walk-forward validation</span><h3>Out-of-sample comparison</h3></div><small>{analysis.walk_forward.status === "complete" ? `${analysis.walk_forward.period_count} quarterly tests` : "Insufficient overlapping history"}</small></div>{analysis.walk_forward.model && <div className="benchmark-grid">{[analysis.walk_forward.model, ...analysis.walk_forward.benchmarks].map(item => <div key={item.name} className={item.name.startsWith("Walk-forward") ? "primary-benchmark" : ""}><span>{item.name}</span><strong>{pct(item.annualized_return,1)}</strong><small>Vol {pct(item.annualized_volatility,1)} · Drawdown {pct(item.max_drawdown,1)}</small></div>)}</div>}<ul className="assumption-list">{analysis.walk_forward.assumptions.map(item => <li key={item}>{item}</li>)}</ul></div>}
+      <div className="panel scenario-outcome-panel"><div className="panel-head"><div><span>Scenario test</span><h3>Empirical return by macro state</h3></div><small>Prediction-market weighted</small></div><div className="scenario-outcome-grid">{alternative.scenario_outcomes.map(outcome => <div key={outcome.label}><span>{outcome.label}</span><strong className={outcome.estimated_return >= 0 ? "good" : "risk"}>{outcome.estimated_return >= 0 ? "+" : ""}{pct(outcome.estimated_return,1)}</strong><small>{pct(outcome.probability)} probability · n={outcome.sample_count ?? 0} · {pct(outcome.shrinkage,0)} shrunk</small></div>)}</div></div>
+      {alternative.model_assumptions?.length ? <div className="panel assumptions-panel"><div className="panel-head"><div><span>Assumptions beside this result</span><h3>How to read these estimates</h3></div></div><ul className="assumption-list">{alternative.model_assumptions.map(item => <li key={item}>{item}</li>)}</ul></div> : null}
       <div className="panel allocation-panel"><div className="panel-head"><div><span>Target ranges</span><h3>Allocation changes</h3></div><small>Current → target</small></div><div className="allocation-list">{alternative.allocations.map(item => <div key={item.ticker}><span className="ticker-badge neutral">{item.ticker.slice(0,4)}</span><p><strong>{item.ticker}</strong><small>{item.reason}</small></p><div className="allocation-values"><span>{pct(item.current_weight)}</span><b>→</b><strong>{pct(item.target_weight)}</strong><small>{pct(item.target_min)}–{pct(item.target_max)}</small></div><em className={item.delta >= 0 ? "up" : "down"}>{item.delta >= 0 ? "+" : ""}{pct(item.delta,1)}</em></div>)}</div></div>
       <div className="projection-grid"><div className="panel"><span className="kicker">Retirement range</span><h3>{money(alternative.projection.nominal_p50)}</h3><p>Median nominal value in {profile.horizon_years} years</p><div className="range-line"><i /><span style={{ left: "10%" }}>P10 {money(alternative.projection.nominal_p10)}</span><span style={{ right: "8%" }}>P90 {money(alternative.projection.nominal_p90)}</span></div><footer>{pct(alternative.projection.goal_probability)} modeled goal frequency</footer></div><div className="panel"><span className="kicker">Tax & turnover</span><h3>{alternative.tax.available ? money(alternative.tax.estimated_tax) : "Inputs needed"}</h3><p>{alternative.tax.note}</p><footer>{pct(alternative.turnover)} one-way turnover</footer></div></div>
       <div className="narrative-panel"><div><span>Optional explanation</span><h3>Validated facts in plain language</h3></div><button className="secondary" onClick={onNarrative}>Generate explanation</button>{narrative && <p>{narrative}</p>}</div>

@@ -25,6 +25,7 @@ EXPECTED_TABLES = {
     "holdings",
     "investor_profiles",
     "macro_observations",
+    "macro_regime_labels",
     "portfolios",
     "prediction_market_snapshots",
     "prediction_markets",

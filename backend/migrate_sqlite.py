@@ -168,7 +168,7 @@ def migrate(path: Path = database.DB_PATH) -> dict[str, int]:
                     warnings=excluded.warnings, result_snapshot=excluded.result_snapshot""",
                     (
                         row["id"], portfolio_id, primary_profile_id,
-                        result.get("model_version", "scenario-shrinkage-v1"), jsonb(request),
+                        result.get("model_version", "walk-forward-regime-shrinkage-v2"), jsonb(request),
                         jsonb(result.get("data_lineage", {})), jsonb(result.get("current_weights", {})),
                         jsonb(result.get("alternatives", [])), jsonb(result.get("warnings", [])),
                         jsonb(result), row["created_at"],
