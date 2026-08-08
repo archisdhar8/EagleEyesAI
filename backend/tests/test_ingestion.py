@@ -1,4 +1,6 @@
-from backend.ingestion import article_id, normalize_sec_payload, parse_providers
+from backend.ingestion import (
+    article_id, normalize_sec_payload, normalize_tiingo_prices, parse_providers,
+)
 
 
 class NewsRow:
@@ -36,3 +38,24 @@ def test_sec_normalization_uses_supported_forms() -> None:
     frame = normalize_sec_payload("TEST", payload)
     assert len(frame) == 1
     assert frame.iloc[0]["metrics"]["revenue"] == 100
+
+
+def test_tiingo_normalization_preserves_adjusted_close() -> None:
+    frame = normalize_tiingo_prices("aapl", [{
+        "date": "2020-08-31T00:00:00.000Z", "open": 127.58, "high": 131.0,
+        "low": 126.0, "close": 129.04, "adjClose": 125.88, "volume": 225702700,
+    }])
+    assert frame.to_dict("records") == [{
+        "ticker": "AAPL", "date": frame.iloc[0]["date"], "open": 127.58,
+        "high": 131.0, "low": 126.0, "close": 129.04,
+        "adjusted_close": 125.88, "volume": 225702700, "vwap": None,
+        "transactions": None,
+    }]
+
+
+def test_tiingo_normalization_drops_incomplete_bars() -> None:
+    frame = normalize_tiingo_prices("SPY", [
+        {"date": "2020-01-01T00:00:00Z", "close": 100, "adjClose": None},
+        {"date": None, "close": 100, "adjClose": 100},
+    ])
+    assert frame.empty

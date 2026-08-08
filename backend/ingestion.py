@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 from . import database
 from .regimes import generate_and_store_regimes, month_ends
-from .scenarios import refresh as refresh_scenarios
+from .scenarios import canonical_contract_series, refresh as refresh_scenarios
 
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -30,6 +30,7 @@ RANKINGS_CACHE = CACHE_ROOT / "outputs" / "stock_rankings.csv"
 
 POLYGON_BARS_URL = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
 POLYGON_NEWS_URL = "https://api.polygon.io/v2/reference/news"
+TIINGO_PRICES_URL = "https://api.tiingo.com/tiingo/daily/{ticker}/prices"
 FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
@@ -237,33 +238,37 @@ def upsert_price_frame(frame: pd.DataFrame, provider: str = "polygon") -> int:
             """CREATE TEMP TABLE price_stage(
             ticker text, asset_type text, bar_date date, open double precision,
             high double precision, low double precision, close double precision,
-            volume double precision, vwap double precision, transactions bigint
+            adjusted_close double precision, volume double precision,
+            vwap double precision, transactions bigint
             ) ON COMMIT DROP"""
         )
         rows = (
             (
                 str(row.ticker).upper(), asset_type(str(row.ticker)), clean(row.date),
                 clean(row.open), clean(row.high), clean(row.low), clean(row.close),
-                clean(row.volume), clean(row.vwap), clean(row.transactions),
+                clean(getattr(row, "adjusted_close", None)), clean(row.volume),
+                clean(row.vwap), clean(row.transactions),
             )
             for row in frame.itertuples(index=False)
         )
         count = copy_rows(
             conn,
-            "COPY price_stage(ticker,asset_type,bar_date,open,high,low,close,volume,vwap,transactions) FROM STDIN",
+            "COPY price_stage(ticker,asset_type,bar_date,open,high,low,close,adjusted_close,volume,vwap,transactions) FROM STDIN",
             rows,
             "prices",
         )
         conn.execute(
             """INSERT INTO public.price_bars(
-            security_id, provider, interval, ts, open, high, low, close, volume, vwap, transactions
+            security_id, provider, interval, ts, open, high, low, close,
+            adjusted_close, volume, vwap, transactions
             ) SELECT s.id, %s, '1d', p.bar_date::timestamptz, p.open, p.high, p.low,
-            p.close, p.volume, p.vwap, p.transactions
+            p.close, p.adjusted_close, p.volume, p.vwap, p.transactions
             FROM price_stage p JOIN public.securities s
               ON s.ticker=p.ticker AND s.asset_type=p.asset_type
             ON CONFLICT (security_id, provider, interval, ts) DO UPDATE SET
             open=excluded.open, high=excluded.high, low=excluded.low, close=excluded.close,
-            volume=excluded.volume, vwap=excluded.vwap, transactions=excluded.transactions,
+            adjusted_close=excluded.adjusted_close, volume=excluded.volume,
+            vwap=excluded.vwap, transactions=excluded.transactions,
             fetched_at=now()""",
             (provider,),
         )
@@ -493,6 +498,100 @@ def refresh_polygon() -> int:
             )
         )
     return upsert_price_frame(pd.concat(frames, ignore_index=True), "polygon") if frames else 0
+
+
+def normalize_tiingo_prices(ticker: str, payload: list[dict[str, Any]]) -> pd.DataFrame:
+    """Normalize Tiingo EOD bars while preserving its total-return adjusted close."""
+    rows: list[dict[str, Any]] = []
+    for item in payload:
+        raw_date = item.get("date")
+        close = clean(item.get("close"))
+        adjusted_close = clean(item.get("adjClose"))
+        if not raw_date or close is None or adjusted_close is None:
+            continue
+        rows.append({
+            "ticker": ticker.upper(),
+            "date": pd.Timestamp(raw_date).date(),
+            "open": clean(item.get("open")),
+            "high": clean(item.get("high")),
+            "low": clean(item.get("low")),
+            "close": close,
+            "adjusted_close": adjusted_close,
+            "volume": clean(item.get("volume")),
+            "vwap": None,
+            "transactions": None,
+        })
+    return pd.DataFrame(rows)
+
+
+def fetch_tiingo_prices(
+    session: requests.Session, ticker: str, start: date, end: date, api_key: str,
+) -> pd.DataFrame:
+    response = request_with_retries(
+        session,
+        TIINGO_PRICES_URL.format(ticker=ticker),
+        params={
+            "startDate": start.isoformat(), "endDate": end.isoformat(),
+            "resampleFreq": "daily", "token": api_key,
+        },
+    )
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError("Tiingo returned an unexpected price payload")
+    return normalize_tiingo_prices(ticker, payload)
+
+
+def _load_tiingo_prices(full_history: bool) -> int:
+    api_key = os.getenv("TIINGO_API_KEY")
+    if not api_key:
+        raise RuntimeError("TIINGO_API_KEY is required")
+    today = datetime.now(timezone.utc).date()
+    candidates = sorted((set(active_tickers()) | ETF_TICKERS) - {"CASH"})
+    earliest: dict[str, date | None] = {}
+    latest: dict[str, date | None] = {}
+    with database.postgres_connection() as conn:
+        rows = conn.execute(
+            """SELECT s.ticker, min(p.ts)::date AS earliest, max(p.ts)::date AS latest
+            FROM public.securities s LEFT JOIN public.price_bars p
+              ON p.security_id=s.id AND p.provider='tiingo'
+            WHERE s.ticker = ANY(%s) GROUP BY s.ticker""",
+            (candidates,),
+        ).fetchall()
+    for row in rows:
+        earliest[row["ticker"]] = row["earliest"]
+        latest[row["ticker"]] = row["latest"]
+    if full_history:
+        candidates.sort(key=lambda ticker: (earliest.get(ticker) is not None, earliest.get(ticker) or date.min, ticker))
+    else:
+        candidates.sort(key=lambda ticker: (latest.get(ticker) is not None, latest.get(ticker) or date.min, ticker))
+    # Tiingo's individual tier permits 50 requests/hour. Subsequent scheduled
+    # runs naturally pick up symbols that are still missing or least current.
+    tickers = candidates[:50]
+
+    session = requests.Session()
+    frames: list[pd.DataFrame] = []
+    for ticker in tickers:
+        if full_history:
+            # Fetch the full coherent series. Upserts make repeated backfills safe.
+            start = date(1990, 1, 1)
+        else:
+            start = (latest.get(ticker) - timedelta(days=7)) if latest.get(ticker) else HISTORY_START
+        if start > today:
+            continue
+        frame = fetch_tiingo_prices(session, ticker, start, today, api_key)
+        if not frame.empty:
+            frames.append(frame)
+    if not frames:
+        raise RuntimeError("Tiingo returned no historical price bars")
+    return upsert_price_frame(pd.concat(frames, ignore_index=True), "tiingo")
+
+
+def refresh_tiingo() -> int:
+    return _load_tiingo_prices(full_history=False)
+
+
+def extend_tiingo_history() -> int:
+    return _load_tiingo_prices(full_history=True)
 
 
 def extend_polygon_history() -> int:
@@ -899,36 +998,103 @@ def refresh_markets() -> int:
     with database.postgres_connection() as conn:
         for contract in contracts:
             provider = str(contract["provider"]).lower()
+            canonical_key, threshold_bucket = canonical_contract_series(contract)
+            series_id = conn.execute(
+                """INSERT INTO public.prediction_contract_series(
+                canonical_key, canonical_scenario, indicator, threshold_bucket,
+                description, metadata
+                ) VALUES (%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (canonical_key) DO UPDATE SET
+                canonical_scenario=excluded.canonical_scenario,
+                indicator=excluded.indicator,
+                threshold_bucket=excluded.threshold_bucket,
+                description=excluded.description,
+                metadata=excluded.metadata
+                RETURNING id""",
+                (
+                    canonical_key, contract.get("scenario"), contract.get("indicator"),
+                    database._jsonb(threshold_bucket), contract.get("title"),
+                    database._jsonb({"mapping_version": "canonical-contract-v1"}),
+                ),
+            ).fetchone()["id"]
             market_id = conn.execute(
                 """INSERT INTO public.prediction_markets(
                 provider, external_market_id, canonical_question, canonical_scenario,
-                title, source_url, metadata
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+                title, source_url, metadata, series_id, threshold_bucket, closes_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (provider, external_market_id) DO UPDATE SET
                 canonical_question=excluded.canonical_question,
                 canonical_scenario=excluded.canonical_scenario, title=excluded.title,
-                source_url=excluded.source_url, metadata=excluded.metadata, updated_at=now()
+                source_url=excluded.source_url, metadata=excluded.metadata,
+                series_id=excluded.series_id, threshold_bucket=excluded.threshold_bucket,
+                closes_at=excluded.closes_at, updated_at=now()
                 RETURNING id""",
                 (
                     provider, contract["id"], contract["title"], contract.get("scenario"),
                     contract["title"], contract.get("source"),
-                    database._jsonb({"indicator": contract.get("indicator"), "event_id": contract.get("event_id")}),
+                    database._jsonb({
+                        "indicator": contract.get("indicator"),
+                        "event_id": contract.get("event_id"),
+                        "token_ids": contract.get("token_ids"),
+                    }),
+                    series_id, database._jsonb(threshold_bucket), contract.get("closes_at"),
                 ),
             ).fetchone()["id"]
             conn.execute(
                 """INSERT INTO public.prediction_market_snapshots(
-                market_id, observed_at, probability, volume, open_interest, confidence, raw_payload
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+                market_id, observed_at, probability, bid, ask, volume, open_interest,
+                confidence, raw_payload
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (market_id, observed_at) DO UPDATE SET
-                probability=excluded.probability, volume=excluded.volume,
+                probability=excluded.probability, bid=excluded.bid, ask=excluded.ask,
+                volume=excluded.volume,
                 open_interest=excluded.open_interest, confidence=excluded.confidence,
                 raw_payload=excluded.raw_payload""",
                 (
-                    market_id, observed_at, contract["probability"], contract.get("volume"),
-                    contract.get("open_interest"), contract.get("confidence"), database._jsonb(contract),
+                    market_id, observed_at, contract["probability"], contract.get("bid"),
+                    contract.get("ask"), contract.get("volume"), contract.get("open_interest"),
+                    contract.get("confidence"), database._jsonb(contract),
                 ),
             )
     return len(contracts)
+
+
+def backfill_market_series() -> int:
+    """Attach previously stored venue contracts to canonical expiration-spanning series."""
+    with database.postgres_connection() as conn:
+        rows = conn.execute(
+            """SELECT id, title, canonical_scenario, threshold_bucket, metadata
+            FROM public.prediction_markets WHERE series_id IS NULL"""
+        ).fetchall()
+        count = 0
+        for row in rows:
+            metadata = row["metadata"] or {}
+            contract = {
+                "title": row["title"], "scenario": row["canonical_scenario"],
+                "indicator": metadata.get("indicator") or "macro outcome",
+                "threshold_bucket": row["threshold_bucket"] or {},
+            }
+            canonical_key, threshold_bucket = canonical_contract_series(contract)
+            series_id = conn.execute(
+                """INSERT INTO public.prediction_contract_series(
+                canonical_key, canonical_scenario, indicator, threshold_bucket,
+                description, metadata
+                ) VALUES (%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (canonical_key) DO UPDATE SET updated_at=now()
+                RETURNING id""",
+                (
+                    canonical_key, contract["scenario"], contract["indicator"],
+                    database._jsonb(threshold_bucket), contract["title"],
+                    database._jsonb({"mapping_version": "canonical-contract-v1", "backfilled": True}),
+                ),
+            ).fetchone()["id"]
+            conn.execute(
+                """UPDATE public.prediction_markets
+                SET series_id=%s, threshold_bucket=%s, updated_at=now() WHERE id=%s""",
+                (series_id, database._jsonb(threshold_bucket), row["id"]),
+            )
+            count += 1
+    return count
 
 
 BACKFILL_PROVIDERS: dict[str, Callable[[], int]] = {
@@ -937,9 +1103,11 @@ BACKFILL_PROVIDERS: dict[str, Callable[[], int]] = {
     "fundamentals": backfill_fundamentals,
     "news": backfill_news,
     "markets": refresh_markets,
+    "market_series": backfill_market_series,
 }
 REFRESH_PROVIDERS: dict[str, Callable[[], int]] = {
     "polygon": refresh_polygon,
+    "tiingo": refresh_tiingo,
     "fred": refresh_fred,
     "news": refresh_news,
     "sec": refresh_sec,
@@ -948,6 +1116,7 @@ REFRESH_PROVIDERS: dict[str, Callable[[], int]] = {
 }
 HISTORY_PROVIDERS: dict[str, Callable[[], int]] = {
     "polygon": extend_polygon_history,
+    "tiingo": extend_tiingo_history,
     "alfred": backfill_alfred_history,
     "regimes": refresh_regime_labels,
 }

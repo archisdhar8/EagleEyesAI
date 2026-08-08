@@ -1,6 +1,8 @@
 import pytest
 
-from backend.scenarios import build_scenarios, normalize_kalshi, normalize_polymarket
+from backend.scenarios import (
+    build_scenarios, canonical_contract_series, normalize_kalshi, normalize_polymarket,
+)
 
 
 def test_kalshi_confidence_ignores_deprecated_liquidity() -> None:
@@ -31,3 +33,19 @@ def test_duplicate_contracts_do_not_count_twice() -> None:
     recession = next(item for item in scenarios if item["key"] == "recession_cuts")
     assert recession["probability"] < .7
     assert abs(sum(item["probability"] for item in scenarios) - 1) < 0.001
+
+
+def test_contract_series_links_expirations_and_preserves_thresholds() -> None:
+    january = {
+        "scenario": "sticky_inflation", "indicator": "inflation path",
+        "title": "Will CPI inflation be above 3% in January 2027?",
+    }
+    february = {**january, "title": "Will CPI inflation be above 3% in February 2027?"}
+    lower = {**january, "title": "Will CPI inflation be below 2% in January 2027?"}
+    january_key, january_bucket = canonical_contract_series(january)
+    february_key, _ = canonical_contract_series(february)
+    lower_key, lower_bucket = canonical_contract_series(lower)
+    assert january_key == february_key
+    assert january_key != lower_key
+    assert january_bucket == {"operator": "gte", "value": 3.0, "unit": "%"}
+    assert lower_bucket["operator"] == "lte"

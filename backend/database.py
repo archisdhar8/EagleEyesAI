@@ -435,16 +435,40 @@ def _upsert_model_version(
     row = conn.execute(
         """INSERT INTO public.model_versions(
         model_key, version, model_type, status, configuration, assumptions
-        ) VALUES (%s,%s,%s,%s,%s,%s)
+        ) VALUES (%s,%s,%s,'evaluation',%s,%s)
         ON CONFLICT (model_key, version) DO UPDATE SET
-        status=excluded.status, configuration=excluded.configuration,
+        configuration=excluded.configuration,
         assumptions=excluded.assumptions
-        RETURNING id""",
+        RETURNING id, status""",
         (
-            model_key, version, model_type, status,
-            _jsonb(configuration), _jsonb(assumptions),
+            model_key, version, model_type, _jsonb(configuration), _jsonb(assumptions),
         ),
     ).fetchone()
+    if status == "production" and row["status"] != "production":
+        existing = conn.execute(
+            """SELECT id FROM public.model_promotion_decisions
+            WHERE model_version_id=%s AND decision='promote'
+              AND requested_status='production' LIMIT 1""",
+            (row["id"],),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """INSERT INTO public.model_promotion_decisions(
+                model_version_id, decision, previous_status, requested_status,
+                rationale, gates, evidence, decided_by
+                ) VALUES (%s,'promote','evaluation','production',%s,%s,%s,%s)""",
+                (
+                    row["id"],
+                    "Transparent baseline approved under the recorded baseline policy; challengers remain evaluation-only.",
+                    _jsonb({"transparent": True, "automatic_challenger_promotion": False}),
+                    _jsonb({"model_key": model_key, "version": version}),
+                    "baseline-policy",
+                ),
+            )
+        conn.execute(
+            "UPDATE public.model_versions SET status='production' WHERE id=%s",
+            (row["id"],),
+        )
     return str(row["id"])
 
 
@@ -628,6 +652,145 @@ def validation_history(limit: int = 20) -> list[dict[str, Any]]:
     ]
 
 
+def prediction_calibration_inputs() -> list[dict[str, Any]]:
+    if not DATABASE_URL:
+        return []
+    with postgres_connection() as conn:
+        rows = conn.execute(
+            """WITH monthly AS (
+              SELECT ss.id, ss.observed_at,
+              row_number() OVER (
+                PARTITION BY date_trunc('month', ss.observed_at)
+                ORDER BY ss.observed_at DESC
+              ) AS position
+              FROM public.scenario_snapshots ss
+              WHERE EXISTS (
+                SELECT 1 FROM public.scenario_probabilities sp
+                WHERE sp.snapshot_id=ss.id AND sp.is_prior=false
+              )
+            )
+            SELECT m.id AS snapshot_id, m.observed_at, sp.scenario_key,
+            sp.probability, sp.is_prior, realized.as_of_date AS realized_at,
+            realized.dominant_regime
+            FROM monthly m
+            JOIN public.scenario_probabilities sp ON sp.snapshot_id=m.id
+            JOIN LATERAL (
+              SELECT as_of_date, dominant_regime
+              FROM public.macro_regime_labels
+              WHERE as_of_date > (date_trunc('month', m.observed_at) + interval '1 month - 1 day')::date
+              ORDER BY as_of_date LIMIT 1
+            ) realized ON true
+            WHERE m.position=1
+            ORDER BY m.observed_at, sp.scenario_key"""
+        ).fetchall()
+    return [
+        {
+            **dict(row), "snapshot_id": str(row["snapshot_id"]),
+            "observed_at": _iso(row["observed_at"]),
+            "realized_at": _iso(row["realized_at"]),
+            "probability": _number(row["probability"]),
+        }
+        for row in rows
+    ]
+
+
+def save_prediction_calibration(result: dict[str, Any]) -> str | None:
+    if not DATABASE_URL:
+        return None
+    with postgres_connection() as conn:
+        row = conn.execute(
+            """INSERT INTO public.prediction_market_calibration_runs(
+            model_version, horizon_months, data_cutoff, sample_count,
+            genuine_market_sample_count, brier_score, calibration_error,
+            status, metrics, assumptions
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (
+                result.get("model_version", "prediction-market-v1"),
+                result.get("horizon_months", 1), result["data_cutoff"],
+                result.get("sample_count", 0), result.get("genuine_market_sample_count", 0),
+                result.get("brier_score"), result.get("calibration_error"),
+                result.get("status", "failed"), _jsonb(result.get("metrics", {})),
+                _jsonb(result.get("assumptions", [])),
+            ),
+        ).fetchone()
+    return str(row["id"])
+
+
+def latest_monitoring_run() -> dict[str, Any] | None:
+    if not DATABASE_URL:
+        return None
+    with postgres_connection() as conn:
+        row = conn.execute(
+            """SELECT mmr.*, mv.model_key, mv.version,
+            pmc.status AS calibration_status, pmc.sample_count AS calibration_samples,
+            pmc.brier_score, pmc.calibration_error
+            FROM public.model_monitoring_runs mmr
+            JOIN public.model_versions mv ON mv.id=mmr.model_version_id
+            LEFT JOIN public.prediction_market_calibration_runs pmc
+              ON pmc.id=mmr.market_calibration_run_id
+            ORDER BY mmr.created_at DESC LIMIT 1"""
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        **dict(row), "id": str(row["id"]),
+        "model_version_id": str(row["model_version_id"]),
+        "analysis_run_id": str(row["analysis_run_id"]) if row["analysis_run_id"] else None,
+        "market_calibration_run_id": str(row["market_calibration_run_id"]) if row["market_calibration_run_id"] else None,
+        "data_cutoff": _iso(row["data_cutoff"]), "created_at": _iso(row["created_at"]),
+    }
+
+
+def save_monitoring_run(
+    *, analysis_run_id: str, calibration_run_id: str | None, status: str,
+    data_cutoff: str, metrics: dict[str, Any], alerts: list[str],
+    freshness: dict[str, Any], coverage: dict[str, Any],
+) -> str:
+    if not DATABASE_URL:
+        raise RuntimeError("Supabase is required for model monitoring")
+    with postgres_connection() as conn:
+        model = conn.execute(
+            """SELECT id FROM public.model_versions
+            WHERE model_key='portfolio_optimizer' AND status='production'
+            ORDER BY created_at DESC LIMIT 1"""
+        ).fetchone()
+        if model is None:
+            raise RuntimeError("No recorded production optimizer version is available")
+        row = conn.execute(
+            """INSERT INTO public.model_monitoring_runs(
+            model_version_id, analysis_run_id, status, data_cutoff,
+            market_calibration_run_id, metrics, alerts, data_freshness, coverage
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (
+                model["id"], analysis_run_id, status, data_cutoff,
+                calibration_run_id, _jsonb(metrics), _jsonb(alerts),
+                _jsonb(freshness), _jsonb(coverage),
+            ),
+        ).fetchone()
+    return str(row["id"])
+
+
+def promotion_decisions(limit: int = 20) -> list[dict[str, Any]]:
+    if not DATABASE_URL:
+        return []
+    with postgres_connection() as conn:
+        rows = conn.execute(
+            """SELECT d.*, mv.model_key, mv.version
+            FROM public.model_promotion_decisions d
+            JOIN public.model_versions mv ON mv.id=d.model_version_id
+            ORDER BY d.decided_at DESC LIMIT %s""",
+            (max(1, min(limit, 100)),),
+        ).fetchall()
+    return [
+        {
+            **dict(row), "id": str(row["id"]),
+            "model_version_id": str(row["model_version_id"]),
+            "decided_at": _iso(row["decided_at"]),
+        }
+        for row in rows
+    ]
+
+
 def load_analysis(run_id: str) -> dict[str, Any]:
     if DATABASE_URL:
         with postgres_connection() as conn:
@@ -688,6 +851,11 @@ def provider_data_status() -> dict[str, Any]:
             metadata, error_message FROM public.provider_fetches
             ORDER BY provider, fetched_at DESC"""
         ).fetchall()
+        price_coverage = conn.execute(
+            """SELECT p.provider, count(*) AS bars, count(DISTINCT p.security_id) AS symbols,
+            min(p.ts) AS earliest, max(p.ts) AS latest
+            FROM public.price_bars p GROUP BY p.provider ORDER BY p.provider"""
+        ).fetchall()
     return {
         "storage": "supabase",
         "counts": {key: int(value or 0) for key, value in counts.items()},
@@ -699,6 +867,14 @@ def provider_data_status() -> dict[str, Any]:
                 "metadata": row["metadata"] or {}, "error": row["error_message"],
             }
             for row in providers
+        ],
+        "price_coverage": [
+            {
+                "provider": row["provider"], "bars": int(row["bars"] or 0),
+                "symbols": int(row["symbols"] or 0), "earliest": _iso(row["earliest"]),
+                "latest": _iso(row["latest"]),
+            }
+            for row in price_coverage
         ],
     }
 
@@ -811,16 +987,41 @@ def price_history(tickers: list[str], limit_per_ticker: int = 5000) -> list[dict
         return []
     with postgres_connection() as conn:
         rows = conn.execute(
-            """SELECT ticker, ts, close FROM (
-              SELECT s.ticker, p.ts, p.close,
+            """WITH provider_stats AS (
+              SELECT s.ticker, p.provider, count(*) AS samples,
+              min(p.ts) AS first_bar, max(p.ts) AS last_bar
+              FROM public.price_bars p JOIN public.securities s ON s.id=p.security_id
+              WHERE s.ticker = ANY(%s) AND p.interval='1d'
+                AND coalesce(p.adjusted_close, p.close) IS NOT NULL
+              GROUP BY s.ticker, p.provider
+            ), selected_provider AS (
+              SELECT ticker, provider FROM (
+                SELECT ticker, provider,
+                row_number() OVER (
+                  PARTITION BY ticker
+                  ORDER BY (last_bar-first_bar) DESC, samples DESC,
+                    CASE WHEN provider='tiingo' THEN 0 ELSE 1 END
+                ) AS priority
+                FROM provider_stats
+              ) ranked WHERE priority=1
+            )
+            SELECT ticker, provider, ts, close FROM (
+              SELECT s.ticker, p.provider, p.ts,
+              coalesce(p.adjusted_close, p.close) AS close,
               row_number() OVER (PARTITION BY s.ticker ORDER BY p.ts DESC) AS position
               FROM public.price_bars p JOIN public.securities s ON s.id=p.security_id
-              WHERE s.ticker = ANY(%s) AND p.interval='1d' AND p.close IS NOT NULL
+              JOIN selected_provider chosen
+                ON chosen.ticker=s.ticker AND chosen.provider=p.provider
+              WHERE s.ticker = ANY(%s) AND p.interval='1d'
+                AND coalesce(p.adjusted_close, p.close) IS NOT NULL
             ) bars WHERE position <= %s ORDER BY ticker, ts""",
-            (normalized, max(1, min(limit_per_ticker, 10000))),
+            (normalized, normalized, max(1, min(limit_per_ticker, 10000))),
         ).fetchall()
     return [
-        {"ticker": row["ticker"], "date": _iso(row["ts"]), "close": _number(row["close"])}
+        {
+            "ticker": row["ticker"], "date": _iso(row["ts"]),
+            "close": _number(row["close"]), "provider": row["provider"],
+        }
         for row in rows
     ]
 
