@@ -418,6 +418,7 @@ def save_analysis(run_id: str, request: dict[str, Any], result: dict[str, Any]) 
                     _jsonb(result), result.get("created_at", utc_now()),
                 ),
             )
+            _save_validation_artifacts(conn, run_id, result)
         return
 
     with sqlite_connection() as conn:
@@ -425,6 +426,206 @@ def save_analysis(run_id: str, request: dict[str, Any], result: dict[str, Any]) 
             "INSERT INTO analysis_runs(id, request_json, result_json, created_at) VALUES (?, ?, ?, ?)",
             (run_id, json.dumps(request, default=str), json.dumps(result, default=str), utc_now()),
         )
+
+
+def _upsert_model_version(
+    conn: psycopg.Connection, *, model_key: str, version: str, model_type: str,
+    status: str, configuration: dict[str, Any], assumptions: list[str],
+) -> str:
+    row = conn.execute(
+        """INSERT INTO public.model_versions(
+        model_key, version, model_type, status, configuration, assumptions
+        ) VALUES (%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (model_key, version) DO UPDATE SET
+        status=excluded.status, configuration=excluded.configuration,
+        assumptions=excluded.assumptions
+        RETURNING id""",
+        (
+            model_key, version, model_type, status,
+            _jsonb(configuration), _jsonb(assumptions),
+        ),
+    ).fetchone()
+    return str(row["id"])
+
+
+def _upsert_validation_run(
+    conn: psycopg.Connection, *, analysis_run_id: str, model_version_id: str,
+    validation_type: str, status: str, data_cutoff: str | None,
+    configuration: dict[str, Any], aggregate_metrics: dict[str, Any],
+    benchmarks: list[dict[str, Any]], recommendation: str | None,
+    assumptions: list[str], folds: list[dict[str, Any]],
+) -> str:
+    row = conn.execute(
+        """INSERT INTO public.validation_runs(
+        analysis_run_id, model_version_id, validation_type, status, data_cutoff,
+        configuration, aggregate_metrics, benchmark_comparisons, recommendation, assumptions
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (analysis_run_id, model_version_id, validation_type) DO UPDATE SET
+        status=excluded.status, data_cutoff=excluded.data_cutoff,
+        configuration=excluded.configuration, aggregate_metrics=excluded.aggregate_metrics,
+        benchmark_comparisons=excluded.benchmark_comparisons,
+        recommendation=excluded.recommendation, assumptions=excluded.assumptions
+        RETURNING id""",
+        (
+            analysis_run_id, model_version_id, validation_type, status, data_cutoff,
+            _jsonb(configuration), _jsonb(aggregate_metrics), _jsonb(benchmarks),
+            recommendation, _jsonb(assumptions),
+        ),
+    ).fetchone()
+    validation_run_id = str(row["id"])
+    conn.execute(
+        "DELETE FROM public.validation_folds WHERE validation_run_id=%s",
+        (validation_run_id,),
+    )
+    for index, fold in enumerate(folds):
+        conn.execute(
+            """INSERT INTO public.validation_folds(
+            validation_run_id, fold_index, train_start, train_end, test_start,
+            test_end, data_cutoff, sample_counts, metrics, benchmark_metrics,
+            diagnostics, leakage_check
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (
+                validation_run_id, int(fold.get("fold_index", index)),
+                fold.get("train_start"), fold["train_end"], fold["test_start"],
+                fold["test_end"], fold.get("data_cutoff") or fold["train_end"],
+                _jsonb(fold.get("sample_counts", {})), _jsonb(fold.get("metrics", {})),
+                _jsonb(fold.get("benchmark_metrics", {})),
+                _jsonb(fold.get("diagnostics", {})), bool(fold.get("leakage_check", False)),
+            ),
+        )
+    return validation_run_id
+
+
+def _save_validation_artifacts(
+    conn: psycopg.Connection, analysis_run_id: str, result: dict[str, Any]
+) -> None:
+    walk = result.get("walk_forward") or {}
+    model_diagnostics = result.get("model_diagnostics") or {}
+    optimizer_assumptions = next(
+        (
+            item.get("model_assumptions", []) for item in result.get("alternatives", [])
+            if item.get("name") == "Balanced"
+        ),
+        walk.get("assumptions", []),
+    )
+    optimizer_id = _upsert_model_version(
+        conn, model_key="portfolio_optimizer",
+        version=result.get("model_version", "walk-forward-regime-shrinkage-v2"),
+        model_type="optimizer", status="production",
+        configuration=model_diagnostics, assumptions=optimizer_assumptions,
+    )
+    _upsert_model_version(
+        conn, model_key="macro_regime_rules", version="macro-regime-rules-v1",
+        model_type="regime_rules", status="production",
+        configuration={"states": 5, "point_in_time": True},
+        assumptions=["Transparent rules use only macro observations available by each month-end cutoff."],
+    )
+    walk_folds = [
+        {
+            "fold_index": index, "train_end": fold["train_end"],
+            "test_start": fold["test_start"], "test_end": fold["test_end"],
+            "data_cutoff": fold["train_end"],
+            "sample_counts": {
+                "eligible_assets": fold.get("eligible_assets"),
+                "regime_training_months": fold.get("regime_training_months"),
+            },
+            "metrics": {
+                "model_return": fold.get("model_return"), "turnover": fold.get("turnover"),
+            },
+            "benchmark_metrics": {
+                "equal_weight_return": fold.get("equal_weight_return"),
+                "static_return": fold.get("static_return"),
+            },
+            "diagnostics": {"validation_method": "quarterly expanding-window walk-forward"},
+            "leakage_check": fold["train_end"] < fold["test_start"],
+        }
+        for index, fold in enumerate(walk.get("periods", []))
+    ]
+    _upsert_validation_run(
+        conn, analysis_run_id=analysis_run_id, model_version_id=optimizer_id,
+        validation_type="portfolio_walk_forward", status=walk.get("status", "failed"),
+        data_cutoff=(walk.get("periods") or [{}])[-1].get("test_end"),
+        configuration={"period_count": walk.get("period_count", 0)},
+        aggregate_metrics=walk.get("model", {}), benchmarks=walk.get("benchmarks", []),
+        recommendation=None, assumptions=walk.get("assumptions", []), folds=walk_folds,
+    )
+
+    evaluation = result.get("ml_regime_evaluation") or {}
+    classifier_id = _upsert_model_version(
+        conn, model_key="regime_classifier",
+        version=evaluation.get("model_version", "multinomial-logit-regime-v1"),
+        model_type="regime_classifier", status="evaluation",
+        configuration=evaluation.get("configuration", {}),
+        assumptions=evaluation.get("assumptions", []),
+    )
+    classifier_folds = [
+        {
+            **fold,
+            "sample_counts": {
+                "train_samples": fold.get("train_samples"),
+                "test_samples": fold.get("test_samples"),
+            },
+            "metrics": fold.get("ml_metrics", {}),
+            "benchmark_metrics": fold.get("baseline_metrics", {}),
+        }
+        for fold in evaluation.get("folds", [])
+    ]
+    _upsert_validation_run(
+        conn, analysis_run_id=analysis_run_id, model_version_id=classifier_id,
+        validation_type="regime_classification",
+        status=evaluation.get("status", "failed"),
+        data_cutoff=(evaluation.get("folds") or [{}])[-1].get("test_end"),
+        configuration=evaluation.get("configuration", {}),
+        aggregate_metrics={
+            "ml_classifier": evaluation.get("ml_classifier", {}),
+            "transparent_baseline": evaluation.get("transparent_baseline", {}),
+            "comparison": evaluation.get("comparison", {}),
+        },
+        benchmarks=[{"name": "Transparent rules", **evaluation.get("transparent_baseline", {})}],
+        recommendation=evaluation.get("recommendation"),
+        assumptions=evaluation.get("assumptions", []), folds=classifier_folds,
+    )
+
+
+def validation_history(limit: int = 20) -> list[dict[str, Any]]:
+    if not DATABASE_URL:
+        return []
+    with postgres_connection() as conn:
+        runs = conn.execute(
+            """SELECT vr.id, vr.analysis_run_id, vr.validation_type, vr.status,
+            vr.data_cutoff, vr.aggregate_metrics, vr.benchmark_comparisons,
+            vr.recommendation, vr.assumptions, vr.created_at,
+            mv.model_key, mv.version, mv.model_type, mv.status AS model_status
+            FROM public.validation_runs vr
+            JOIN public.model_versions mv ON mv.id=vr.model_version_id
+            ORDER BY vr.created_at DESC LIMIT %s""",
+            (max(1, min(limit, 100)),),
+        ).fetchall()
+        run_ids = [row["id"] for row in runs]
+        folds = conn.execute(
+            """SELECT validation_run_id, fold_index, train_start, train_end,
+            test_start, test_end, data_cutoff, sample_counts, metrics,
+            benchmark_metrics, diagnostics, leakage_check
+            FROM public.validation_folds WHERE validation_run_id = ANY(%s)
+            ORDER BY validation_run_id, fold_index""",
+            (run_ids,),
+        ).fetchall() if run_ids else []
+    by_run: dict[str, list[dict[str, Any]]] = {}
+    for fold in folds:
+        item = dict(fold)
+        run_key = str(item.pop("validation_run_id"))
+        for key in ("train_start", "train_end", "test_start", "test_end", "data_cutoff"):
+            item[key] = _iso(item[key])
+        by_run.setdefault(run_key, []).append(item)
+    return [
+        {
+            **dict(row), "id": str(row["id"]),
+            "analysis_run_id": str(row["analysis_run_id"]) if row["analysis_run_id"] else None,
+            "data_cutoff": _iso(row["data_cutoff"]), "created_at": _iso(row["created_at"]),
+            "folds": by_run.get(str(row["id"]), []),
+        }
+        for row in runs
+    ]
 
 
 def load_analysis(run_id: str) -> dict[str, Any]:

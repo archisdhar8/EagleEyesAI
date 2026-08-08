@@ -97,6 +97,12 @@ The optimizer uses `walk-forward-regime-shrinkage-v2`:
 
 Historical macro probabilities substitute for unavailable historical prediction-market snapshots during validation. Returns exclude fees, spreads, taxes, and execution delay; these limitations are displayed beside the results.
 
+### Stored validation and ML challenger
+
+Supabase stores an immutable model registry plus queryable validation runs and folds. Each fold records train/test dates, the information cutoff, sample counts, model and benchmark metrics, diagnostics, and an explicit leakage check. The API exposes recent records at `GET /api/model-validation`.
+
+The experimental regime challenger is an L2-regularized multinomial logistic regression. It predicts next month's dominant regime from point-in-time macro features using expanding training windows, twelve-month tests, and a one-month embargo. It is compared with the transparent rules probabilities on Brier score, log loss, calibration, accuracy, probability stability, and fold consistency. The production regime model is never changed automatically: the challenger must improve Brier score by at least 2%, improve log loss, win at least 60% of folds, and pass every leakage check before the UI recommends considering a probability blend.
+
 GitHub Actions schedules prediction markets hourly, prices/macro/news on weekdays, SEC fundamentals weekly, and extended Polygon/ALFRED history monthly. Configure repository Actions secrets named `DATABASE_URL`, `POLYGON_API_KEY`, `FRED_API_KEY`, and `SEC_USER_AGENT`. Use the Supabase session-pooler URL for `DATABASE_URL`; never commit these values.
 
 Legacy FRED cache rows are explicitly marked as not point-in-time because they contain latest-known observations. Scheduled FRED rows preserve their retrieval vintage so model validation can distinguish them.

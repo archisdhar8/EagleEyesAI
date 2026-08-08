@@ -26,6 +26,7 @@ EXPECTED_TABLES = {
     "investor_profiles",
     "macro_observations",
     "macro_regime_labels",
+    "model_versions",
     "portfolios",
     "prediction_market_snapshots",
     "prediction_markets",
@@ -35,6 +36,8 @@ EXPECTED_TABLES = {
     "scenario_snapshots",
     "securities",
     "security_research_snapshots",
+    "validation_folds",
+    "validation_runs",
 }
 
 

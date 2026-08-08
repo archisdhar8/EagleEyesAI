@@ -12,6 +12,7 @@ import pandas as pd
 from scipy.optimize import minimize
 
 from . import database
+from .ml_regime import evaluate_regime_classifier
 from .models import InvestorProfile
 from .quant import (
     REGIME_KEYS,
@@ -594,6 +595,7 @@ def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> di
     price_tickers = list(dict.fromkeys([row["ticker"] for row in research] + proxy_tickers))
     prices = _price_matrix(price_tickers)
     labels = database.regime_history(limit=1000)
+    ml_evaluation = evaluate_regime_classifier(labels)
     expected, covariance, _, model_diagnostics, regime_returns = _return_model(
         research, scenarios, prices, labels
     )
@@ -644,6 +646,7 @@ def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> di
         "research": research, "alternatives": alternatives,
         "model_diagnostics": model_diagnostics, "walk_forward": walk_forward,
         "benchmarks": walk_forward.get("benchmarks", []),
+        "ml_regime_evaluation": ml_evaluation,
         "warnings": [
             "Decision-support research only; no trades are submitted.",
             "Expected returns and projections are model estimates, not guarantees.",

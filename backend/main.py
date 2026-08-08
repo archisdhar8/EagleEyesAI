@@ -191,6 +191,11 @@ def get_analysis(run_id: str) -> dict[str, Any]:
         raise HTTPException(404, "Analysis run not found") from exc
 
 
+@app.get("/api/model-validation")
+def model_validation(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
+    return {"runs": database.validation_history(limit)}
+
+
 @app.post("/api/analyses/{run_id}/explanation")
 def explain(run_id: str, request: ExplanationRequest) -> dict[str, Any]:
     try:
