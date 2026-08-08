@@ -26,15 +26,22 @@ EXPECTED_TABLES = {
     "investor_profiles",
     "macro_observations",
     "macro_regime_labels",
+    "model_monitoring_runs",
+    "model_promotion_decisions",
+    "model_versions",
     "portfolios",
     "prediction_market_snapshots",
+    "prediction_market_calibration_runs",
     "prediction_markets",
+    "prediction_contract_series",
     "price_bars",
     "provider_fetches",
     "scenario_probabilities",
     "scenario_snapshots",
     "securities",
     "security_research_snapshots",
+    "validation_folds",
+    "validation_runs",
 }
 
 

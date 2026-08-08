@@ -79,6 +79,8 @@ def overview() -> dict[str, Any]:
         "scenarios": scenarios, "research": research, "storage": database.storage_mode(),
         "data_status": database.provider_data_status(), "latest_analysis": database.latest_analysis(),
         "regime_history": regime_summary(),
+        "model_monitoring": database.latest_monitoring_run(),
+        "promotion_decisions": database.promotion_decisions(5),
     }
 
 
@@ -189,6 +191,19 @@ def get_analysis(run_id: str) -> dict[str, Any]:
         return database.load_analysis(run_id)
     except KeyError as exc:
         raise HTTPException(404, "Analysis run not found") from exc
+
+
+@app.get("/api/model-validation")
+def model_validation(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
+    return {"runs": database.validation_history(limit)}
+
+
+@app.get("/api/model-monitoring")
+def model_monitoring() -> dict[str, Any]:
+    return {
+        "latest": database.latest_monitoring_run(),
+        "promotion_decisions": database.promotion_decisions(20),
+    }
 
 
 @app.post("/api/analyses/{run_id}/explanation")

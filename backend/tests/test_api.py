@@ -23,6 +23,20 @@ def test_regime_history_has_safe_sqlite_fallback() -> None:
     assert response.json() == {"model_version": "macro-regime-rules-v1", "history": []}
 
 
+def test_model_validation_has_safe_sqlite_fallback() -> None:
+    with TestClient(app) as client:
+        response = client.get("/api/model-validation")
+    assert response.status_code == 200
+    assert response.json() == {"runs": []}
+
+
+def test_model_monitoring_has_safe_sqlite_fallback() -> None:
+    with TestClient(app) as client:
+        response = client.get("/api/model-monitoring")
+    assert response.status_code == 200
+    assert response.json() == {"latest": None, "promotion_decisions": []}
+
+
 def test_csv_import_validation() -> None:
     with TestClient(app) as client:
         response = client.post("/api/portfolios/import", json={"name": "Test", "csv_text": "ticker,weight,account_type\nSPY,0.6,taxable\nBND,0.4,traditional_ira\n"})

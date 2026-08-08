@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -66,6 +67,32 @@ def _canonical(text: str) -> tuple[str, str] | None:
     return None
 
 
+def _threshold_bucket(text: str) -> dict[str, Any]:
+    clean = text.lower().replace(",", "")
+    operator = None
+    if re.search(r"\b(above|over|exceed|higher than|at least|more than)\b", clean):
+        operator = "gte"
+    elif re.search(r"\b(below|under|lower than|at most|less than)\b", clean):
+        operator = "lte"
+    match = re.search(r"(?:\$\s*)?(-?\d+(?:\.\d+)?)\s*(%|percent|bps|basis points|dollars?)?", clean)
+    if operator is None or match is None:
+        return {}
+    value = float(match.group(1))
+    unit = match.group(2) or ("usd" if "$" in match.group(0) else "level")
+    return {"operator": operator, "value": value, "unit": unit}
+
+
+def canonical_contract_series(contract: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Map venue-specific expirations into a stable macro-question family."""
+    bucket = contract.get("threshold_bucket") or _threshold_bucket(str(contract.get("title", "")))
+    parts = [str(contract.get("scenario", "unknown")), str(contract.get("indicator", "unknown"))]
+    if bucket:
+        parts.extend([str(bucket.get("operator")), str(bucket.get("value")), str(bucket.get("unit"))])
+    material = "|".join(parts).lower()
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
+    return f"macro:{digest}", bucket
+
+
 def _confidence(*, bid: float | None, ask: float | None, volume: float, open_interest: float, depth: float, updated_at: str | None) -> float:
     spread = 0.30 if bid is None or ask is None else max(0.0, ask - bid)
     spread_score = max(0.0, 1.0 - spread / 0.30)
@@ -106,10 +133,14 @@ def normalize_kalshi(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "scenario": scenario,
             "indicator": indicator,
             "probability": probability,
+            "bid": bid,
+            "ask": ask,
             "confidence": _confidence(bid=bid, ask=ask, volume=volume, open_interest=oi, depth=0, updated_at=market.get("updated_time")),
             "volume": volume,
             "open_interest": oi,
             "source": f"https://kalshi.com/markets/{market.get('ticker', '')}",
+            "closes_at": market.get("close_time") or market.get("expected_expiration_time") or market.get("expiration_time"),
+            "threshold_bucket": _threshold_bucket(title),
         })
     return contracts
 
@@ -137,10 +168,15 @@ def normalize_polymarket(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "scenario": scenario,
             "indicator": indicator,
             "probability": probability,
+            "bid": bid,
+            "ask": ask,
             "confidence": _confidence(bid=bid, ask=ask, volume=volume, open_interest=oi, depth=0, updated_at=market.get("updatedAt")),
             "volume": volume,
             "open_interest": oi,
             "source": f"https://polymarket.com/event/{market.get('slug', '')}",
+            "closes_at": market.get("endDate") or market.get("end_date_iso"),
+            "threshold_bucket": _threshold_bucket(title),
+            "token_ids": market.get("clobTokenIds"),
         })
     return contracts
 
@@ -239,4 +275,3 @@ def refresh(force: bool = False) -> dict[str, Any]:
         warnings.append("No matching macro contracts found; scenario probabilities use disclosed priors.")
     database.save_scenario_snapshot(scenarios, contracts, warnings)
     return {"scenarios": scenarios, "contracts": contracts, "warnings": warnings, "fetched_at": datetime.now(timezone.utc).isoformat(), "cached": False}
-

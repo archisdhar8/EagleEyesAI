@@ -13,6 +13,8 @@ jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,6 +23,15 @@ jobs:
           cache: pip
       - run: pip install -r backend/requirements.txt
       - run: python -m backend.ingestion refresh --providers polygon,fred,news,regimes
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+      - if: env.TIINGO_API_KEY != ''
+        run: python -m backend.ingestion refresh --providers tiingo
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      - run: python -m backend.monitoring run
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}

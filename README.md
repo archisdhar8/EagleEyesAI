@@ -71,19 +71,21 @@ Incremental refreshes are provider-selectable:
 
 ```bash
 .venv/bin/python -m backend.ingestion refresh --providers markets
-.venv/bin/python -m backend.ingestion refresh --providers polygon,fred,news
+.venv/bin/python -m backend.ingestion refresh --providers polygon,tiingo,fred,news
 .venv/bin/python -m backend.ingestion refresh --providers sec
 ```
 
 Extend the modeling history and rebuild monthly point-in-time macro regimes:
 
 ```bash
-.venv/bin/python -m backend.ingestion history --providers polygon,alfred,regimes
+.venv/bin/python -m backend.ingestion history --providers tiingo,alfred,regimes
 ```
 
 The historical job requests broad and sector ETF prices from 2005 (or fund inception), active stock prices for ten years, and month-end ALFRED vintages for the regime feature set. Actual price depth depends on the Polygon subscription; the importer prints every symbol whose returned start date is later than requested. ALFRED imports retain an 18-month window for each vintage, which is sufficient for year-over-year and three-month regime features without storing every unchanged historical value for every vintage. Daily market-observed series that ALFRED does not revision-track (the Treasury curve, high-yield spread, and oil) are aggregated locally and explicitly stored as non-revised month-end point-in-time proxies.
 
 Regime labels are stored monthly using `macro-regime-rules-v1`. Every label records the vintage cutoff, latest observation and vintage dates, feature values, scenario probabilities, confidence, and coverage. Labels are skipped when fewer than five required series were available, rather than filling missing history with revised future data.
+
+Prediction-market refreshes run hourly. Venue-specific contracts are linked to canonical macro series across expirations, while every probability, bid/ask, confidence score, and scenario snapshot remains timestamped. Once at least six monthly genuine-market forecasts have a subsequently realized point-in-time macro regime, monitoring reports Brier score and calibration error rather than substituting macro priors.
 
 ## Quantitative model validation
 
@@ -97,7 +99,15 @@ The optimizer uses `walk-forward-regime-shrinkage-v2`:
 
 Historical macro probabilities substitute for unavailable historical prediction-market snapshots during validation. Returns exclude fees, spreads, taxes, and execution delay; these limitations are displayed beside the results.
 
-GitHub Actions schedules prediction markets hourly, prices/macro/news on weekdays, SEC fundamentals weekly, and extended Polygon/ALFRED history monthly. Configure repository Actions secrets named `DATABASE_URL`, `POLYGON_API_KEY`, `FRED_API_KEY`, and `SEC_USER_AGENT`. Use the Supabase session-pooler URL for `DATABASE_URL`; never commit these values.
+### Stored validation and ML challenger
+
+Supabase stores an immutable model registry plus queryable validation runs and folds. Each fold records train/test dates, the information cutoff, sample counts, model and benchmark metrics, diagnostics, and an explicit leakage check. The API exposes recent records at `GET /api/model-validation`.
+
+The experimental regime challenger is an L2-regularized multinomial logistic regression. It predicts next month's dominant regime from point-in-time macro features using expanding training windows, twelve-month tests, and a one-month embargo. It is compared with the transparent rules probabilities on Brier score, log loss, calibration, accuracy, probability stability, and fold consistency. The production regime model is never changed automatically: the challenger must improve Brier score by at least 2%, improve log loss, win at least 60% of folds, and pass every leakage check before the UI recommends considering a probability blend.
+
+GitHub Actions schedules prediction markets hourly, prices/macro/news on weekdays, SEC fundamentals weekly, and extended Tiingo/ALFRED history monthly. Configure repository Actions secrets named `DATABASE_URL`, `POLYGON_API_KEY`, `TIINGO_API_KEY`, `FRED_API_KEY`, and `SEC_USER_AGENT`. Tiingo supplies the coherent adjusted return history; Polygon remains the recent market-data source. Use the Supabase session-pooler URL for `DATABASE_URL`; never commit these values.
+
+Daily and monthly data jobs also run `python -m backend.monitoring run`. Each run persists prediction-market calibration, covariance conditioning, regime counts, benchmark performance, turnover, allocation stability, freshness, and coverage. New model versions enter evaluation first; a database promotion gate requires an immutable promotion decision before production status is allowed.
 
 Legacy FRED cache rows are explicitly marked as not point-in-time because they contain latest-known observations. Scheduled FRED rows preserve their retrieval vintage so model validation can distinguish them.
 

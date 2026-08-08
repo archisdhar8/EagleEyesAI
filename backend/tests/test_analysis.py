@@ -2,7 +2,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from backend.analysis import _optimize, _projection, _tax_estimate, _walk_forward
+from backend.analysis import (
+    _optimize, _price_coverage_diagnostics, _projection, _tax_estimate, _walk_forward,
+)
 from backend.models import InvestorProfile
 from backend.quant import REGIME_KEYS, dynamic_covariance, empirical_regime_returns
 
@@ -131,3 +133,17 @@ def test_walk_forward_is_reproducible_and_has_no_train_test_overlap() -> None:
     assert first["period_count"] >= 5
     assert {item["name"] for item in first["benchmarks"]} == {"Equal weight", "Static current allocation"}
     assert all(item["train_end"] < item["test_start"] for item in first["periods"])
+
+
+def test_price_coverage_discloses_short_history_and_sector_proxy() -> None:
+    dates = pd.bdate_range("2022-01-03", "2026-06-30")
+    prices = pd.DataFrame({"NEW": np.linspace(10, 20, len(dates)), "XLK": np.linspace(100, 180, len(dates))}, index=dates)
+    prices.attrs["providers"] = {"NEW": "polygon", "XLK": "tiingo"}
+    result = _price_coverage_diagnostics(
+        prices,
+        [{"ticker": "NEW", "sector": "Information Technology"}],
+        ["XLK"],
+    )
+    assert result["insufficient_full_cycle"] == ["NEW"]
+    assert result["sector_proxy_fallbacks"]["NEW"] == "XLK"
+    assert result["assets"]["XLK"]["provider"] == "tiingo"

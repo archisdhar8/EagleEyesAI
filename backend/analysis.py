@@ -12,6 +12,7 @@ import pandas as pd
 from scipy.optimize import minimize
 
 from . import database
+from .ml_regime import evaluate_regime_classifier
 from .models import InvestorProfile
 from .quant import (
     REGIME_KEYS,
@@ -235,7 +236,12 @@ def _price_matrix(tickers: list[str], price_limit: int = 5000) -> pd.DataFrame:
         if stored:
             frame = pd.DataFrame(stored)
             frame["date"] = pd.to_datetime(frame["date"], utc=True).dt.date
-            return frame.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index()
+            matrix = frame.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index()
+            matrix.attrs["providers"] = {
+                ticker: str(values.iloc[-1])
+                for ticker, values in frame.sort_values("date").groupby("ticker")["provider"]
+            }
+            return matrix
     if not PRICES_PATH.exists():
         return pd.DataFrame()
     frame = pd.read_parquet(PRICES_PATH, columns=["ticker", "date", "close"])
@@ -244,6 +250,40 @@ def _price_matrix(tickers: list[str], price_limit: int = 5000) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame()
     return frame.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index().tail(price_limit)
+
+
+def _price_coverage_diagnostics(
+    prices: pd.DataFrame, research: list[dict[str, Any]], proxy_tickers: list[str]
+) -> dict[str, Any]:
+    providers = prices.attrs.get("providers", {})
+    assets: dict[str, dict[str, Any]] = {}
+    for ticker in prices.columns:
+        values = prices[ticker].dropna()
+        if values.empty:
+            continue
+        first, last = pd.Timestamp(values.index[0]), pd.Timestamp(values.index[-1])
+        years = max(0.0, (last - first).days / 365.25)
+        assets[ticker] = {
+            "provider": providers.get(ticker, "local"), "observations": int(len(values)),
+            "first": str(first.date()), "last": str(last.date()), "years": round(years, 2),
+        }
+    research_tickers = [row["ticker"] for row in research if row["ticker"] != "CASH"]
+    insufficient = sorted(
+        ticker for ticker in research_tickers
+        if ticker not in assets or float(assets[ticker]["years"]) < 7
+    )
+    missing_proxies = sorted(ticker for ticker in proxy_tickers if ticker not in assets)
+    return {
+        "method": "one coherent adjusted-price provider per ticker",
+        "minimum_full_cycle_years": 7,
+        "assets": assets,
+        "insufficient_full_cycle": insufficient,
+        "sector_proxy_fallbacks": {
+            row["ticker"]: SECTOR_PROXIES.get(row.get("sector", ""), "VTI")
+            for row in research if row["ticker"] != "CASH"
+        },
+        "missing_sector_proxies": missing_proxies,
+    }
 
 
 def _return_model(
@@ -594,8 +634,12 @@ def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> di
     price_tickers = list(dict.fromkeys([row["ticker"] for row in research] + proxy_tickers))
     prices = _price_matrix(price_tickers)
     labels = database.regime_history(limit=1000)
+    ml_evaluation = evaluate_regime_classifier(labels)
     expected, covariance, _, model_diagnostics, regime_returns = _return_model(
         research, scenarios, prices, labels
+    )
+    model_diagnostics["price_coverage"] = _price_coverage_diagnostics(
+        prices, research, proxy_tickers
     )
     current, portfolio_value = _current_weights(holdings, research)
     walk_forward = _walk_forward(prices, labels, research, profile, current)
@@ -644,6 +688,7 @@ def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> di
         "research": research, "alternatives": alternatives,
         "model_diagnostics": model_diagnostics, "walk_forward": walk_forward,
         "benchmarks": walk_forward.get("benchmarks", []),
+        "ml_regime_evaluation": ml_evaluation,
         "warnings": [
             "Decision-support research only; no trades are submitted.",
             "Expected returns and projections are model estimates, not guarantees.",
