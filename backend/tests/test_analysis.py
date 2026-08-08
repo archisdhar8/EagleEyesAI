@@ -1,8 +1,10 @@
 import numpy as np
+import pandas as pd
 import pytest
 
-from backend.analysis import _optimize, _projection, _tax_estimate
+from backend.analysis import _optimize, _projection, _tax_estimate, _walk_forward
 from backend.models import InvestorProfile
+from backend.quant import REGIME_KEYS, dynamic_covariance, empirical_regime_returns
 
 
 def test_projection_is_reproducible_and_ordered() -> None:
@@ -48,3 +50,84 @@ def test_optimizer_respects_cash_floor_and_position_caps() -> None:
     assert weights.sum() == pytest.approx(1)
     assert weights[0] >= .10
     assert weights[1] <= .45
+
+
+def test_dynamic_covariance_is_psd_and_improves_conditioning() -> None:
+    rng = np.random.default_rng(7)
+    common = rng.normal(0, .01, 180)
+    returns = pd.DataFrame({
+        "AAA": common + rng.normal(0, .0002, 180),
+        "BBB": common + rng.normal(0, .0002, 180),
+        "CCC": rng.normal(0, .012, 180),
+    })
+    estimate = dynamic_covariance(returns, ["AAA", "BBB", "CCC"])
+    assert np.linalg.eigvalsh(estimate.matrix).min() > 0
+    assert 0.02 <= estimate.diagnostics["shrinkage_intensity"] <= .98
+    assert estimate.diagnostics["shrunk_condition_number"] < estimate.diagnostics["raw_condition_number"]
+
+
+def test_dynamic_covariance_shrinks_sparse_samples_more() -> None:
+    rng = np.random.default_rng(11)
+    full = pd.DataFrame(rng.normal(0, .01, (400, 4)), columns=list("ABCD"))
+    sparse = full.tail(45).copy()
+    sparse.loc[sparse.index[:20], "D"] = np.nan
+    full_estimate = dynamic_covariance(full, list("ABCD"))
+    sparse_estimate = dynamic_covariance(sparse, list("ABCD"))
+    assert sparse_estimate.diagnostics["shrinkage_intensity"] > full_estimate.diagnostics["shrinkage_intensity"]
+
+
+def _synthetic_history() -> tuple[pd.DataFrame, list[dict], list[dict]]:
+    rng = np.random.default_rng(1234)
+    dates = pd.bdate_range("2020-01-02", "2026-06-30")
+    daily = pd.DataFrame({
+        "SPY": rng.normal(.00025, .009, len(dates)),
+        "BND": rng.normal(.00010, .004, len(dates)),
+        "XLV": rng.normal(.00020, .008, len(dates)),
+        "XLE": rng.normal(.00018, .012, len(dates)),
+        "VTI": rng.normal(.00023, .009, len(dates)),
+    }, index=dates)
+    prices = 100 * (1 + daily).cumprod()
+    labels = []
+    for index, month_end in enumerate(pd.date_range("2020-01-31", "2026-05-31", freq="ME")):
+        regime = REGIME_KEYS[index % len(REGIME_KEYS)]
+        probabilities = {key: .05 for key in REGIME_KEYS}
+        probabilities[regime] = .80
+        labels.append({
+            "as_of_date": month_end.date().isoformat(),
+            "dominant_regime": regime,
+            "probabilities": probabilities,
+        })
+    research = [
+        {"ticker": "SPY", "sector": "Broad Market", "industry": "Large Blend", "confidence": 90, "expected_return": .07},
+        {"ticker": "BND", "sector": "Fixed Income", "industry": "Aggregate Bonds", "confidence": 90, "expected_return": .04},
+        {"ticker": "XLV", "sector": "Health Care", "industry": "Sector ETF", "confidence": 85, "expected_return": .06},
+        {"ticker": "XLE", "sector": "Energy", "industry": "Sector ETF", "confidence": 80, "expected_return": .06},
+        {"ticker": "CASH", "sector": "Cash", "industry": "Cash", "confidence": 100, "expected_return": .025},
+    ]
+    return prices, labels, research
+
+
+def test_empirical_regime_returns_are_shrunk_and_point_in_time() -> None:
+    prices, labels, research = _synthetic_history()
+    estimate = empirical_regime_returns(
+        prices, labels, research, as_of=pd.Timestamp("2024-12-31"), prior_strength=12
+    )
+    assert set(estimate.returns) == set(REGIME_KEYS)
+    assert all(len(vector) == len(research) for vector in estimate.returns.values())
+    assert estimate.diagnostics["as_of"] == "2024-12-31"
+    assert estimate.diagnostics["labelled_forward_months"] < len(labels)
+    for state in estimate.diagnostics["states"].values():
+        assert 0 < state["average_shrinkage"] <= 1
+
+
+def test_walk_forward_is_reproducible_and_has_no_train_test_overlap() -> None:
+    prices, labels, research = _synthetic_history()
+    static = np.array([.45, .25, .10, .10, .10])
+    profile = InvestorProfile(preset="balanced")
+    first = _walk_forward(prices, labels, research, profile, static)
+    second = _walk_forward(prices, labels, research, profile, static)
+    assert first == second
+    assert first["status"] == "complete"
+    assert first["period_count"] >= 5
+    assert {item["name"] for item in first["benchmarks"]} == {"Equal weight", "Static current allocation"}
+    assert all(item["train_end"] < item["test_start"] for item in first["periods"])

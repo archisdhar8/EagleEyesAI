@@ -13,10 +13,17 @@ from scipy.optimize import minimize
 
 from . import database
 from .models import InvestorProfile
+from .quant import (
+    REGIME_KEYS,
+    SECTOR_PROXIES,
+    dynamic_covariance,
+    empirical_regime_returns,
+    portfolio_path_metrics,
+)
 from .scenarios import refresh as refresh_scenarios
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 RANKINGS_PATH = ROOT / "data" / "outputs" / "stock_rankings.csv"
 PRICES_PATH = ROOT / "data" / "raw" / "polygon" / "prices_daily.parquet"
 MACRO_PATH = ROOT / "data" / "processed" / "macro_features.parquet"
@@ -35,15 +42,6 @@ ETF_META = {
     "BND": ("Total Bond Market ETF", "Fixed Income", "Aggregate Bonds"),
     "CASH": ("Cash reserve", "Cash", "Cash"),
 }
-
-SCENARIO_SECTOR_EFFECTS = {
-    "soft_landing": {"Broad Market": 0.08, "Information Technology": 0.11, "Financials": 0.08, "Energy": 0.04, "Fixed Income": 0.03},
-    "sticky_inflation": {"Broad Market": -0.01, "Information Technology": -0.05, "Financials": 0.02, "Energy": 0.11, "Fixed Income": -0.06},
-    "recession_cuts": {"Broad Market": -0.08, "Information Technology": -0.05, "Financials": -0.12, "Energy": -0.10, "Health Care": 0.01, "Fixed Income": 0.10},
-    "growth_reacceleration": {"Broad Market": 0.12, "Information Technology": 0.16, "Financials": 0.10, "Industrials": 0.13, "Energy": 0.09, "Fixed Income": -0.02},
-    "oil_shock": {"Broad Market": -0.06, "Energy": 0.18, "Industrials": -0.05, "Consumer Discretionary": -0.09, "Fixed Income": 0.02},
-}
-
 
 def _num(value: Any, default: float = 0.0) -> float:
     try:
@@ -231,9 +229,9 @@ def security_research(tickers: list[str]) -> list[dict[str, Any]]:
     return rows
 
 
-def _price_matrix(tickers: list[str]) -> pd.DataFrame:
+def _price_matrix(tickers: list[str], price_limit: int = 5000) -> pd.DataFrame:
     if database.DATABASE_URL:
-        stored = database.security_data(tickers, price_limit=756)["prices"]
+        stored = database.price_history(tickers, limit_per_ticker=price_limit)
         if stored:
             frame = pd.DataFrame(stored)
             frame["date"] = pd.to_datetime(frame["date"], utc=True).dt.date
@@ -245,38 +243,42 @@ def _price_matrix(tickers: list[str]) -> pd.DataFrame:
     frame = frame[frame["ticker"].isin(tickers)]
     if frame.empty:
         return pd.DataFrame()
-    return frame.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index().tail(756)
+    return frame.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index().tail(price_limit)
 
 
-def _return_model(research: list[dict[str, Any]], scenarios: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+def _return_model(
+    research: list[dict[str, Any]], scenarios: list[dict[str, Any]],
+    prices: pd.DataFrame | None = None, labels: list[dict[str, Any]] | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float], dict[str, Any], dict[str, np.ndarray]]:
     tickers = [row["ticker"] for row in research]
-    prices = _price_matrix(tickers)
+    prices = prices if prices is not None else _price_matrix(tickers)
     returns = prices.pct_change(fill_method=None).dropna(how="all") if not prices.empty else pd.DataFrame()
     vol_by_ticker: dict[str, float] = {}
-    covariance = np.zeros((len(tickers), len(tickers)))
-    for i, ticker in enumerate(tickers):
+    for ticker in tickers:
         series = returns[ticker].dropna() if ticker in returns else pd.Series(dtype=float)
         vol_by_ticker[ticker] = float(series.std() * np.sqrt(252)) if len(series) >= 60 else (0.01 if ticker == "CASH" else 0.16 if ticker in ETF_META else 0.28)
-    if not returns.empty:
-        raw = returns.reindex(columns=tickers).cov(min_periods=60).fillna(0).to_numpy() * 252
-        diagonal = np.diag([vol_by_ticker[t] ** 2 for t in tickers])
-        covariance = raw * 0.65 + diagonal * 0.35
-    else:
-        covariance = np.diag([vol_by_ticker[t] ** 2 for t in tickers])
-    covariance += np.eye(len(tickers)) * 1e-6
-    scenario_expected = []
-    for row in research:
-        value = 0.0
-        for scenario in scenarios:
-            effects = SCENARIO_SECTOR_EFFECTS.get(scenario["key"], {})
-            sector_return = effects.get(row["sector"], effects.get("Broad Market", 0.0))
-            if row["ticker"] == "CASH":
-                sector_return = 0.025
-            value += float(scenario["probability"]) * sector_return
-        scenario_expected.append(value)
+    covariance_estimate = dynamic_covariance(returns, tickers, vol_by_ticker)
+    regime_estimate = empirical_regime_returns(prices, labels or [], research)
+    probabilities = {item["key"]: float(item["probability"]) for item in scenarios}
+    probability_total = sum(probabilities.get(key, 0) for key in REGIME_KEYS) or 1.0
+    empirical_expected = sum(
+        regime_estimate.returns[key] * probabilities.get(key, 0) / probability_total
+        for key in REGIME_KEYS
+    )
     score_expected = np.array([row["expected_return"] * (0.55 + row["confidence"] / 200) for row in research])
-    expected = score_expected * 0.55 + np.array(scenario_expected) * 0.45
-    return expected, covariance, vol_by_ticker
+    labelled_months = regime_estimate.diagnostics["labelled_forward_months"]
+    empirical_weight = 0.0 if labelled_months == 0 else float(np.clip(labelled_months / 48, 0.45, 0.85))
+    expected = empirical_expected * empirical_weight + score_expected * (1 - empirical_weight)
+    diagnostics = {
+        "covariance": covariance_estimate.diagnostics,
+        "regime_returns": regime_estimate.diagnostics,
+        "expected_return_blend": {
+            "empirical_regime_weight": round(empirical_weight, 6),
+            "company_research_weight": round(1 - empirical_weight, 6),
+            "scenario_probability_source": "prediction markets with macro-prior fallback",
+        },
+    }
+    return expected, covariance_estimate.matrix, vol_by_ticker, diagnostics, regime_estimate.returns
 
 
 def _current_weights(holdings: list[dict[str, Any]], research: list[dict[str, Any]]) -> tuple[np.ndarray, float]:
@@ -381,16 +383,171 @@ def _optimize(label: str, expected: np.ndarray, covariance: np.ndarray, current:
     return weights, []
 
 
-def _scenario_outcomes(weights: np.ndarray, research: list[dict[str, Any]], scenarios: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _scenario_outcomes(
+    weights: np.ndarray,
+    scenarios: list[dict[str, Any]],
+    regime_returns: dict[str, np.ndarray],
+    regime_diagnostics: dict[str, Any],
+) -> list[dict[str, Any]]:
     outcomes = []
     for scenario in scenarios:
-        returns = []
-        for row in research:
-            sector_effects = SCENARIO_SECTOR_EFFECTS.get(scenario["key"], {})
-            scenario_return = 0.025 if row["ticker"] == "CASH" else sector_effects.get(row["sector"], sector_effects.get("Broad Market", 0.0))
-            returns.append(scenario_return + (row["final_score"] - 50) * 0.0003)
-        outcomes.append({"key": scenario["key"], "label": scenario["label"], "probability": scenario["probability"], "estimated_return": round(float(weights @ np.array(returns)), 4)})
+        state = regime_diagnostics.get("states", {}).get(scenario["key"], {})
+        vector = regime_returns.get(scenario["key"], np.zeros(len(weights)))
+        outcomes.append({
+            "key": scenario["key"], "label": scenario["label"],
+            "probability": scenario["probability"],
+            "estimated_return": round(float(weights @ vector), 4),
+            "sample_count": state.get("median_asset_samples", 0),
+            "regime_months": state.get("regime_months", 0),
+            "shrinkage": state.get("average_shrinkage", 1.0),
+            "method": "Shrunk empirical next-month return",
+        })
     return outcomes
+
+
+def _probabilities_at(labels: list[dict[str, Any]], cutoff: pd.Timestamp) -> dict[str, float]:
+    available = [item for item in labels if pd.Timestamp(item["as_of_date"]) <= cutoff]
+    if not available:
+        return {key: 1 / len(REGIME_KEYS) for key in REGIME_KEYS}
+    latest = max(available, key=lambda item: item["as_of_date"])
+    probabilities = {key: _num((latest.get("probabilities") or {}).get(key)) for key in REGIME_KEYS}
+    total = sum(probabilities.values()) or 1.0
+    return {key: value / total for key, value in probabilities.items()}
+
+
+def _walk_forward(
+    prices: pd.DataFrame,
+    labels: list[dict[str, Any]],
+    research: list[dict[str, Any]],
+    profile: InvestorProfile,
+    static_weights: np.ndarray,
+    *,
+    train_months: int = 24,
+    test_months: int = 3,
+) -> dict[str, Any]:
+    tickers = [row["ticker"] for row in research]
+    if prices.empty or len(prices) < 252 or not labels:
+        return {
+            "status": "insufficient_history", "periods": [], "period_count": 0,
+            "benchmarks": [], "assumptions": [
+                "At least one year of daily prices and point-in-time monthly regime labels are required."
+            ],
+        }
+    frame = prices.reindex(columns=tickers).copy()
+    frame.index = pd.to_datetime(frame.index, utc=True).tz_convert(None)
+    daily = frame.pct_change(fill_method=None)
+    if "CASH" in tickers:
+        daily["CASH"] = 0.025 / 252
+    start = frame.index.min() + pd.DateOffset(months=train_months)
+    end = frame.index.max() - pd.DateOffset(months=test_months)
+    if start > end:
+        return {
+            "status": "insufficient_history", "periods": [], "period_count": 0,
+            "benchmarks": [], "assumptions": [f"At least {train_months + test_months} months of price history is required."],
+        }
+    cutoffs = pd.date_range(start=start, end=end, freq=f"{test_months}ME")
+    model_parts: list[pd.Series] = []
+    equal_parts: list[pd.Series] = []
+    static_parts: list[pd.Series] = []
+    periods: list[dict[str, Any]] = []
+    prior_weights = np.full(len(tickers), 1 / max(len(tickers), 1))
+    turnovers: list[float] = []
+    static = static_weights.copy()
+    if static.sum() <= 0:
+        static = prior_weights.copy()
+    else:
+        static /= static.sum()
+    for cutoff in cutoffs:
+        train_prices = frame.loc[:cutoff]
+        train_returns = daily.loc[:cutoff].tail(504)
+        eligible = np.array([
+            ticker == "CASH" or train_prices[ticker].count() >= 120
+            for ticker in tickers
+        ], dtype=bool)
+        if eligible.sum() < 2:
+            continue
+        fallback_volatility = {
+            ticker: float(train_returns[ticker].std() * np.sqrt(252))
+            if train_returns[ticker].count() >= 60 else (0.01 if ticker == "CASH" else 0.25)
+            for ticker in tickers
+        }
+        covariance = dynamic_covariance(train_returns, tickers, fallback_volatility).matrix
+        regime = empirical_regime_returns(train_prices, labels, research, as_of=cutoff)
+        probabilities = _probabilities_at(labels, cutoff)
+        empirical = sum(regime.returns[key] * probabilities[key] for key in REGIME_KEYS)
+        score_expected = np.array([
+            row["expected_return"] * (0.55 + row["confidence"] / 200) for row in research
+        ])
+        labelled_months = regime.diagnostics["labelled_forward_months"]
+        empirical_weight = 0.0 if labelled_months == 0 else float(np.clip(labelled_months / 48, 0.45, 0.85))
+        expected = empirical * empirical_weight + score_expected * (1 - empirical_weight)
+        adjusted_research = [dict(row) for row in research]
+        for index, is_eligible in enumerate(eligible):
+            if not is_eligible:
+                adjusted_research[index]["confidence"] = 0
+        weights, conflicts = _optimize(
+            "Balanced", expected, covariance, prior_weights, adjusted_research, profile
+        )
+        if conflicts:
+            continue
+        test_start = cutoff + pd.Timedelta(days=1)
+        test_end = cutoff + pd.DateOffset(months=test_months)
+        realized = daily[(daily.index >= test_start) & (daily.index <= test_end)]
+        if len(realized) < 20:
+            continue
+        equal_weights = eligible.astype(float) / eligible.sum()
+        model_return = realized.fillna(0).mul(weights, axis=1).sum(axis=1)
+        equal_return = realized.fillna(0).mul(equal_weights, axis=1).sum(axis=1)
+        static_return = realized.fillna(0).mul(static, axis=1).sum(axis=1)
+        turnover = float(np.abs(weights - prior_weights).sum() / 2)
+        turnovers.append(turnover)
+        model_parts.append(model_return)
+        equal_parts.append(equal_return)
+        static_parts.append(static_return)
+        periods.append({
+            "train_end": cutoff.date().isoformat(),
+            "test_start": test_start.date().isoformat(),
+            "test_end": min(test_end, realized.index.max()).date().isoformat(),
+            "model_return": round(float((1 + model_return).prod() - 1), 6),
+            "equal_weight_return": round(float((1 + equal_return).prod() - 1), 6),
+            "static_return": round(float((1 + static_return).prod() - 1), 6),
+            "turnover": round(turnover, 6),
+            "eligible_assets": int(eligible.sum()),
+            "regime_training_months": regime.diagnostics["labelled_forward_months"],
+        })
+        prior_weights = weights
+    if not periods:
+        return {
+            "status": "insufficient_history", "periods": [], "period_count": 0,
+            "benchmarks": [], "assumptions": ["No complete out-of-sample quarter passed coverage constraints."],
+        }
+    model_path = pd.concat(model_parts).sort_index()
+    equal_path = pd.concat(equal_parts).sort_index()
+    static_path = pd.concat(static_parts).sort_index()
+    model_metrics = portfolio_path_metrics(model_path)
+    equal_metrics = portfolio_path_metrics(equal_path)
+    static_metrics = portfolio_path_metrics(static_path)
+    model_metrics["average_turnover"] = round(float(np.mean(turnovers)), 6)
+    model_metrics["quarters_beating_equal_weight"] = round(float(np.mean([
+        item["model_return"] > item["equal_weight_return"] for item in periods
+    ])), 6)
+    model_metrics["quarters_beating_static"] = round(float(np.mean([
+        item["model_return"] > item["static_return"] for item in periods
+    ])), 6)
+    return {
+        "status": "complete", "period_count": len(periods), "periods": periods,
+        "model": {"name": "Walk-forward Balanced", **model_metrics},
+        "benchmarks": [
+            {"name": "Equal weight", **equal_metrics},
+            {"name": "Static current allocation", **static_metrics},
+        ],
+        "assumptions": [
+            f"Expanding point-in-time regime window; trailing 504 trading days for covariance; {test_months}-month tests.",
+            "Historical macro-regime probabilities stand in for unavailable historical prediction-market snapshots.",
+            "Returns are evaluated before fees, spreads, taxes, and implementation delay.",
+            "Equal weight is rebalanced each test quarter; static current allocation is not optimized.",
+        ],
+    }
 
 
 def _projection(value: float, expected_return: float, volatility: float, profile: InvestorProfile, seed: int) -> dict[str, Any]:
@@ -433,8 +590,15 @@ def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> di
     if not any(ticker in ETF_META and ETF_META[ticker][1] == "Broad Market" for ticker in tickers):
         tickers.append("VTI")
     research = security_research(list(dict.fromkeys(tickers))[:50])
-    expected, covariance, _ = _return_model(research, scenarios)
+    proxy_tickers = sorted(set(SECTOR_PROXIES.values()))
+    price_tickers = list(dict.fromkeys([row["ticker"] for row in research] + proxy_tickers))
+    prices = _price_matrix(price_tickers)
+    labels = database.regime_history(limit=1000)
+    expected, covariance, _, model_diagnostics, regime_returns = _return_model(
+        research, scenarios, prices, labels
+    )
     current, portfolio_value = _current_weights(holdings, research)
+    walk_forward = _walk_forward(prices, labels, research, profile, current)
     alternatives = []
     for index, label in enumerate(["Risk-Controlled", "Balanced", "Goal-Tilted"]):
         weights, conflicts = _optimize(label, expected, covariance, current, research, profile)
@@ -458,23 +622,38 @@ def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> di
             "drawdown_range": [round(-volatility * 2.2, 4), round(-volatility * 1.2, 4)],
             "turnover": round(turnover, 4), "effective_holdings": round(1 / max(float((weights**2).sum()), 1e-9), 1),
             "allocations": sorted(allocations, key=lambda item: item["target_weight"], reverse=True),
-            "scenario_outcomes": _scenario_outcomes(weights, research, scenarios),
+            "scenario_outcomes": _scenario_outcomes(
+                weights, scenarios, regime_returns, model_diagnostics["regime_returns"]
+            ),
             "projection": _projection(portfolio_value, exp_return, volatility, profile, 90210 + index),
             "tax": _tax_estimate(weights, current, research, holdings, portfolio_value, profile),
             "constraint_status": "infeasible" if conflicts else "satisfied", "conflicts": conflicts,
             "tradeoff": _tradeoff(label),
+            "model_assumptions": [
+                f"Expected return blends {model_diagnostics['expected_return_blend']['empirical_regime_weight']:.0%} empirical regime history with company research.",
+                f"Covariance uses {model_diagnostics['covariance']['shrinkage_intensity']:.0%} shrinkage toward a constant-correlation target.",
+                "Scenario outcomes are sample-size-shrunk historical next-month returns, not fixed sector shocks.",
+                "Risk, return, drawdown, tax, and retirement figures are estimates rather than guarantees.",
+            ],
         })
     run_id = str(uuid.uuid4())
     result = {
-        "id": run_id, "created_at": datetime.now(timezone.utc).isoformat(), "model_version": "scenario-shrinkage-v1",
+        "id": run_id, "created_at": datetime.now(timezone.utc).isoformat(), "model_version": "walk-forward-regime-shrinkage-v2",
         "macro": latest_macro(), "scenarios": scenarios, "scenario_warnings": scenario_payload["warnings"],
         "portfolio_value": round(portfolio_value, 2), "current_weights": {row["ticker"]: round(float(current[i]), 4) for i, row in enumerate(research) if current[i] > 0},
         "research": research, "alternatives": alternatives,
-        "warnings": ["Decision-support research only; no trades are submitted.", "Expected returns and projections are model estimates, not guarantees."],
+        "model_diagnostics": model_diagnostics, "walk_forward": walk_forward,
+        "benchmarks": walk_forward.get("benchmarks", []),
+        "warnings": [
+            "Decision-support research only; no trades are submitted.",
+            "Expected returns and projections are model estimates, not guarantees.",
+            *(["Walk-forward validation is unavailable until more overlapping price and point-in-time regime history exists."] if walk_forward["status"] != "complete" else []),
+        ],
         "data_lineage": {
             "research": "supabase" if database.DATABASE_URL else str(RANKINGS_PATH),
             "prices": "supabase.price_bars" if database.DATABASE_URL else str(PRICES_PATH),
             "macro": "supabase.macro_observations" if database.DATABASE_URL else str(MACRO_PATH),
+            "regimes": "supabase.macro_regime_labels" if database.DATABASE_URL else "unavailable",
             "scenario_fetched_at": scenario_payload["fetched_at"],
         },
     }

@@ -412,7 +412,7 @@ def save_analysis(run_id: str, request: dict[str, Any], result: dict[str, Any]) 
                 ON CONFLICT (id) DO UPDATE SET result_snapshot=excluded.result_snapshot""",
                 (
                     run_id, portfolio_id, profile["id"] if profile else None,
-                    result.get("model_version", "scenario-shrinkage-v1"), _jsonb(request),
+                    result.get("model_version", "walk-forward-regime-shrinkage-v2"), _jsonb(request),
                     _jsonb(result.get("data_lineage", {})), _jsonb(result.get("current_weights", {})),
                     _jsonb(result.get("alternatives", [])), _jsonb(result.get("warnings", [])),
                     _jsonb(result), result.get("created_at", utc_now()),
@@ -599,6 +599,29 @@ def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
             for row in news
         ],
     }
+
+
+def price_history(tickers: list[str], limit_per_ticker: int = 5000) -> list[dict[str, Any]]:
+    normalized = sorted({
+        ticker.strip().upper() for ticker in tickers
+        if ticker.strip() and ticker.upper() != "CASH"
+    })
+    if not DATABASE_URL or not normalized:
+        return []
+    with postgres_connection() as conn:
+        rows = conn.execute(
+            """SELECT ticker, ts, close FROM (
+              SELECT s.ticker, p.ts, p.close,
+              row_number() OVER (PARTITION BY s.ticker ORDER BY p.ts DESC) AS position
+              FROM public.price_bars p JOIN public.securities s ON s.id=p.security_id
+              WHERE s.ticker = ANY(%s) AND p.interval='1d' AND p.close IS NOT NULL
+            ) bars WHERE position <= %s ORDER BY ticker, ts""",
+            (normalized, max(1, min(limit_per_ticker, 10000))),
+        ).fetchall()
+    return [
+        {"ticker": row["ticker"], "date": _iso(row["ts"]), "close": _number(row["close"])}
+        for row in rows
+    ]
 
 
 def regime_history(limit: int = 240) -> list[dict[str, Any]]:

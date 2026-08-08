@@ -85,6 +85,18 @@ The historical job requests broad and sector ETF prices from 2005 (or fund incep
 
 Regime labels are stored monthly using `macro-regime-rules-v1`. Every label records the vintage cutoff, latest observation and vintage dates, feature values, scenario probabilities, confidence, and coverage. Labels are skipped when fewer than five required series were available, rather than filling missing history with revised future data.
 
+## Quantitative model validation
+
+The optimizer uses `walk-forward-regime-shrinkage-v2`:
+
+- Daily covariance is winsorized and dynamically shrunk toward a constant-correlation target. The result records sample counts, shrinkage intensity, missing-data fraction, condition numbers, effective rank, and minimum eigenvalue.
+- Fixed sector scenario shocks are not used. Each macro state uses the next-month returns historically observed after point-in-time regime labels. Sparse state/security estimates shrink toward sector-ETF, asset-unconditional, and cross-sectional priors.
+- Current prediction-market probabilities weight those empirical state returns. Company research adjusts the result with a disclosed weight; it does not replace price history.
+- The walk-forward runner uses an expanding regime window, trailing 504 trading days for covariance, quarterly re-estimation, and non-overlapping three-month tests.
+- Every run compares the Balanced model with a quarterly equal-weight benchmark and the user's static current allocation. Results include annualized return/volatility, maximum drawdown, Sharpe ratio, turnover, and quarter-level hit rates.
+
+Historical macro probabilities substitute for unavailable historical prediction-market snapshots during validation. Returns exclude fees, spreads, taxes, and execution delay; these limitations are displayed beside the results.
+
 GitHub Actions schedules prediction markets hourly, prices/macro/news on weekdays, SEC fundamentals weekly, and extended Polygon/ALFRED history monthly. Configure repository Actions secrets named `DATABASE_URL`, `POLYGON_API_KEY`, `FRED_API_KEY`, and `SEC_USER_AGENT`. Use the Supabase session-pooler URL for `DATABASE_URL`; never commit these values.
 
 Legacy FRED cache rows are explicitly marked as not point-in-time because they contain latest-known observations. Scheduled FRED rows preserve their retrieval vintage so model validation can distinguish them.
