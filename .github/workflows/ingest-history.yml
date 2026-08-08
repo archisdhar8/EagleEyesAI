@@ -1,18 +1,18 @@
-name: Refresh prices, macro data, and news
+name: Extend historical model data
 
 on:
   schedule:
-    - cron: "35 2 * * 1-5"
+    - cron: "15 4 1 * *"
   workflow_dispatch:
 
 concurrency:
-  group: investment-dashboard-daily-ingestion
+  group: investment-dashboard-history-ingestion
   cancel-in-progress: false
 
 jobs:
-  refresh:
+  history:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,7 +20,7 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: pip install -r backend/requirements.txt
-      - run: python -m backend.ingestion refresh --providers polygon,fred,news,regimes
+      - run: python -m backend.ingestion history --providers polygon,alfred,regimes
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}

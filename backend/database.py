@@ -470,7 +470,8 @@ def provider_data_status() -> dict[str, Any]:
             (SELECT count(*) FROM public.macro_observations) AS macro_observations,
             (SELECT count(*) FROM public.fundamental_periods) AS fundamental_periods,
             (SELECT count(*) FROM public.documents WHERE document_type='news') AS news_documents,
-            (SELECT count(*) FROM public.prediction_market_snapshots) AS market_snapshots"""
+            (SELECT count(*) FROM public.prediction_market_snapshots) AS market_snapshots,
+            (SELECT count(*) FROM public.macro_regime_labels) AS macro_regimes"""
         ).fetchone()
         freshness = conn.execute(
             """SELECT
@@ -478,7 +479,8 @@ def provider_data_status() -> dict[str, Any]:
             (SELECT max(observation_date) FROM public.macro_observations) AS macro,
             (SELECT max(period_end) FROM public.fundamental_periods) AS fundamentals,
             (SELECT max(published_at) FROM public.documents WHERE document_type='news') AS news,
-            (SELECT max(observed_at) FROM public.prediction_market_snapshots) AS markets"""
+            (SELECT max(observed_at) FROM public.prediction_market_snapshots) AS markets,
+            (SELECT max(as_of_date) FROM public.macro_regime_labels) AS regimes"""
         ).fetchone()
         providers = conn.execute(
             """SELECT DISTINCT ON (provider) provider, status, fetched_at, as_of,
@@ -597,3 +599,23 @@ def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
             for row in news
         ],
     }
+
+
+def regime_history(limit: int = 240) -> list[dict[str, Any]]:
+    if not DATABASE_URL:
+        return []
+    with postgres_connection() as conn:
+        rows = conn.execute(
+            """SELECT as_of_date, model_version, dominant_regime, probabilities,
+            inputs, confidence, data_quality, is_point_in_time
+            FROM public.macro_regime_labels ORDER BY as_of_date DESC LIMIT %s""",
+            (max(1, min(limit, 1000)),),
+        ).fetchall()
+    return [
+        {
+            **dict(row), "as_of_date": _iso(row["as_of_date"]),
+            "confidence": _number(row["confidence"]),
+            "data_quality": _number(row["data_quality"]),
+        }
+        for row in rows
+    ]
