@@ -7,7 +7,8 @@ const API = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
 type Tab = "overview" | "portfolio" | "scenarios" | "research" | "optimize";
 type Holding = { ticker: string; shares?: number | null; weight?: number | null; market_value?: number | null; cost_basis?: number | null; account_type: string; acquisition_date?: string | null };
 type Scenario = { key: string; label: string; probability: number; confidence: number; change_1d?: number | null; change_1w?: number | null; change_1m?: number | null; indicators: string[]; sources: string[]; as_of: string; is_prior: boolean };
-type Research = { ticker: string; company: string; sector: string; industry: string; final_score: number; growth_rating: number; valuation_score: number; fundamental_score: number; industry_score: number; technical_score: number; news_score: number; confidence: number; data_quality: string; risk_flags: string[]; source?: string; price?: number | null; price_change_1y?: number | null; price_as_of?: string | null; fundamentals_as_of?: string | null; revenue_growth?: number | null; net_margin?: number | null; news_count?: number; latest_news?: { title: string; source_url?: string | null; published_at?: string | null } | null; data_source?: string };
+type CompanyMarket = { provider: string; id: string; title: string; probability: number; confidence: number; volume?: number; evidence_type: string; source?: string; closes_at?: string | null; observed_at?: string | null };
+type Research = { ticker: string; company: string; sector: string; industry: string; final_score: number; growth_rating: number; valuation_score: number; fundamental_score: number; industry_score: number; technical_score: number; news_score: number; confidence: number; data_quality: string; risk_flags: string[]; source?: string; price?: number | null; price_change_1y?: number | null; price_as_of?: string | null; fundamentals_as_of?: string | null; revenue_growth?: number | null; net_margin?: number | null; news_count?: number; latest_news?: { title: string; source_url?: string | null; published_at?: string | null } | null; prediction_markets?: CompanyMarket[]; data_source?: string };
 type Profile = { age: number; retirement_age: number; horizon_years: number; account_type: string; annual_contribution: number; annual_withdrawal: number; target_value: number; tax_rate: number; risk_tolerance: number; preset: string; restrictions: string[]; watchlist: string[]; objectives: Record<string, number>; llm_provider: string; llm_endpoint?: string | null; llm_model?: string | null };
 type Alternative = { name: string; expected_return: number; volatility: number; drawdown_range: number[]; turnover: number; effective_holdings: number; tradeoff: string; constraint_status: string; conflicts: string[]; allocations: Array<{ ticker: string; current_weight: number; target_weight: number; target_min: number; target_max: number; delta: number; reason: string }>; scenario_outcomes: Array<{ label: string; probability: number; estimated_return: number; sample_count?: number; regime_months?: number; shrinkage?: number; method?: string }>; projection: { nominal_p10: number; nominal_p50: number; nominal_p90: number; real_p50: number; goal_probability: number; assumptions: string }; tax: { available: boolean; estimated_realized_gain: number | null; estimated_tax: number | null; note: string }; model_assumptions?: string[] };
 type Macro = { regime: string; score: number; as_of: string | null; source?: string; metrics?: Record<string, number | null> };
@@ -52,11 +53,9 @@ function scoreTone(value: number) { return value >= 75 ? "good" : value >= 55 ? 
 
 export default function Dashboard() {
   const [tab, setTab] = useState<Tab>("overview");
-  const [dark, setDark] = useState(() =>
-    typeof window === "undefined"
-      ? true
-      : window.localStorage.getItem("investment-dashboard-theme") !== "light"
-  );
+  // Keep the server and first client render identical. The saved browser-only
+  // preference is applied after hydration.
+  const [dark, setDark] = useState(true);
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
@@ -68,6 +67,12 @@ export default function Dashboard() {
     { ticker: "CSCO", weight: .18, account_type: "taxable" }, { ticker: "SPY", weight: .22, account_type: "taxable" },
     { ticker: "CASH", weight: .10, account_type: "taxable" },
   ]);
+  const [savedPortfolioSnapshot, setSavedPortfolioSnapshot] = useState(() => portfolioSignature("Primary portfolio", [
+    { ticker: "AAPL", weight: .28, account_type: "taxable" }, { ticker: "MU", weight: .22, account_type: "taxable" },
+    { ticker: "CSCO", weight: .18, account_type: "taxable" }, { ticker: "SPY", weight: .22, account_type: "taxable" },
+    { ticker: "CASH", weight: .10, account_type: "taxable" },
+  ]));
+  const [persistedTickers, setPersistedTickers] = useState(["AAPL", "MU", "CSCO", "SPY", "CASH"]);
   const [profile, setProfile] = useState<Profile>(defaultProfile);
   const [macro, setMacro] = useState<Macro>({ regime: "neutral", score: 50, as_of: null });
   const [scenarios, setScenarios] = useState<Scenario[]>(seededScenarios);
@@ -94,6 +99,8 @@ export default function Dashboard() {
         setConnected(true);
         if (data.portfolio) {
           setPortfolioId(data.portfolio.id); setPortfolioName(data.portfolio.name); setHoldings(data.portfolio.holdings);
+          setSavedPortfolioSnapshot(portfolioSignature(data.portfolio.name, data.portfolio.holdings));
+          setPersistedTickers(data.portfolio.holdings.map((row: Holding) => row.ticker.trim().toUpperCase()));
         }
         setProfile(data.profile); setMacro(data.macro); setScenarios(data.scenarios.scenarios); setContracts(data.scenarios.contracts || []); setScenarioFetchedAt(data.scenarios.fetched_at || null); setScenarioWarnings(data.scenarios.warnings); setResearch(data.research); setDataStatus(data.data_status); setRegimeHistory(data.regime_history || { latest: null, sample_counts: {}, total_samples: 0 });
         setMonitoring(data.model_monitoring || null);
@@ -106,19 +113,69 @@ export default function Dashboard() {
     return () => { active = false; };
   }, []);
 
+  useEffect(() => {
+    const savedThemeIsDark = window.localStorage.getItem("investment-dashboard-theme") !== "light";
+    const frame = window.requestAnimationFrame(() => setDark(savedThemeIsDark));
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
   useEffect(() => { document.documentElement.dataset.theme = dark ? "dark" : "light"; }, [dark]);
+
+  const portfolioErrors = useMemo(() => validatePortfolio(portfolioName, holdings), [portfolioName, holdings]);
+  const portfolioDirty = portfolioSignature(portfolioName, holdings) !== savedPortfolioSnapshot;
+
+  useEffect(() => {
+    if (!portfolioDirty) return;
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [portfolioDirty]);
 
   function toggleTheme() {
     const next = !dark; setDark(next); window.localStorage.setItem("investment-dashboard-theme", next ? "dark" : "light");
   }
 
+  function researchTickers(nextHoldings: Holding[] = holdings) {
+    return [...new Set([
+      ...nextHoldings.map(row => row.ticker.trim().toUpperCase()),
+      ...profile.watchlist.map(ticker => ticker.trim().toUpperCase()),
+    ].filter(ticker => ticker && ticker !== "CASH"))].slice(0, 50);
+  }
+
+  async function loadResearch(nextHoldings: Holding[] = holdings, refreshProvider = false, ingestTickers: string[] = []) {
+    const tickers = researchTickers(nextHoldings);
+    const response = refreshProvider
+      ? await fetch(`${API}/research/refresh`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tickers, ingest_tickers: ingestTickers }),
+        })
+      : await fetch(`${API}/research?tickers=${encodeURIComponent(tickers.join(","))}`);
+    if (!response.ok) throw new Error(await apiError(response, "Research refresh failed"));
+    const data = await response.json();
+    setResearch(refreshProvider ? data.research : data);
+    return refreshProvider ? data : { research: data, markets_found: 0, warnings: [] };
+  }
+
   async function savePortfolio() {
     setBusy("Saving portfolio"); setNotice("");
     try {
+      const errors = validatePortfolio(portfolioName, holdings);
+      if (errors.length) throw new Error(errors[0]);
+      const addedTickers = researchTickers(holdings).filter(ticker => !persistedTickers.includes(ticker));
       const url = portfolioId ? `${API}/portfolios/${portfolioId}` : `${API}/portfolios`;
       const response = await fetch(url, { method: portfolioId ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: portfolioName, holdings: holdings.map(cleanHolding) }) });
-      if (!response.ok) throw new Error(await response.text());
-      const saved = await response.json(); setPortfolioId(saved.id); setConnected(true); setNotice("Portfolio saved.");
+      if (!response.ok) throw new Error(await apiError(response, "Unable to save portfolio"));
+      const saved = await response.json();
+      setPortfolioId(saved.id); setHoldings(saved.holdings); setConnected(true);
+      setSavedPortfolioSnapshot(portfolioSignature(saved.name, saved.holdings));
+      setPersistedTickers(saved.holdings.map((row: Holding) => row.ticker.trim().toUpperCase()));
+      try {
+        const refreshed = await loadResearch(saved.holdings, true, addedTickers);
+        const suffix = refreshed.markets_found ? ` ${refreshed.markets_found} Polymarket company signal${refreshed.markets_found === 1 ? "" : "s"} found.` : " Research universe updated.";
+        setNotice(`Portfolio saved.${suffix}`);
+      } catch {
+        setNotice("Portfolio saved, but company-market evidence could not be refreshed. Existing research remains available.");
+      }
     } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to save portfolio."); }
     finally { setBusy(""); }
   }
@@ -128,8 +185,16 @@ export default function Dashboard() {
     setBusy("Validating CSV"); setNotice("");
     try {
       const response = await fetch(`${API}/portfolios/import`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: file.name.replace(/\.csv$/i, ""), csv_text: await file.text() }) });
-      const data = await response.json(); if (!response.ok) throw new Error(data.detail || "CSV validation failed");
-      setPortfolioId(data.portfolio.id); setPortfolioName(data.portfolio.name); setHoldings(data.portfolio.holdings); setNotice(`${data.validated_rows} holdings validated and saved.`); setConnected(true);
+      const data = await response.json(); if (!response.ok) throw new Error(formatApiDetail(data.detail) || "CSV validation failed");
+      setPortfolioId(data.portfolio.id); setPortfolioName(data.portfolio.name); setHoldings(data.portfolio.holdings); setConnected(true);
+      setSavedPortfolioSnapshot(portfolioSignature(data.portfolio.name, data.portfolio.holdings));
+      setPersistedTickers(data.portfolio.holdings.map((row: Holding) => row.ticker.trim().toUpperCase()));
+      try {
+        await loadResearch(data.portfolio.holdings, true, researchTickers(data.portfolio.holdings));
+        setNotice(`${data.validated_rows} holdings validated, saved, and loaded into Research.`);
+      } catch {
+        setNotice(`${data.validated_rows} holdings saved. Company-market refresh is temporarily unavailable.`);
+      }
     } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to import CSV."); }
     finally { setBusy(""); event.target.value = ""; }
   }
@@ -144,9 +209,22 @@ export default function Dashboard() {
     finally { setBusy(""); }
   }
 
+  async function refreshResearch() {
+    setBusy("Refreshing company research"); setNotice("");
+    try {
+      const data = await loadResearch(holdings, true, researchTickers(holdings));
+      setConnected(true);
+      setNotice(`Research refreshed for ${data.searched} securities; ${data.markets_found} live Polymarket company signals found.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Research refresh unavailable.");
+    } finally { setBusy(""); }
+  }
+
   async function runOptimization() {
     setBusy("Running scenario analysis"); setNotice(""); setNarrative("");
     try {
+      const errors = validatePortfolio(portfolioName, holdings);
+      if (errors.length) throw new Error(`Portfolio needs attention: ${errors[0]}`);
       await fetch(`${API}/profile`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(profile) });
       const response = await fetch(`${API}/analyses`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ portfolio: { name: portfolioName, holdings: holdings.map(cleanHolding) }, profile }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.detail || "Analysis failed");
@@ -168,12 +246,17 @@ export default function Dashboard() {
   const topScenario = [...scenarios].sort((a, b) => b.probability - a.probability)[0];
   const sortedResearch = useMemo(() => [...research].sort((a, b) => Number(b[sortKey] || 0) - Number(a[sortKey] || 0)), [research, sortKey]);
 
+  function navigate(next: Tab) {
+    if (tab === "portfolio" && next !== "portfolio" && portfolioDirty && !window.confirm("You have unsaved portfolio changes. Leave without saving?")) return;
+    setTab(next);
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark">ID</div><div><strong>Investment</strong><span>Dashboard</span></div></div>
         <nav aria-label="Primary navigation">
-          {nav.map(([key, icon, label]) => <button key={key} className={tab === key ? "active" : ""} onClick={() => setTab(key)}><span aria-hidden>{icon}</span>{label}</button>)}
+          {nav.map(([key, icon, label]) => <button key={key} className={tab === key ? "active" : ""} onClick={() => navigate(key)}><span aria-hidden>{icon}</span>{label}</button>)}
         </nav>
         <div className="sidebar-foot">
           <div className={`connection ${connected ? "online" : ""}`}><i />{connected ? "Research engine connected" : "Research engine offline"}</div>
@@ -185,15 +268,15 @@ export default function Dashboard() {
       <main>
         <header className="topbar">
           <div><span className="eyebrow">Quarterly decision system</span><h1>{nav.find(item => item[0] === tab)?.[2]}</h1></div>
-          <div className="top-actions"><div className="freshness"><span>Data lineage</span><strong>{macro.as_of || "Awaiting refresh"}</strong></div><button className="primary" onClick={() => setTab("optimize")}>Run analysis <span>→</span></button></div>
+          <div className="top-actions"><div className="freshness"><span>Data lineage</span><strong>{macro.as_of || "Awaiting refresh"}</strong></div><button className="primary" onClick={() => navigate("optimize")}>Run analysis <span>→</span></button></div>
         </header>
         {busy && <div className="progress" role="status"><span />{busy}…</div>}
         {notice && <div className="notice"><span>i</span>{notice}<button onClick={() => setNotice("")} aria-label="Dismiss">×</button></div>}
 
-        {tab === "overview" && <Overview loading={loading} portfolioName={portfolioName} holdings={holdings} macro={macro} scenarios={scenarios} research={research} topScenario={topScenario} analysis={analysis} dataStatus={dataStatus} onNavigate={setTab} />}
-        {tab === "portfolio" && <Portfolio holdings={holdings} setHoldings={setHoldings} name={portfolioName} setName={setPortfolioName} total={currentWeightTotal} onSave={savePortfolio} onImport={importCsv} />}
+        {tab === "overview" && <Overview loading={loading} portfolioName={portfolioName} holdings={holdings} macro={macro} scenarios={scenarios} research={research} topScenario={topScenario} analysis={analysis} dataStatus={dataStatus} onNavigate={navigate} />}
+        {tab === "portfolio" && <Portfolio holdings={holdings} setHoldings={setHoldings} name={portfolioName} setName={setPortfolioName} total={currentWeightTotal} dirty={portfolioDirty} errors={portfolioErrors} saving={busy === "Saving portfolio"} onSave={savePortfolio} onImport={importCsv} />}
         {tab === "scenarios" && <Scenarios scenarios={scenarios} contracts={contracts} fetchedAt={scenarioFetchedAt} regimeHistory={regimeHistory} warnings={scenarioWarnings} onRefresh={refreshMarkets} />}
-        {tab === "research" && <ResearchTable rows={sortedResearch} sortKey={sortKey} setSortKey={setSortKey} onNavigate={setTab} />}
+        {tab === "research" && <ResearchTable rows={sortedResearch} sortKey={sortKey} setSortKey={setSortKey} onNavigate={navigate} onRefresh={refreshResearch} />}
         {tab === "optimize" && <Optimize profile={profile} setProfile={setProfile} analysis={analysis} monitoring={monitoring} selected={selectedAlternative} setSelected={setSelectedAlternative} onRun={runOptimization} narrative={narrative} onNarrative={generateNarrative} />}
       </main>
     </div>
@@ -244,19 +327,28 @@ function Metric({ label, value, meta, tone = "neutral" }: { label: string; value
 function DataSource({ label, count, date }: { label: string; count?: number; date?: string | null }) { return <div><span>{label}</span><strong>{compact(count)}</strong><small>through {dateLabel(date)}</small></div>; }
 function PanelHead({ eyebrow, title, action, onClick }: { eyebrow: string; title: string; action: string; onClick: () => void }) { return <div className="panel-head"><div><span>{eyebrow}</span><h3>{title}</h3></div><button onClick={onClick}>{action} →</button></div>; }
 
-function Portfolio({ holdings, setHoldings, name, setName, total, onSave, onImport }: { holdings: Holding[]; setHoldings: (rows: Holding[]) => void; name: string; setName: (v:string) => void; total: number; onSave: () => void; onImport: (e: ChangeEvent<HTMLInputElement>) => void }) {
-  const update = (index: number, key: keyof Holding, value: string) => setHoldings(holdings.map((row, i) => i === index ? { ...row, [key]: key === "ticker" || key === "account_type" || key === "acquisition_date" ? value : value === "" ? null : Number(value) } : row));
+function Portfolio({ holdings, setHoldings, name, setName, total, dirty, errors, saving, onSave, onImport }: { holdings: Holding[]; setHoldings: (rows: Holding[]) => void; name: string; setName: (v:string) => void; total: number; dirty: boolean; errors: string[]; saving: boolean; onSave: () => void; onImport: (e: ChangeEvent<HTMLInputElement>) => void }) {
+  const update = (index: number, key: keyof Holding, value: string) => setHoldings(holdings.map((row, i) => {
+    if (i !== index) return row;
+    const normalized = key === "ticker" || key === "account_type" || key === "acquisition_date"
+      ? value
+      : value === "" ? null : key === "weight" ? Number(value) / 100 : Number(value);
+    return { ...row, [key]: normalized };
+  }));
   return <section className="workspace"><div className="section-intro"><div><span className="kicker">Your source of truth</span><h2>Build the portfolio you want to examine.</h2><p>Use weights for a quick analysis, or add market value and aggregate cost basis for tax estimates.</p></div><div className={`weight-status ${Math.abs(total - 1) < .001 ? "valid" : ""}`}><span>Entered weights</span><strong>{pct(total, 1)}</strong><small>{Math.abs(total - 1) < .001 ? "Ready" : "Weights will be normalized"}</small></div></div>
-    <div className="panel portfolio-panel"><div className="portfolio-toolbar"><label>Portfolio name<input value={name} onChange={e => setName(e.target.value)} /></label><div><label className="upload-button">Import CSV<input type="file" accept=".csv,text/csv" onChange={onImport} /></label><button className="secondary" onClick={() => setHoldings([...holdings, { ticker: "", weight: 0, account_type: "taxable" }])}>+ Add holding</button><button className="primary" onClick={onSave}>Save portfolio</button></div></div>
-      <div className="table-scroll"><table className="holdings-table"><thead><tr><th>Ticker</th><th>Weight</th><th>Market value</th><th>Cost basis</th><th>Account</th><th>Acquired</th><th /></tr></thead><tbody>{holdings.map((row, i) => <tr key={`${row.ticker}-${i}`}><td><input className="ticker-input" value={row.ticker} onChange={e => update(i, "ticker", e.target.value.toUpperCase())} placeholder="Ticker" /></td><td><input type="number" step="0.01" value={row.weight ?? ""} onChange={e => update(i, "weight", e.target.value)} placeholder="0.10" /></td><td><input type="number" value={row.market_value ?? ""} onChange={e => update(i, "market_value", e.target.value)} placeholder="$" /></td><td><input type="number" value={row.cost_basis ?? ""} onChange={e => update(i, "cost_basis", e.target.value)} placeholder="Optional" /></td><td><select value={row.account_type} onChange={e => update(i, "account_type", e.target.value)}><option value="taxable">Taxable</option><option value="traditional_ira">Traditional IRA</option><option value="roth_ira">Roth IRA</option><option value="401k">401(k)</option><option value="other">Other</option></select></td><td><input type="date" value={row.acquisition_date || ""} onChange={e => update(i, "acquisition_date", e.target.value)} /></td><td><button className="remove" onClick={() => setHoldings(holdings.filter((_, idx) => idx !== i))} aria-label={`Remove ${row.ticker}`}>×</button></td></tr>)}</tbody></table></div>
-      <div className="csv-hint"><strong>CSV columns</strong><code>ticker, weight, market_value, cost_basis, account_type, acquisition_date</code><span>Provide shares, weight, or market value for each row.</span></div>
+    <div className="panel portfolio-panel"><div className="portfolio-toolbar"><label>Portfolio name<input aria-label="Portfolio name" value={name} onChange={e => setName(e.target.value)} /></label><div><label className="upload-button">Import CSV<input aria-label="Import portfolio CSV" type="file" accept=".csv,text/csv" onChange={onImport} /></label><button className="secondary" onClick={() => setHoldings([...holdings, { ticker: "", weight: 0, account_type: "taxable" }])}>+ Add holding</button><button className="primary" disabled={saving || errors.length > 0 || !dirty} onClick={onSave}>{saving ? "Saving…" : dirty ? "Save portfolio" : "Saved"}</button></div></div>
+      <div className={`save-state ${dirty ? "dirty" : "saved"}`} role="status"><span>{dirty ? "Unsaved changes" : "All changes saved"}</span><small>{dirty ? "Save before leaving this page or running an analysis." : "Research is synchronized with the saved portfolio."}</small></div>
+      {errors.length > 0 && <div className="validation-list" role="alert"><strong>Fix before saving</strong>{errors.map(error => <span key={error}>{error}</span>)}</div>}
+      <div className="table-scroll"><table className="holdings-table"><thead><tr><th>Ticker</th><th>Weight (%)</th><th>Market value</th><th>Cost basis</th><th>Account</th><th>Acquired</th><th /></tr></thead><tbody>{holdings.map((row, i) => <tr key={`${row.ticker}-${i}`}><td><input aria-label={`Ticker row ${i + 1}`} className="ticker-input" value={row.ticker} onChange={e => update(i, "ticker", e.target.value.toUpperCase())} placeholder="Ticker" /></td><td><input aria-label={`Weight percent for ${row.ticker || `row ${i + 1}`}`} type="number" min="0" max="100" step="0.1" value={row.weight == null ? "" : Number((row.weight * 100).toFixed(4))} onChange={e => update(i, "weight", e.target.value)} placeholder="10" /></td><td><input aria-label={`Market value for ${row.ticker || `row ${i + 1}`}`} type="number" min="0" value={row.market_value ?? ""} onChange={e => update(i, "market_value", e.target.value)} placeholder="$" /></td><td><input aria-label={`Cost basis for ${row.ticker || `row ${i + 1}`}`} type="number" min="0" value={row.cost_basis ?? ""} onChange={e => update(i, "cost_basis", e.target.value)} placeholder="Optional" /></td><td><select aria-label={`Account for ${row.ticker || `row ${i + 1}`}`} value={row.account_type} onChange={e => update(i, "account_type", e.target.value)}><option value="taxable">Taxable</option><option value="traditional_ira">Traditional IRA</option><option value="roth_ira">Roth IRA</option><option value="401k">401(k)</option><option value="other">Other</option></select></td><td><input aria-label={`Acquisition date for ${row.ticker || `row ${i + 1}`}`} type="date" value={row.acquisition_date || ""} onChange={e => update(i, "acquisition_date", e.target.value)} /></td><td><button className="remove" onClick={() => setHoldings(holdings.filter((_, idx) => idx !== i))} aria-label={`Remove ${row.ticker || `row ${i + 1}`}`}>×</button></td></tr>)}</tbody></table></div>
+      <div className="csv-hint"><strong>CSV columns</strong><code>ticker, weight_percent, market_value, cost_basis, account_type, acquisition_date</code><span>The screen and weight_percent use 0–100 percentages. A CSV weight column remains decimal 0–1. Do not include both.</span></div>
     </div>
   </section>;
 }
 
 function Scenarios({ scenarios, contracts, fetchedAt, regimeHistory, warnings, onRefresh }: { scenarios: Scenario[]; contracts: Contract[]; fetchedAt: string | null; regimeHistory: RegimeSummary; warnings: string[]; onRefresh: () => void }) {
+  const uniqueWarnings = [...new Set(warnings)];
   return <section className="workspace"><div className="section-intro"><div><span className="kicker">Prediction markets first</span><h2>Probabilities, with their confidence attached.</h2><p>Contracts are deduplicated, weighted by market quality, and shrunk toward disclosed priors when evidence is thin.</p></div><button className="primary refresh-button" onClick={onRefresh}>↻ Refresh markets</button></div>
-    {warnings.length > 0 && <div className="warning-strip">{warnings.map(w => <span key={w}>△ {w}</span>)}</div>}
+    {uniqueWarnings.length > 0 && <div className="warning-strip">{uniqueWarnings.map(w => <span key={w}>△ {w}</span>)}</div>}
     <div className="regime-sample-strip"><div><span>Point-in-time regime library</span><strong>{regimeHistory.total_samples} monthly samples</strong><small>{regimeHistory.latest ? `Latest: ${regimeHistory.latest.dominant_regime.replaceAll("_", " ")} · ${dateLabel(regimeHistory.latest.as_of_date)}` : "Historical labeling pending"}</small></div>{Object.entries(regimeHistory.sample_counts).sort((a,b) => b[1]-a[1]).map(([key,count]) => <div key={key}><span>{key.replaceAll("_", " ")}</span><strong>{count}</strong><small>{regimeHistory.total_samples ? pct(count / regimeHistory.total_samples) : "—"} of samples</small></div>)}</div>
     <div className="scenario-grid">{scenarios.map((scenario, index) => <article className="scenario-card" key={scenario.key}><div className="scenario-number">0{index + 1}</div><span className="confidence-dot"><i style={{ opacity: scenario.confidence }} /> {pct(scenario.confidence)} signal confidence</span><h3>{scenario.label}</h3><div className="big-probability">{pct(scenario.probability)}</div><div className="prob-track"><i style={{ width: `${scenario.probability * 100}%` }} /></div><div className="change-grid"><span>1 day<b className={(scenario.change_1d || 0) >= 0 ? "up" : "down"}>{scenario.change_1d == null ? "—" : `${scenario.change_1d > 0 ? "+" : ""}${pct(scenario.change_1d, 1)}`}</b></span><span>1 week<b>{scenario.change_1w == null ? "—" : pct(scenario.change_1w, 1)}</b></span><span>1 month<b>{scenario.change_1m == null ? "—" : pct(scenario.change_1m, 1)}</b></span></div><div className="indicator-tags">{scenario.indicators.length ? scenario.indicators.map(i => <span key={i}>{i}</span>) : <span>disclosed prior</span>}</div><footer>{scenario.is_prior ? "Market coverage unavailable or weak" : `${scenario.sources.length} linked source${scenario.sources.length === 1 ? "" : "s"}`}</footer></article>)}</div>
     <div className="panel contract-panel"><div className="panel-head"><div><span>Stored market evidence</span><h3>Contracts behind the probabilities</h3></div><small>Snapshot {dateLabel(fetchedAt)}</small></div>
@@ -266,11 +358,11 @@ function Scenarios({ scenarios, contracts, fetchedAt, regimeHistory, warnings, o
   </section>;
 }
 
-function ResearchTable({ rows, sortKey, setSortKey, onNavigate }: { rows: Research[]; sortKey: keyof Research; setSortKey: (key:keyof Research) => void; onNavigate: (tab: Tab) => void }) {
+function ResearchTable({ rows, sortKey, setSortKey, onNavigate, onRefresh }: { rows: Research[]; sortKey: keyof Research; setSortKey: (key:keyof Research) => void; onNavigate: (tab: Tab) => void; onRefresh: () => void }) {
   const headers: Array<[keyof Research, string]> = [["final_score", "Composite"], ["growth_rating", "Growth"], ["valuation_score", "Value"], ["fundamental_score", "Quality"], ["industry_score", "Industry"], ["technical_score", "Technical"], ["confidence", "Confidence"]];
-  return <section className="workspace"><div className="section-intro"><div><span className="kicker">Evidence before narrative</span><h2>Every rating keeps its components visible.</h2><p>Scores are comparative research signals—not price targets or instructions to buy or sell.</p></div><button className="secondary" onClick={() => onNavigate("portfolio")}>Manage universe</button></div>
+  return <section className="workspace"><div className="section-intro"><div><span className="kicker">Evidence before narrative</span><h2>Every rating keeps its components visible.</h2><p>Scores are comparative research signals—not price targets or instructions to buy or sell.</p></div><div className="section-actions"><button className="secondary" onClick={() => onNavigate("portfolio")}>Manage universe</button><button className="primary" onClick={onRefresh}>↻ Refresh evidence</button></div></div>
     <div className="panel research-panel"><div className="research-toolbar"><span>{rows.length} securities</span><div>Sort by {headers.map(([key, label]) => <button key={key} className={sortKey === key ? "active" : ""} onClick={() => setSortKey(key)}>{label}</button>)}</div></div>
-      {rows.length === 0 ? <EmptyState title="Research data is waiting" body="Start the local engine or run an analysis to load holdings, watchlist names, and ETF coverage." /> : <div className="table-scroll"><table className="research-table"><thead><tr><th>Security</th><th>Price / 1Y</th>{headers.map(([,label]) => <th key={label}>{label}</th>)}<th>Data</th><th>Evidence</th><th>Primary risk</th></tr></thead><tbody>{rows.map(row => <tr key={row.ticker}><td><div className="security-cell"><span>{row.ticker.slice(0,2)}</span><p><strong>{row.ticker}</strong><small>{row.company}<br />{row.sector}</small></p></div></td><td><div className="market-cell"><strong>{row.price == null ? "—" : money(row.price)}</strong><small className={(row.price_change_1y || 0) >= 0 ? "up" : "down"}>{row.price_change_1y == null ? "No history" : `${row.price_change_1y >= 0 ? "+" : ""}${pct(row.price_change_1y,1)}`}</small></div></td>{headers.map(([key]) => <td key={key}><Score value={Number(row[key])} /></td>)}<td><span className={`quality ${row.data_quality}`}>{row.data_quality}</span></td><td><div className="evidence-cell"><span>Price {dateLabel(row.price_as_of)}</span><span>Fund. {dateLabel(row.fundamentals_as_of)}</span><span>{row.news_count || 0} recent articles</span>{row.latest_news?.source_url && <a href={row.latest_news.source_url} target="_blank" rel="noreferrer">Latest source ↗</a>}</div></td><td className="risk-copy">{row.risk_flags[0]?.replaceAll("_", " ") || "No hard flag"}</td></tr>)}</tbody></table></div>}
+      {rows.length === 0 ? <EmptyState title="Research data is waiting" body="Start the local engine or run an analysis to load holdings, watchlist names, and ETF coverage." /> : <div className="table-scroll"><table className="research-table"><thead><tr><th>Security</th><th>Price / 1Y</th>{headers.map(([,label]) => <th key={label}>{label}</th>)}<th>Data</th><th>Evidence</th><th>Primary risk</th></tr></thead><tbody>{rows.map(row => <tr key={row.ticker}><td><div className="security-cell"><span>{row.ticker.slice(0,2)}</span><p><strong>{row.ticker}</strong><small>{row.company}<br />{row.sector}</small></p></div></td><td><div className="market-cell"><strong>{row.price == null ? "—" : money(row.price)}</strong><small className={(row.price_change_1y || 0) >= 0 ? "up" : "down"}>{row.price_change_1y == null ? "No history" : `${row.price_change_1y >= 0 ? "+" : ""}${pct(row.price_change_1y,1)}`}</small></div></td>{headers.map(([key]) => <td key={key}><Score value={Number(row[key])} /></td>)}<td><span className={`quality ${row.data_quality}`}>{row.data_quality}</span></td><td><div className="evidence-cell"><span>Price {dateLabel(row.price_as_of)}</span><span>Fund. {dateLabel(row.fundamentals_as_of)}</span><span>{row.news_count || 0} recent articles</span>{row.latest_news?.source_url && <a href={row.latest_news.source_url} target="_blank" rel="noreferrer">Latest news ↗</a>}{row.prediction_markets?.length ? <details className="prediction-evidence"><summary>{row.prediction_markets.length} Polymarket signal{row.prediction_markets.length === 1 ? "" : "s"}</summary>{row.prediction_markets.slice(0,3).map(market => <a key={market.id} href={market.source} target="_blank" rel="noreferrer"><b>{pct(market.probability,0)}</b><span>{market.evidence_type}: {market.title}</span></a>)}</details> : <span>No company prediction market</span>}</div></td><td className="risk-copy">{row.risk_flags[0]?.replaceAll("_", " ") || "No hard flag"}</td></tr>)}</tbody></table></div>}
     </div>
   </section>;
 }
@@ -310,3 +402,22 @@ function Optimize({ profile, setProfile, analysis, monitoring, selected, setSele
 function Field({ label, value, onChange }: { label: string; value: number; onChange: (value:string) => void }) { return <label>{label}<input type="number" value={value} onChange={e => onChange(e.target.value)} /></label>; }
 function EmptyState({ title, body }: { title: string; body: string }) { return <div className="empty-state"><span>◎</span><h3>{title}</h3><p>{body}</p></div>; }
 function cleanHolding(row: Holding) { const output: Record<string, unknown> = { ticker: row.ticker.toUpperCase(), account_type: row.account_type }; (["shares","weight","market_value","cost_basis","acquisition_date"] as const).forEach(key => { if (row[key] !== null && row[key] !== undefined && row[key] !== "") output[key] = row[key]; }); return output; }
+function portfolioSignature(name: string, holdings: Holding[]) { return JSON.stringify({ name: name.trim(), holdings: holdings.map(cleanHolding) }); }
+function validatePortfolio(name: string, holdings: Holding[]) {
+  const errors: string[] = [];
+  if (!name.trim()) errors.push("Portfolio name is required.");
+  if (!holdings.length) errors.push("Add at least one holding.");
+  const tickers = holdings.map(row => row.ticker.trim().toUpperCase());
+  const duplicates = [...new Set(tickers.filter((ticker, index) => ticker && tickers.indexOf(ticker) !== index))];
+  if (duplicates.length) errors.push(`Duplicate ticker${duplicates.length === 1 ? "" : "s"}: ${duplicates.join(", ")}. Combine each ticker into one row.`);
+  holdings.forEach((row, index) => {
+    const ticker = row.ticker.trim().toUpperCase();
+    if (!ticker) errors.push(`Row ${index + 1}: ticker is required.`);
+    else if (!/^[A-Z][A-Z0-9.-]{0,9}$/.test(ticker)) errors.push(`Row ${index + 1}: ${ticker} is not a valid ticker format.`);
+    if (row.shares == null && row.weight == null && row.market_value == null) errors.push(`Row ${index + 1}: provide shares, weight, or market value.`);
+    if (row.weight != null && (row.weight < 0 || row.weight > 1)) errors.push(`Row ${index + 1}: weight must be between 0% and 100%.`);
+  });
+  return errors;
+}
+function formatApiDetail(detail: unknown) { if (typeof detail === "string") return detail; if (Array.isArray(detail)) return detail.map(item => typeof item?.msg === "string" ? `${item.loc?.at(-1) || "field"}: ${item.msg}` : String(item)).join(" · "); return ""; }
+async function apiError(response: Response, fallback: string) { try { const data = await response.json(); return formatApiDetail(data.detail) || fallback; } catch { return fallback; } }

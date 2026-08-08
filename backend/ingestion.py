@@ -455,11 +455,14 @@ def active_tickers() -> list[str]:
     return sorted({str(row["ticker"]).upper() for row in rows} | {"SPY", "QQQ", "VTI", "BND"})
 
 
-def refresh_polygon() -> int:
+def refresh_polygon(tickers: Iterable[str] | None = None) -> int:
     api_key = os.getenv("POLYGON_API_KEY")
     if not api_key:
         raise RuntimeError("POLYGON_API_KEY is required")
-    tickers = active_tickers()
+    tickers = sorted({
+        str(ticker).strip().upper() for ticker in (tickers or active_tickers())
+        if str(ticker).strip() and str(ticker).upper() != "CASH"
+    })
     frames: list[pd.DataFrame] = []
     today = datetime.now(timezone.utc).date()
     with database.postgres_connection() as conn:
@@ -541,12 +544,19 @@ def fetch_tiingo_prices(
     return normalize_tiingo_prices(ticker, payload)
 
 
-def _load_tiingo_prices(full_history: bool) -> int:
+def _load_tiingo_prices(full_history: bool, requested_tickers: Iterable[str] | None = None) -> int:
     api_key = os.getenv("TIINGO_API_KEY")
     if not api_key:
         raise RuntimeError("TIINGO_API_KEY is required")
     today = datetime.now(timezone.utc).date()
-    candidates = sorted((set(active_tickers()) | ETF_TICKERS) - {"CASH"})
+    requested = {
+        str(ticker).strip().upper() for ticker in (requested_tickers or [])
+        if str(ticker).strip()
+    }
+    candidates = sorted(
+        (requested if requested_tickers is not None else (set(active_tickers()) | ETF_TICKERS))
+        - {"CASH"}
+    )
     earliest: dict[str, date | None] = {}
     latest: dict[str, date | None] = {}
     with database.postgres_connection() as conn:
@@ -586,8 +596,8 @@ def _load_tiingo_prices(full_history: bool) -> int:
     return upsert_price_frame(pd.concat(frames, ignore_index=True), "tiingo")
 
 
-def refresh_tiingo() -> int:
-    return _load_tiingo_prices(full_history=False)
+def refresh_tiingo(tickers: Iterable[str] | None = None) -> int:
+    return _load_tiingo_prices(full_history=False, requested_tickers=tickers)
 
 
 def extend_tiingo_history() -> int:
@@ -880,14 +890,18 @@ def refresh_fred() -> int:
     return len(values)
 
 
-def refresh_news() -> int:
+def refresh_news(tickers: Iterable[str] | None = None) -> int:
     api_key = os.getenv("POLYGON_API_KEY")
     if not api_key:
         raise RuntimeError("POLYGON_API_KEY is required")
     rows: list[dict[str, Any]] = []
     since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     session = requests.Session()
-    for ticker in active_tickers():
+    selected = sorted({
+        str(ticker).strip().upper() for ticker in (tickers or active_tickers())
+        if str(ticker).strip() and str(ticker).upper() != "CASH"
+    })
+    for ticker in selected:
         response = session.get(
             POLYGON_NEWS_URL,
             params={
@@ -964,7 +978,7 @@ def upsert_sec_periods(frame: pd.DataFrame) -> int:
     return len(frame)
 
 
-def refresh_sec() -> int:
+def refresh_sec(tickers: Iterable[str] | None = None) -> int:
     user_agent = os.getenv("SEC_USER_AGENT")
     if not user_agent or "@" not in user_agent:
         raise RuntimeError("SEC_USER_AGENT is required and must include a contact email")
@@ -977,7 +991,11 @@ def refresh_sec() -> int:
         for item in response.json().values()
     }
     frames = []
-    for ticker in active_tickers():
+    selected = sorted({
+        str(ticker).strip().upper() for ticker in (tickers or active_tickers())
+        if str(ticker).strip() and str(ticker).upper() != "CASH"
+    })
+    for ticker in selected:
         cik = mapping.get(ticker)
         if not cik:
             continue
@@ -989,6 +1007,51 @@ def refresh_sec() -> int:
         if not frame.empty:
             frames.append(frame)
     return upsert_sec_periods(pd.concat(frames, ignore_index=True)) if frames else 0
+
+
+def refresh_security_evidence(tickers: Iterable[str]) -> dict[str, Any]:
+    """Fetch durable evidence for newly selected securities without blocking saves.
+
+    Each provider is isolated so partial outages are reported as coverage warnings
+    instead of causing a saved portfolio to disappear.
+    """
+    selected = sorted({
+        str(ticker).strip().upper() for ticker in tickers
+        if str(ticker).strip() and str(ticker).upper() != "CASH"
+    })[:50]
+    if not selected:
+        return {"tickers": [], "providers": {}, "warnings": []}
+    if not database.DATABASE_URL:
+        return {
+            "tickers": selected,
+            "providers": {},
+            "warnings": ["Automatic provider ingestion requires Supabase storage."],
+        }
+
+    providers: dict[str, int] = {}
+    warnings: list[str] = []
+    operations: list[tuple[str, Callable[[], int]]] = []
+    if os.getenv("TIINGO_API_KEY"):
+        operations.append(("tiingo", lambda: refresh_tiingo(selected)))
+    elif os.getenv("POLYGON_API_KEY"):
+        operations.append(("polygon", lambda: refresh_polygon(selected)))
+    else:
+        warnings.append("No Tiingo or Polygon key is configured for automatic price history.")
+    if os.getenv("POLYGON_API_KEY"):
+        operations.append(("polygon_news", lambda: refresh_news(selected)))
+    else:
+        warnings.append("Polygon news refresh is not configured.")
+    if os.getenv("SEC_USER_AGENT"):
+        operations.append(("sec", lambda: refresh_sec(selected)))
+    else:
+        warnings.append("SEC fundamentals refresh is not configured.")
+
+    for provider, operation in operations:
+        try:
+            providers[provider] = operation()
+        except Exception as exc:
+            warnings.append(f"{provider} refresh failed: {type(exc).__name__}: {str(exc)[:180]}")
+    return {"tickers": selected, "providers": providers, "warnings": warnings}
 
 
 def refresh_markets() -> int:
@@ -1014,7 +1077,7 @@ def refresh_markets() -> int:
                 (
                     canonical_key, contract.get("scenario"), contract.get("indicator"),
                     database._jsonb(threshold_bucket), contract.get("title"),
-                    database._jsonb({"mapping_version": "canonical-contract-v1"}),
+                    database._jsonb({"mapping_version": "canonical-contract-v2"}),
                 ),
             ).fetchone()["id"]
             market_id = conn.execute(
@@ -1064,7 +1127,9 @@ def backfill_market_series() -> int:
     with database.postgres_connection() as conn:
         rows = conn.execute(
             """SELECT id, title, canonical_scenario, threshold_bucket, metadata
-            FROM public.prediction_markets WHERE series_id IS NULL"""
+            FROM public.prediction_markets
+            WHERE series_id IS NULL AND canonical_scenario IS NOT NULL
+            """
         ).fetchall()
         count = 0
         for row in rows:
@@ -1085,7 +1150,7 @@ def backfill_market_series() -> int:
                 (
                     canonical_key, contract["scenario"], contract["indicator"],
                     database._jsonb(threshold_bucket), contract["title"],
-                    database._jsonb({"mapping_version": "canonical-contract-v1", "backfilled": True}),
+                    database._jsonb({"mapping_version": "canonical-contract-v2", "backfilled": True}),
                 ),
             ).fetchone()["id"]
             conn.execute(

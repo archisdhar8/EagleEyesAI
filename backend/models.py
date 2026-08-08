@@ -60,6 +60,14 @@ class PortfolioPayload(BaseModel):
     name: str = Field(default="Primary portfolio", min_length=1, max_length=80)
     holdings: list[Holding] = Field(min_length=1, max_length=50)
 
+    @model_validator(mode="after")
+    def reject_duplicate_tickers(self) -> "PortfolioPayload":
+        tickers = [holding.ticker.upper().strip() for holding in self.holdings]
+        duplicates = sorted({ticker for ticker in tickers if tickers.count(ticker) > 1})
+        if duplicates:
+            raise ValueError(f"Duplicate tickers are not allowed: {', '.join(duplicates)}")
+        return self
+
 
 class Scenario(BaseModel):
     key: str

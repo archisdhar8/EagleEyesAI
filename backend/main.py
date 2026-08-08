@@ -7,11 +7,13 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import database
 from .analysis import latest_macro, run_analysis, security_research
+from .company_markets import refresh_company_markets
 from .explanations import generate_explanation
+from .ingestion import refresh_security_evidence
 from .models import AnalysisRequest, ExplanationRequest, Holding, InvestorProfile, PortfolioPayload
 from .scenarios import refresh as refresh_scenarios
 
@@ -48,6 +50,11 @@ app.add_middleware(
 class CsvImport(BaseModel):
     name: str = "Imported portfolio"
     csv_text: str
+
+
+class ResearchRefresh(BaseModel):
+    tickers: list[str]
+    ingest_tickers: list[str] = Field(default_factory=list)
 
 
 def regime_summary() -> dict[str, Any]:
@@ -110,12 +117,19 @@ def import_portfolio(payload: CsvImport) -> dict[str, Any]:
             raise ValueError("CSV requires a ticker column")
         holdings = []
         normalized_names = {name.lower().strip(): name for name in reader.fieldnames}
+        if "weight" in normalized_names and "weight_percent" in normalized_names:
+            raise ValueError("CSV must use either weight (decimal 0–1) or weight_percent (0–100), not both")
         for line_number, row in enumerate(reader, start=2):
             normalized = {key: row.get(original) for key, original in normalized_names.items()}
             values: dict[str, Any] = {"ticker": (normalized.get("ticker") or "").strip().upper(), "account_type": (normalized.get("account_type") or "taxable").strip().lower()}
             for key in ["shares", "weight", "market_value", "cost_basis"]:
                 if normalized.get(key) not in {None, ""}:
                     values[key] = float(str(normalized[key]).replace(",", "").replace("$", ""))
+            if normalized.get("weight_percent") not in {None, ""}:
+                percent = float(str(normalized["weight_percent"]).replace("%", "").strip())
+                if not 0 <= percent <= 100:
+                    raise ValueError(f"Invalid row {line_number}: weight_percent must be between 0 and 100")
+                values["weight"] = percent / 100
             if normalized.get("acquisition_date"):
                 values["acquisition_date"] = normalized["acquisition_date"]
             try:
@@ -124,6 +138,11 @@ def import_portfolio(payload: CsvImport) -> dict[str, Any]:
                 raise ValueError(f"Invalid row {line_number}: {exc}") from exc
         if not holdings:
             raise ValueError("CSV contains no holdings")
+        tickers = [holding["ticker"] for holding in holdings]
+        duplicates = sorted({ticker for ticker in tickers if tickers.count(ticker) > 1})
+        if duplicates:
+            raise ValueError(f"Duplicate tickers are not allowed: {', '.join(duplicates)}")
+        PortfolioPayload(name=payload.name, holdings=[Holding.model_validate(item) for item in holdings])
     except (csv.Error, ValueError) as exc:
         raise HTTPException(422, str(exc)) from exc
     portfolio = database.save_portfolio(payload.name, holdings)
@@ -164,6 +183,29 @@ def regimes(limit: int = Query(default=240, ge=1, le=1000)) -> dict[str, Any]:
 def research(tickers: str = Query(default="")) -> list[dict[str, Any]]:
     values = [ticker.strip().upper() for ticker in tickers.split(",") if ticker.strip()]
     return security_research(values[:50])
+
+
+@app.post("/api/research/refresh")
+def refresh_research(payload: ResearchRefresh) -> dict[str, Any]:
+    values = list(dict.fromkeys(
+        ticker.strip().upper() for ticker in payload.tickers if ticker.strip() and ticker.upper() != "CASH"
+    ))[:50]
+    ingest_values = list(dict.fromkeys(
+        ticker.strip().upper() for ticker in payload.ingest_tickers
+        if ticker.strip() and ticker.upper() != "CASH" and ticker.strip().upper() in values
+    ))
+    evidence = refresh_security_evidence(ingest_values)
+    current = security_research(values)
+    companies = {row["ticker"]: row.get("company") or row["ticker"] for row in current}
+    provider = refresh_company_markets(companies)
+    return {
+        "research": security_research(values),
+        "provider": "Polymarket",
+        "searched": provider["searched"],
+        "markets_found": len(provider["markets"]),
+        "warnings": [*evidence["warnings"], *provider["warnings"]],
+        "evidence_refresh": evidence,
+    }
 
 
 @app.post("/api/analyses")

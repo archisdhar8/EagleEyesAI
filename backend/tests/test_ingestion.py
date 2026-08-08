@@ -1,5 +1,6 @@
 from backend.ingestion import (
     article_id, normalize_sec_payload, normalize_tiingo_prices, parse_providers,
+    refresh_security_evidence,
 )
 
 
@@ -59,3 +60,23 @@ def test_tiingo_normalization_drops_incomplete_bars() -> None:
         {"date": None, "close": 100, "adjClose": 100},
     ])
     assert frame.empty
+
+
+def test_security_evidence_reports_local_storage_limit(monkeypatch) -> None:
+    monkeypatch.setattr("backend.ingestion.database.DATABASE_URL", None)
+    result = refresh_security_evidence(["aapl", "CASH", "AAPL"])
+    assert result["tickers"] == ["AAPL"]
+    assert "Supabase" in result["warnings"][0]
+
+
+def test_security_evidence_isolates_provider_failures(monkeypatch) -> None:
+    monkeypatch.setattr("backend.ingestion.database.DATABASE_URL", "postgresql://configured")
+    monkeypatch.setenv("TIINGO_API_KEY", "configured")
+    monkeypatch.setenv("POLYGON_API_KEY", "configured")
+    monkeypatch.setenv("SEC_USER_AGENT", "test@example.com")
+    monkeypatch.setattr("backend.ingestion.refresh_tiingo", lambda tickers: 500)
+    monkeypatch.setattr("backend.ingestion.refresh_news", lambda tickers: (_ for _ in ()).throw(RuntimeError("offline")))
+    monkeypatch.setattr("backend.ingestion.refresh_sec", lambda tickers: 12)
+    result = refresh_security_evidence(["MSFT"])
+    assert result["providers"] == {"tiingo": 500, "sec": 12}
+    assert any("polygon_news refresh failed" in warning for warning in result["warnings"])

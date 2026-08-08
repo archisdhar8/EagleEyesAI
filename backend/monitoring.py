@@ -35,7 +35,7 @@ def calibration_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     if len(samples) < 6:
         return {
-            "status": "insufficient_history", "model_version": "prediction-market-v1",
+            "status": "insufficient_history", "model_version": "prediction-market-v2",
             "horizon_months": 1, "data_cutoff": str(cutoff)[:10],
             "sample_count": len(samples), "genuine_market_sample_count": len(samples),
             "brier_score": None, "calibration_error": None, "metrics": {},
@@ -61,7 +61,7 @@ def calibration_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 float(flattened_outcomes[mask].mean()) - float(flattened_probabilities[mask].mean())
             )
     return {
-        "status": "complete", "model_version": "prediction-market-v1",
+        "status": "complete", "model_version": "prediction-market-v2",
         "horizon_months": 1, "data_cutoff": str(cutoff)[:10],
         "sample_count": len(samples), "genuine_market_sample_count": len(samples),
         "brier_score": round(brier, 6),

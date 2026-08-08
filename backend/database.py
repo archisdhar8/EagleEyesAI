@@ -332,7 +332,8 @@ def save_scenario_snapshot(
                 model_version, warnings, lineage, raw_scenarios, raw_contracts
                 ) VALUES (%s, %s, %s, %s, %s) RETURNING id""",
                 (
-                    "prediction-market-v1", _jsonb(warnings), _jsonb({}),
+                    "prediction-market-v2", _jsonb(warnings),
+                    _jsonb({"classifier": "strict-macro-v2", "sports_rejection": True}),
                     _jsonb(scenarios), _jsonb(contracts),
                 ),
             ).fetchone()["id"]
@@ -705,7 +706,7 @@ def save_prediction_calibration(result: dict[str, Any]) -> str | None:
             status, metrics, assumptions
             ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (
-                result.get("model_version", "prediction-market-v1"),
+                result.get("model_version", "prediction-market-v2"),
                 result.get("horizon_months", 1), result["data_cutoff"],
                 result.get("sample_count", 0), result.get("genuine_market_sample_count", 0),
                 result.get("brier_score"), result.get("calibration_error"),
@@ -909,7 +910,7 @@ def macro_observation_history(series_ids: list[str], limit_per_series: int = 18)
 def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
     normalized = sorted({ticker.strip().upper() for ticker in tickers if ticker.strip() and ticker.upper() != "CASH"})
     if not DATABASE_URL or not normalized:
-        return {"securities": [], "fundamentals": [], "prices": [], "news": []}
+        return {"securities": [], "fundamentals": [], "prices": [], "news": [], "company_markets": []}
     with postgres_connection() as conn:
         securities = conn.execute(
             """SELECT id, ticker, asset_type, company_name, sector, industry, updated_at
@@ -947,6 +948,26 @@ def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
             ) items WHERE position <= 25 ORDER BY ticker, published_at DESC NULLS LAST""",
             (normalized,),
         ).fetchall()
+        company_markets = conn.execute(
+            """SELECT ticker, provider, external_market_id, title, source_url,
+            evidence_type, closes_at, probability, confidence, volume, observed_at
+            FROM (
+              SELECT upper(pm.metadata->>'ticker') AS ticker, pm.provider,
+              pm.external_market_id, pm.title, pm.source_url,
+              pm.metadata->>'evidence_type' AS evidence_type,
+              pm.closes_at, pms.probability,
+              pms.confidence, pms.volume, pms.observed_at,
+              row_number() OVER (
+                PARTITION BY pm.id ORDER BY pms.observed_at DESC
+              ) AS snapshot_position
+              FROM public.prediction_markets pm
+              JOIN public.prediction_market_snapshots pms ON pms.market_id=pm.id
+              WHERE upper(pm.metadata->>'ticker') = ANY(%s)
+                AND pm.canonical_scenario IS NULL
+            ) latest WHERE snapshot_position=1
+            ORDER BY ticker, confidence DESC NULLS LAST, volume DESC NULLS LAST""",
+            (normalized,),
+        ).fetchall()
     return {
         "securities": [
             {**dict(row), "id": str(row["id"]), "updated_at": _iso(row["updated_at"])}
@@ -975,7 +996,69 @@ def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
             }
             for row in news
         ],
+        "company_markets": [
+            {
+                **dict(row), "probability": _number(row["probability"]),
+                "confidence": _number(row["confidence"]), "volume": _number(row["volume"]),
+                "closes_at": _iso(row["closes_at"]), "observed_at": _iso(row["observed_at"]),
+                "source": row["source_url"], "id": row["external_market_id"],
+            }
+            for row in company_markets
+        ],
     }
+
+
+def save_security_prediction_markets(
+    ticker: str, company_name: str, markets: list[dict[str, Any]]
+) -> int:
+    if not DATABASE_URL or not markets:
+        return 0
+    observed_at = utc_now()
+    with postgres_connection() as conn:
+        conn.execute(
+            """INSERT INTO public.securities(ticker, asset_type, company_name)
+            VALUES (%s, 'stock', %s)
+            ON CONFLICT (ticker, asset_type) DO UPDATE SET
+              company_name=coalesce(public.securities.company_name, excluded.company_name),
+              updated_at=now()
+            RETURNING id""",
+            (ticker.upper(), company_name or ticker.upper()),
+        ).fetchone()
+        for market in markets:
+            market_id = conn.execute(
+                """INSERT INTO public.prediction_markets(
+                provider, external_market_id, canonical_question, canonical_scenario,
+                title, source_url, closes_at, metadata
+                ) VALUES ('polymarket', %s, %s, NULL, %s, %s, %s, %s)
+                ON CONFLICT (provider, external_market_id) DO UPDATE SET
+                  canonical_question=excluded.canonical_question,
+                  title=excluded.title, source_url=excluded.source_url,
+                  closes_at=excluded.closes_at, metadata=excluded.metadata,
+                  updated_at=now()
+                RETURNING id""",
+                (
+                    market["id"], market["title"], market["title"], market.get("source"),
+                    market.get("closes_at"),
+                    _jsonb({
+                        "ticker": ticker.upper(), "token_ids": market.get("token_ids"),
+                        "evidence_type": market.get("evidence_type", "business catalyst"),
+                        "scope": "security_research",
+                    }),
+                ),
+            ).fetchone()["id"]
+            conn.execute(
+                """INSERT INTO public.prediction_market_snapshots(
+                market_id, observed_at, probability, volume, confidence, raw_payload
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (market_id, observed_at) DO UPDATE SET
+                  probability=excluded.probability, volume=excluded.volume,
+                  confidence=excluded.confidence, raw_payload=excluded.raw_payload""",
+                (
+                    market_id, observed_at, market["probability"], market.get("volume"),
+                    market.get("confidence"), _jsonb(market),
+                ),
+            )
+    return len(markets)
 
 
 def price_history(tickers: list[str], limit_per_ticker: int = 5000) -> list[dict[str, Any]]:

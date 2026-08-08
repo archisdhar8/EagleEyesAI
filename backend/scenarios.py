@@ -30,6 +30,17 @@ LABELS = {
     "oil_shock": "Oil shock",
 }
 
+SPORTS_CONTEXT_PATTERN = re.compile(
+    r"\b(?:sports?|soccer|football|basketball|baseball|hockey|tennis|cricket|"
+    r"esports?|nfl|nba|wnba|nhl|mlb|epl|uefa|fifa)\b",
+    re.IGNORECASE,
+)
+SPORTS_TITLE_PATTERN = re.compile(
+    r"(?:\bvs(?:\.|\b)|\b(?:match|game|score|goals?|league|tournament|"
+    r"playoffs?|quarterfinal|semifinal)\b|\bwinner\s*\?)",
+    re.IGNORECASE,
+)
+
 
 def _number(value: Any, default: float = 0.0) -> float:
     try:
@@ -50,16 +61,39 @@ def _probability(value: Any) -> float | None:
     return max(0.0, min(1.0, result))
 
 
-def _canonical(text: str) -> tuple[str, str] | None:
+def _market_context(market: dict[str, Any] | None) -> str:
+    if not market:
+        return ""
+    values: list[str] = []
+    for key in ("category", "subcategory", "tags", "series_ticker", "event_ticker", "ticker", "slug"):
+        value = market.get(key)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, list):
+            values.extend(str(item.get("label") or item.get("name") or item) if isinstance(item, dict) else str(item) for item in value)
+    return " ".join(values)
+
+
+def is_sports_market(text: str, market: dict[str, Any] | None = None) -> bool:
+    return bool(SPORTS_TITLE_PATTERN.search(text) or SPORTS_CONTEXT_PATTERN.search(_market_context(market)))
+
+
+def _canonical(text: str, market: dict[str, Any] | None = None) -> tuple[str, str] | None:
     clean = text.lower()
+    if is_sports_market(clean, market):
+        return None
     rules: list[tuple[str, str, str]] = [
-        ("recession", "recession_cuts", "recession probability"),
-        ("unemployment", "recession_cuts", "unemployment risk"),
-        (r"fed.*cut|rate cut|interest rate.*lower", "recession_cuts", "rate-cut probability"),
-        (r"cpi|inflation|pce", "sticky_inflation", "inflation path"),
-        (r"oil|wti|brent", "oil_shock", "oil price"),
-        (r"gdp|economic growth", "growth_reacceleration", "growth path"),
-        (r"treasury|yield|interest rate", "sticky_inflation", "rates path"),
+        (r"\brecession\b", "recession_cuts", "recession probability"),
+        (r"\bunemployment\b", "recession_cuts", "unemployment risk"),
+        (r"\bfed\b.*\bcut|\brate cuts?\b|\binterest rates?\b.*\blower\b", "recession_cuts", "rate-cut probability"),
+        (r"\b(?:cpi|inflation|pce)\b", "sticky_inflation", "inflation path"),
+        (
+            r"\b(?:crude oil|oil prices?|wti|west texas intermediate|brent(?: crude| oil| prices?)?)\b",
+            "oil_shock",
+            "oil price",
+        ),
+        (r"\b(?:gdp|economic growth)\b", "growth_reacceleration", "growth path"),
+        (r"\b(?:treasury|yields?|interest rates?)\b", "sticky_inflation", "rates path"),
     ]
     for pattern, scenario, indicator in rules:
         if re.search(pattern, clean):
@@ -113,7 +147,7 @@ def normalize_kalshi(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     contracts: list[dict[str, Any]] = []
     for market in markets:
         title = str(market.get("title") or market.get("subtitle") or market.get("ticker") or "")
-        mapping = _canonical(title)
+        mapping = _canonical(title, market)
         if mapping is None:
             continue
         bid = _probability(market.get("yes_bid_dollars") or market.get("yes_bid"))
@@ -149,7 +183,7 @@ def normalize_polymarket(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     contracts: list[dict[str, Any]] = []
     for market in markets:
         title = str(market.get("question") or market.get("title") or "")
-        mapping = _canonical(title)
+        mapping = _canonical(title, market)
         if mapping is None:
             continue
         probability = _probability(market.get("outcomePrices") or market.get("lastTradePrice"))
@@ -188,6 +222,23 @@ def _deduplicate(contracts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if key not in best or contract["confidence"] > best[key]["confidence"]:
             best[key] = contract
     return list(best.values())
+
+
+def sanitize_contracts(contracts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Revalidate stored contracts with the current classifier.
+
+    Snapshots can outlive a classifier release, so cached data must pass the
+    same checks as newly fetched provider data before it can affect a scenario.
+    """
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for contract in contracts:
+        mapping = _canonical(str(contract.get("title", "")), contract)
+        if mapping is None or mapping != (contract.get("scenario"), contract.get("indicator")):
+            rejected.append(contract)
+        else:
+            accepted.append(contract)
+    return accepted, rejected
 
 
 def build_scenarios(contracts: list[dict[str, Any]], history: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
@@ -248,9 +299,13 @@ def _historical_change(key: str, current: float, history: list[dict[str, Any]], 
 
 def refresh(force: bool = False) -> dict[str, Any]:
     latest = database.latest_scenario_snapshot()
+    latest_contracts: list[dict[str, Any]] = []
+    rejected_cached: list[dict[str, Any]] = []
+    if latest:
+        latest_contracts, rejected_cached = sanitize_contracts(latest.get("contracts", []))
     if latest and not force:
         fetched = datetime.fromisoformat(latest["fetched_at"].replace("Z", "+00:00"))
-        if (datetime.now(timezone.utc) - fetched).total_seconds() < CACHE_SECONDS:
+        if not rejected_cached and (datetime.now(timezone.utc) - fetched).total_seconds() < CACHE_SECONDS:
             return {**latest, "cached": True}
     warnings: list[str] = []
     contracts: list[dict[str, Any]] = []
@@ -267,8 +322,26 @@ def refresh(force: bool = False) -> dict[str, Any]:
     except (requests.RequestException, ValueError) as exc:
         warnings.append(f"Polymarket refresh unavailable: {type(exc).__name__}")
 
+    if rejected_cached:
+        warnings.append(
+            f"Rejected {len(rejected_cached)} cached contract(s) that failed the current macro-market classifier."
+        )
     if not contracts and latest:
-        return {**latest, "cached": True, "warnings": latest["warnings"] + warnings + ["Using the latest validated scenario snapshot."]}
+        fallback_scenarios = build_scenarios(latest_contracts)
+        fallback_warnings = list(latest.get("warnings", [])) + warnings
+        if latest_contracts:
+            fallback_warnings.append("Using only revalidated contracts from the latest snapshot.")
+        else:
+            fallback_warnings.append("No validated prediction-market evidence remains; using disclosed priors.")
+        fallback_warnings = list(dict.fromkeys(fallback_warnings))
+        database.save_scenario_snapshot(fallback_scenarios, latest_contracts, fallback_warnings)
+        return {
+            "scenarios": fallback_scenarios,
+            "contracts": latest_contracts,
+            "warnings": fallback_warnings,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "cached": True,
+        }
     history = database.scenario_history()
     scenarios = build_scenarios(contracts, history)
     if not contracts:

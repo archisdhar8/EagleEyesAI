@@ -2,6 +2,7 @@ import pytest
 
 from backend.scenarios import (
     build_scenarios, canonical_contract_series, normalize_kalshi, normalize_polymarket,
+    sanitize_contracts,
 )
 
 
@@ -25,6 +26,48 @@ def test_polymarket_maps_outcome_prices_and_event_id() -> None:
     }])
     assert contracts[0]["probability"] == 0.31
     assert contracts[0]["event_id"] == "condition-1"
+
+
+@pytest.mark.parametrize(
+    "market",
+    [
+        {"ticker": "SOCCER-1", "title": "Brentford vs Tottenham Winner?", "last_price": 42},
+        {"ticker": "NHL-1", "title": "Will the Edmonton Oilers win the game?", "last_price": 55},
+        {
+            "ticker": "PLAYER-1",
+            "title": "Will Brent score in the match?",
+            "category": "Sports",
+            "last_price": 30,
+        },
+    ],
+)
+def test_kalshi_rejects_sports_markets_that_contain_commodity_words(market: dict) -> None:
+    assert normalize_kalshi([market]) == []
+
+
+def test_kalshi_accepts_explicit_brent_crude_market() -> None:
+    contracts = normalize_kalshi([{
+        "ticker": "BRENT-100", "event_ticker": "BRENT", "category": "Economics",
+        "title": "Will Brent crude oil be above $100?", "last_price": 41,
+    }])
+    assert len(contracts) == 1
+    assert contracts[0]["scenario"] == "oil_shock"
+    assert contracts[0]["indicator"] == "oil price"
+
+
+def test_cached_contracts_are_revalidated_by_current_classifier() -> None:
+    valid = {
+        "provider": "Kalshi", "id": "oil", "event_id": "oil", "title": "Will WTI oil price exceed $100?",
+        "scenario": "oil_shock", "indicator": "oil price", "probability": .4, "confidence": .5,
+    }
+    invalid = {
+        "provider": "Kalshi", "id": "football", "event_id": "football",
+        "title": "Brentford vs Tottenham Winner?", "scenario": "oil_shock",
+        "indicator": "oil price", "probability": .4, "confidence": .5,
+    }
+    accepted, rejected = sanitize_contracts([valid, invalid])
+    assert accepted == [valid]
+    assert rejected == [invalid]
 
 
 def test_duplicate_contracts_do_not_count_twice() -> None:

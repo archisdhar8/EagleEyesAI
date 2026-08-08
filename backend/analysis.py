@@ -120,18 +120,21 @@ def security_research(tickers: list[str]) -> list[dict[str, Any]]:
     rankings = load_rankings()
     indexed = rankings.set_index(rankings["ticker"].astype(str).str.upper()) if not rankings.empty else pd.DataFrame()
     stored = database.security_data(tickers) if database.DATABASE_URL else {
-        "securities": [], "fundamentals": [], "prices": [], "news": []
+        "securities": [], "fundamentals": [], "prices": [], "news": [], "company_markets": []
     }
     stored_securities = {row["ticker"]: row for row in stored["securities"]}
     stored_fundamentals: dict[str, list[dict[str, Any]]] = {}
     stored_prices: dict[str, list[dict[str, Any]]] = {}
     stored_news: dict[str, list[dict[str, Any]]] = {}
+    stored_company_markets: dict[str, list[dict[str, Any]]] = {}
     for row in stored["fundamentals"]:
         stored_fundamentals.setdefault(row["ticker"], []).append(row)
     for row in stored["prices"]:
         stored_prices.setdefault(row["ticker"], []).append(row)
     for row in stored["news"]:
         stored_news.setdefault(row["ticker"], []).append(row)
+    for row in stored.get("company_markets", []):
+        stored_company_markets.setdefault(row["ticker"], []).append(row)
     rows: list[dict[str, Any]] = []
     for ticker in dict.fromkeys(t.upper() for t in tickers):
         if not rankings.empty and ticker in indexed.index:
@@ -162,6 +165,7 @@ def security_research(tickers: list[str]) -> list[dict[str, Any]]:
         fundamentals = stored_fundamentals.get(ticker, [])
         prices = stored_prices.get(ticker, [])
         news_items = stored_news.get(ticker, [])
+        company_markets = stored_company_markets.get(ticker, [])[:5]
         price = _num(prices[-1]["close"]) if prices else None
         price_change_1y = None
         if len(prices) >= 2 and _num(prices[max(0, len(prices) - 252)]["close"]) > 0:
@@ -225,7 +229,8 @@ def security_research(tickers: list[str]) -> list[dict[str, Any]]:
             "net_margin": None if net_margin is None else round(net_margin, 4),
             "news_count": len(news_items),
             "latest_news": news_items[0] if news_items else None,
-            "data_source": "supabase" if database.DATABASE_URL and (prices or fundamentals or news_items) else "local_fallback",
+            "prediction_markets": company_markets,
+            "data_source": "supabase" if database.DATABASE_URL and (prices or fundamentals or news_items or company_markets) else "local_fallback",
         })
     return rows
 
