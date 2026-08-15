@@ -1,0 +1,10 @@
+{
+  "id": "layout-fixture-1",
+  "name": "Macro and portfolio",
+  "updated_at": "2026-08-09T12:00:00Z",
+  "widgets": [
+    { "id": "portfolio-return", "type": "portfolio_return", "size": "wide" },
+    { "id": "macro-indicators", "type": "macro_indicators", "size": "full" },
+    { "id": "market-monitor", "type": "model_monitoring", "size": "small" }
+  ]
+}

@@ -1,0 +1,192 @@
+import { expect, test, type Page } from "@playwright/test";
+import { installApiMock } from "./fixtures";
+
+async function signIn(page: Page) {
+  await page.goto("/");
+  await page.getByTestId("auth-email").fill("browser@example.com");
+  await page.getByTestId("auth-password").fill("browser-test-password");
+  await page.getByTestId("auth-submit").click();
+  await expect(page.getByRole("heading", { name: "Today", exact: true })).toBeVisible();
+  await expect(page.getByText("What currently matters to your portfolio", { exact: true })).toBeVisible();
+}
+
+async function buildBoard(page: Page, prompt = "Show my portfolio return and risks") {
+  await page.goto("/ask");
+  const composer = page.getByPlaceholder("Describe the dashboard you want…");
+  await composer.fill(prompt);
+  await page.getByRole("button", { name: "Build view →" }).click();
+  await expect(page.getByRole("heading", { name: "Portfolio return and risks" })).toBeVisible();
+  await expect(page.getByText("Required evidence verified")).toBeVisible();
+}
+
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript(() => sessionStorage.clear());
+});
+
+test("login survives refresh and sign-out clears the local test session", async ({ page }) => {
+  const state = await installApiMock(page);
+  await signIn(page);
+  await page.evaluate(() => {
+    const key = Object.keys(localStorage).find(item => item.startsWith("sb-") && item.endsWith("-auth-token"));
+    if (!key) throw new Error("Supabase session was not persisted");
+    const stored = JSON.parse(localStorage.getItem(key)!);
+    stored.expires_at = 1;
+    localStorage.setItem(key, JSON.stringify(stored));
+  });
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Today", exact: true })).toBeVisible();
+  await expect(page.getByText("What currently matters to your portfolio", { exact: true })).toBeVisible();
+  await expect.poll(() => state.authGrants).toContain("refresh_token");
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await expect(page.getByTestId("auth-form")).toBeVisible();
+});
+
+test("portfolio import flows to Research and analysis", async ({ page }) => {
+  await installApiMock(page, { portfolio: false });
+  await signIn(page);
+  await page.goto("/portfolio?view=holdings");
+  await page.getByLabel("Import portfolio CSV").setInputFiles({
+    name: "portfolio.csv", mimeType: "text/csv", buffer: Buffer.from("symbol,weight\nAAPL,50%\nSPY,50%\n"),
+  });
+  await expect(page.getByText("2 holdings validated, saved, and loaded into Research.")).toBeVisible();
+  await page.goto("/research?view=stocks");
+  await expect(page.getByText("Apple Inc.")).toBeVisible();
+  await page.goto("/portfolio?view=analysis");
+  await page.getByRole("button", { name: "Run portfolio analysis →" }).click();
+  await expect(page.getByText("Three alternatives are ready. Review the tradeoffs—not just the headline return.")).toBeVisible();
+  await expect(page.getByRole("button", { name: /Balanced 7\.0% modeled return/ })).toBeVisible();
+});
+
+test("transaction ledger previews separately and saves only after review", async ({ page }) => {
+  await installApiMock(page);
+  await signIn(page);
+  await page.goto("/portfolio?view=holdings");
+  await page.getByText("Actual-performance ledger (optional)").click();
+  await page.getByText("Import transaction CSV").locator("input").setInputFiles({
+    name: "transactions.csv", mimeType: "text/csv",
+    buffer: Buffer.from("Date,Type,Symbol,Quantity,Price,Memo\n2025-01-02,Buy,AAPL,5,100,first lot\n"),
+  });
+  await expect(page.getByText("1 valid transactions")).toBeVisible();
+  await expect(page.getByText("Ignored columns: Memo")).toBeVisible();
+  await page.getByRole("button", { name: "Save reviewed ledger" }).click();
+  await expect(page.getByRole("button", { name: "1 saved · 0 duplicates skipped" })).toBeVisible();
+  await expect(page.getByText("This remains separate from the current holdings snapshot", { exact: false })).toBeVisible();
+});
+
+test("legacy routes canonicalize without losing the requested subview", async ({ page }) => {
+  await installApiMock(page);
+  await signIn(page);
+  for (const [legacy, canonical] of [
+    ["/overview", "/today"], ["/scenarios", "/research?view=scenarios"],
+    ["/research", "/research"], ["/optimize", "/portfolio?view=analysis"],
+    ["/ai-workspace", "/ask"], ["/research-terminal", "/advanced?view=terminal"],
+  ]) {
+    await page.goto(legacy);
+    await expect(page).toHaveURL(new RegExp(canonical.replace("?", "\\?")));
+  }
+});
+
+test("manual terminal adds, resizes, moves, saves, reopens, and resets", async ({ page }) => {
+  await installApiMock(page);
+  await signIn(page);
+  await page.goto("/advanced?view=terminal");
+  await page.locator(".terminal-workspace").getByRole("button", { name: "＋ Add widget" }).click();
+  await page.getByRole("button", { name: /^Portfolio Positions Saved holdings/ }).click();
+  await expect(page.getByRole("heading", { name: "Positions" })).toBeVisible();
+  const positionCard = page.locator("article.terminal-widget").filter({ hasText: "Positions" });
+  await positionCard.getByTitle("Change widget size").click();
+  const moveBackward = page.getByRole("button", { name: "Move Positions backward" });
+  await expect(moveBackward).toBeEnabled();
+  await moveBackward.click();
+  page.once("dialog", dialog => dialog.accept("Browser terminal"));
+  await page.getByRole("button", { name: "Save layout" }).click();
+  await expect(page.getByText("Advanced layout saved.")).toBeVisible();
+  await page.locator(".layout-toolbar select").selectOption({ label: "Browser terminal" });
+  await page.getByRole("button", { name: "Reset layout" }).click();
+  await expect(page.getByRole("heading", { name: "Hypothetical current-weight return" })).toBeVisible();
+});
+
+test("provider health exposes coverage, fallbacks, and degraded state without secrets", async ({ page }) => {
+  await installApiMock(page);
+  await signIn(page);
+  await page.goto("/advanced?view=providers");
+  await expect(page.getByRole("heading", { name: "Provider health, coverage, fallbacks, and limits." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Corporate-action-adjusted prices" })).toBeVisible();
+  await expect(page.locator(".provider-summary p").filter({ hasText: "healthy" }).getByText("5", { exact: true })).toBeVisible();
+  await expect(page.getByText("Fixture stale fallback")).toBeVisible();
+  await expect(page.locator("body")).not.toContainText("API_KEY");
+});
+
+test("AI board supports progressive build, revision, add, resize, remove, save, reopen, and exact duplicate", async ({ page }) => {
+  await installApiMock(page);
+  await signIn(page);
+  await buildBoard(page);
+  await page.getByLabel("Resize Portfolio performance").selectOption("12");
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button", { name: "Remove Optional risk summary" }).click();
+  await expect(page.getByRole("heading", { name: "Optional risk summary" })).toHaveCount(0);
+  await page.getByRole("button", { name: "＋ Add data" }).click();
+  await page.getByRole("button", { name: /^Macro Macro trends Stored macro factors/ }).click();
+  await expect(page.getByRole("heading", { name: "Macro trends" })).toBeVisible();
+  await page.getByPlaceholder("Revise this view…").fill("Focus the explanation on drawdown risk");
+  await page.getByRole("button", { name: "Revise view →" }).click();
+  await expect(page.getByRole("heading", { name: "Revised portfolio board" })).toBeVisible();
+  await page.getByRole("button", { name: "Save dashboard" }).click();
+  await expect(page.getByText("Dashboard view saved.")).toBeVisible();
+  await page.getByTitle("Open saved dashboard").click();
+  await expect(page.getByText("Saved dashboard")).toBeVisible();
+  await page.locator('summary[aria-label="More actions for Revised portfolio board"]').click();
+  await page.getByRole("button", { name: "Duplicate exactly" }).click();
+  await expect(page.getByText("Dashboard duplicated with the same layout and compatible results.")).toBeVisible();
+  await expect(page.getByText("Revised portfolio board copy")).toBeVisible();
+});
+
+test("partial widget failure preserves successful evidence and narration", async ({ page }) => {
+  await installApiMock(page, { partial: true });
+  await signIn(page);
+  await buildBoard(page);
+  await expect(page.getByText("Widget unavailable")).toBeVisible();
+  await expect(page.getByText("The validated return evidence is available.")).toBeVisible();
+  await expect(page.getByRole("strong").filter({ hasText: "10.0%" })).toBeVisible();
+});
+
+test("stale fallback and no-portfolio mode remain useful", async ({ page }) => {
+  await installApiMock(page, { portfolio: false, stale: true });
+  await signIn(page);
+  await expect(page.getByText("General market mode")).toBeVisible();
+  await expect(page.getByText("Using last validated provider snapshot")).toBeVisible();
+  await page.goto("/research?view=stocks");
+  await expect(page.getByText("Browser fixture universe")).toBeVisible();
+  await expect(page.getByText("Apple Inc.")).toBeVisible();
+});
+
+test("presentation levels transform the same stored widget result", async ({ page }) => {
+  await installApiMock(page);
+  await signIn(page);
+  await buildBoard(page);
+  await expect(page.getByText("Evidence", { exact: true }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Simple" }).click();
+  await expect(page.getByText("Evidence", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("This shows how today’s holdings and weights behaved historically; it is not your actual account return.")).toBeVisible();
+  await page.getByRole("button", { name: "Expert" }).click();
+  const expertMethod = page.getByText("Method, lineage, and validation").first();
+  await expect(expertMethod).toBeVisible();
+  await expertMethod.click();
+  await expect(page.getByText("golden-v1", { exact: false }).first()).toBeVisible();
+});
+
+test("separate browser users do not share saved boards", async ({ browser }) => {
+  const first = await browser.newContext();
+  const second = await browser.newContext();
+  const firstPage = await first.newPage();
+  const secondPage = await second.newPage();
+  await installApiMock(firstPage);
+  await installApiMock(secondPage);
+  await signIn(firstPage); await buildBoard(firstPage);
+  await firstPage.getByRole("button", { name: "Save dashboard" }).click();
+  await signIn(secondPage);
+  await secondPage.goto("/ask");
+  await expect(firstPage.getByRole("heading", { name: "Portfolio return and risks", exact: true })).toBeVisible();
+  await expect(secondPage.getByRole("heading", { name: "Portfolio return and risks", exact: true })).toHaveCount(0);
+  await first.close(); await second.close();
+});

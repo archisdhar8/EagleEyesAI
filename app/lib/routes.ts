@@ -1,0 +1,71 @@
+export type Tab = "today" | "plan" | "portfolio" | "explore" | "ask" | "advanced";
+export type ExploreView = "stocks" | "etfs" | "sectors" | "themes" | "macro" | "scenarios" | "prediction-markets" | "compare" | "watchlist";
+export type PortfolioView = "holdings" | "analysis";
+export type AdvancedView = "terminal" | "diagnostics" | "validation" | "lineage" | "providers";
+
+export type RouteState = {
+  tab: Tab;
+  exploreView?: ExploreView;
+  portfolioView?: PortfolioView;
+  advancedView?: AdvancedView;
+  canonicalPath: string;
+};
+
+export const NAV_ITEMS: ReadonlyArray<readonly [Tab, string, string]> = [
+  ["today", "⌂", "Today"],
+  ["plan", "◌", "Plan"],
+  ["portfolio", "◫", "Portfolio"],
+  ["explore", "◎", "Research"],
+  ["ask", "✦", "Ask EagleEyes"],
+  ["advanced", "▦", "Advanced"],
+];
+
+const ROUTES: Record<string, Omit<RouteState, "canonicalPath"> & { canonicalPath?: string }> = {
+  "/": { tab: "today", canonicalPath: "/today" },
+  "/today": { tab: "today" },
+  "/home": { tab: "today", canonicalPath: "/today" },
+  "/overview": { tab: "today", canonicalPath: "/today" },
+  "/plan": { tab: "plan" },
+  "/portfolio": { tab: "portfolio" },
+  "/optimize": { tab: "portfolio", portfolioView: "analysis", canonicalPath: "/portfolio?view=analysis" },
+  "/explore": { tab: "explore", canonicalPath: "/research" },
+  "/research": { tab: "explore", exploreView: "stocks" },
+  "/scenarios": { tab: "explore", exploreView: "scenarios", canonicalPath: "/research?view=scenarios" },
+  "/ask": { tab: "ask" },
+  "/ai-workspace": { tab: "ask", canonicalPath: "/ask" },
+  "/advanced": { tab: "advanced" },
+  "/research-terminal": { tab: "advanced", advancedView: "terminal", canonicalPath: "/advanced?view=terminal" },
+};
+
+function oneOf<T extends string>(value: string | null, allowed: readonly T[]): T | undefined {
+  return value && allowed.includes(value as T) ? value as T : undefined;
+}
+
+export function resolveAppRoute(pathname: string, search = ""): RouteState | null {
+  const definition = ROUTES[pathname];
+  if (!definition) return null;
+  const requestedView = new URLSearchParams(search).get("view");
+  const normalizedExploreView = requestedView === "securities" ? "stocks" : requestedView === "comparisons" ? "compare" : requestedView;
+  const exploreView = definition.tab === "explore"
+    ? oneOf(normalizedExploreView, ["stocks", "etfs", "sectors", "themes", "macro", "scenarios", "prediction-markets", "compare", "watchlist"] as const) || definition.exploreView || "stocks"
+    : undefined;
+  const portfolioView = definition.tab === "portfolio"
+    ? oneOf(requestedView, ["holdings", "analysis"] as const) || definition.portfolioView
+    : undefined;
+  const advancedView = definition.tab === "advanced"
+    ? oneOf(requestedView, ["terminal", "diagnostics", "validation", "lineage", "providers"] as const) || definition.advancedView
+    : undefined;
+  return {
+    tab: definition.tab,
+    exploreView,
+    portfolioView,
+    advancedView,
+    canonicalPath: definition.canonicalPath || `${pathname}${search}`,
+  };
+}
+
+export function pathForTab(tab: Tab): string {
+  if (tab === "today") return "/today";
+  if (tab === "explore") return "/research";
+  return `/${tab}`;
+}

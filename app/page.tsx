@@ -1,5 +1,5 @@
-import Dashboard from "./Dashboard";
+import InvestmentApp from "./InvestmentApp";
 
 export default function Home() {
-  return <Dashboard />;
+  return <InvestmentApp />;
 }

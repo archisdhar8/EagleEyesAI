@@ -8,6 +8,7 @@ import math
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -34,6 +35,7 @@ TIINGO_PRICES_URL = "https://api.tiingo.com/tiingo/daily/{ticker}/prices"
 FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+POLYGON_TICKERS_URL = "https://api.polygon.io/v3/reference/tickers"
 
 ETF_TICKERS = {
     "SPY", "QQQ", "VTI", "IWM", "DIA", "BND", "AGG", "TLT", "SHY", "IEF",
@@ -455,6 +457,60 @@ def active_tickers() -> list[str]:
     return sorted({str(row["ticker"]).upper() for row in rows} | {"SPY", "QQQ", "VTI", "BND"})
 
 
+def refresh_security_catalog() -> int:
+    """Populate the supported active U.S. common-stock catalog.
+
+    Catalog presence establishes discoverability and identity only; it does not
+    claim complete prices, fundamentals, news, or valuation evidence.
+    """
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        raise RuntimeError("POLYGON_API_KEY is required")
+    rows: list[tuple[Any, ...]] = []
+    session = requests.Session()
+    for security_type, coverage_tier in (("CS", "core_us"), ("ADRC", "conditional_adr")):
+        next_url: str | None = POLYGON_TICKERS_URL
+        params: dict[str, Any] | None = {
+            "market": "stocks", "locale": "us", "active": "true",
+            "type": security_type, "limit": 1000, "sort": "ticker", "apiKey": api_key,
+        }
+        while next_url:
+            response = session.get(next_url, params=params, timeout=30)
+            raise_provider_error(response)
+            payload = response.json()
+            observed = datetime.now(timezone.utc).isoformat()
+            for item in payload.get("results") or []:
+                ticker = str(item.get("ticker") or "").strip().upper()
+                name = str(item.get("name") or ticker).strip()
+                if ticker:
+                    rows.append((
+                        ticker, name, item.get("primary_exchange"),
+                        "common_stock" if security_type == "CS" else "adr",
+                        str(item.get("currency_name") or "USD").upper(),
+                        bool(item.get("active", True)), coverage_tier,
+                        json.dumps({"polygon_type": security_type, "composite_figi": item.get("composite_figi")}),
+                        item.get("last_updated_utc") or observed,
+                    ))
+            next_url = payload.get("next_url")
+            params = {"apiKey": api_key} if next_url else None
+    with database.postgres_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.executemany(
+                """INSERT INTO public.security_master(
+                ticker,name,exchange,instrument_type,currency,active,coverage_tier,
+                provider_mappings,verified_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                ON CONFLICT (ticker) DO UPDATE SET name=excluded.name,
+                exchange=excluded.exchange,instrument_type=excluded.instrument_type,
+                currency=excluded.currency,active=excluded.active,
+                coverage_tier=excluded.coverage_tier,
+                provider_mappings=public.security_master.provider_mappings || excluded.provider_mappings,
+                verified_at=excluded.verified_at,updated_at=now()""",
+                rows,
+            )
+    return len(rows)
+
+
 def refresh_polygon(tickers: Iterable[str] | None = None) -> int:
     api_key = os.getenv("POLYGON_API_KEY")
     if not api_key:
@@ -845,7 +901,10 @@ def refresh_fred() -> int:
     api_key = os.getenv("FRED_API_KEY")
     if not api_key:
         raise RuntimeError("FRED_API_KEY is required")
-    today = datetime.now(timezone.utc).date()
+    # FRED validates real-time dates against its U.S. Central business date.
+    # Using UTC after 18:00 Pacific can be one day ahead of FRED and causes a
+    # truthful but avoidable HTTP 400 at the nightly refresh boundary.
+    today = datetime.now(ZoneInfo("America/Chicago")).date()
     with database.postgres_connection() as conn:
         latest_rows = conn.execute(
             """SELECT series_id, max(observation_date) AS latest
@@ -1178,6 +1237,7 @@ REFRESH_PROVIDERS: dict[str, Callable[[], int]] = {
     "sec": refresh_sec,
     "markets": refresh_markets,
     "regimes": refresh_regime_labels,
+    "security_catalog": refresh_security_catalog,
 }
 HISTORY_PROVIDERS: dict[str, Callable[[], int]] = {
     "polygon": extend_polygon_history,

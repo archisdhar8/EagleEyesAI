@@ -2,9 +2,13 @@
 
 ## InvestmentDashboard
 
-A single-user portfolio research sandbox with a local FastAPI analysis service and Supabase-backed durable storage. Prediction-market probabilities set macro scenario weights; existing company research and an explainable statistical model test portfolio alternatives against those scenarios.
+An authenticated, market-first investment research workspace with a local FastAPI analysis service and Supabase-backed durable storage. EagleEyes combines searchable stock research, macroeconomic market-state identification, historical regime comparisons, Kalshi and Polymarket evidence, portfolio analysis, goal and policy context, AI-generated research boards, and a configurable advanced terminal.
+
+The default experience uses plain-language evidence buckets, portfolio relevance, confidence, freshness, and explicit limitations. Historical macro data, prediction markets, company fundamentals, valuation, price behavior, and portfolio risk remain separate evidence layers rather than being collapsed into one unexplained score.
 
 The app does not connect to a broker, submit trades, or claim to produce a best portfolio.
+
+For a detailed description of every user-facing page, widget, calculation layer, workflow, and limitation, read the [complete user guide](docs/USER_GUIDE.md).
 
 This repository is standalone: its Python environment, private backend configuration, local SQLite fallback, and optional provider caches all live inside `InvestmentDashboard`. It does not require the older parent `investment-thesis` project.
 
@@ -110,6 +114,24 @@ GitHub Actions schedules prediction markets hourly, prices/macro/news on weekday
 Daily and monthly data jobs also run `python -m backend.monitoring run`. Each run persists prediction-market calibration, covariance conditioning, regime counts, benchmark performance, turnover, allocation stability, freshness, and coverage. New model versions enter evaluation first; a database promotion gate requires an immutable promotion decision before production status is allowed.
 
 Legacy FRED cache rows are explicitly marked as not point-in-time because they contain latest-known observations. Scheduled FRED rows preserve their retrieval vintage so model validation can distinguish them.
+
+## Verification
+
+Run the complete local regression matrix with:
+
+```bash
+npm run test:all
+```
+
+This builds the frontend, runs the TypeScript and backend suites, then exercises authenticated browser journeys with Playwright. Browser tests use deterministic provider fixtures and intercepted Supabase test responses; production authentication is not bypassed. See [`docs/PHASE_8_TEST_STRATEGY.md`](docs/PHASE_8_TEST_STRATEGY.md) for coverage, golden quantitative contracts, and the phase-by-phase verification record.
+
+Real integrations use a separate opt-in suite so normal CI never depends on credentials or provider uptime. See [`docs/LIVE_PROVIDER_SMOKE_TESTS.md`](docs/LIVE_PROVIDER_SMOKE_TESTS.md). Advanced → Provider health displays configuration state, last validated ingestion, stored coverage, fallbacks, errors, and reported rate-limit metadata without exposing secret values.
+
+## Historical coverage contract
+
+Research security responses now include a versioned adjusted-price coverage record with provider, first and last date, observations, estimated missing sessions, corporate-action adjustment method, full-cycle eligibility, direct factor-model eligibility, sector/broad-ETF fallback, warnings, and lineage. A seven-year span is the disclosed full-cycle minimum. Shorter histories remain researchable, but factor and regime conclusions are visibly weakened and return adjustments are shrunk toward transparent priors.
+
+Use `GET /api/research/coverage?tickers=AAPL,SPY` to audit symbols before relying on backtests. Provider capability and ingestion health are available at `GET /api/providers/health`.
 
 ## Optional explanations
 

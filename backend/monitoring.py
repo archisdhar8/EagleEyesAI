@@ -148,7 +148,16 @@ def build_monitoring_result(
 def run_monitoring() -> dict[str, Any]:
     portfolios = database.list_portfolios()
     if not portfolios:
-        raise RuntimeError("A saved portfolio is required for model monitoring")
+        return {
+            "id": None,
+            "analysis_run_id": None,
+            "status": "skipped",
+            "metrics": {},
+            "alerts": [],
+            "freshness": {},
+            "coverage": {},
+            "reason": "No system-owned portfolio is configured; user-owned portfolios require an authenticated analysis context.",
+        }
     profile = InvestorProfile.model_validate(database.load_profile() or {})
     portfolio = portfolios[0]
     analysis = run_analysis(portfolio["holdings"], profile)
@@ -175,7 +184,8 @@ def main() -> int:
         print(database.latest_monitoring_run() or "No monitoring runs")
         return 0
     result = run_monitoring()
-    print(f"monitoring={result['status']} alerts={len(result['alerts'])} id={result['id']}")
+    detail = f" reason={result['reason']}" if result.get("reason") else ""
+    print(f"monitoring={result['status']} alerts={len(result['alerts'])} id={result['id']}{detail}")
     return 0
 
 

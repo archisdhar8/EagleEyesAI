@@ -9,6 +9,9 @@ __pycache__/
 .pytest_cache/
 *.pyc
 *.tsbuildinfo
+test-results/
+playwright-report/
+.playwright/
 .env
 .env.*
 !.env.example

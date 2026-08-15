@@ -29,8 +29,7 @@ test("server-renders InvestmentDashboard", async () => {
 
   const html = await response.text();
   assert.match(html, /<title>InvestmentDashboard/);
-  assert.match(html, /Decision lens, not autopilot/);
-  assert.match(html, /Trading is disabled/);
-  assert.match(html, /Prediction markets set the scenario weights/);
+  assert.match(html, /Opening your research workspace/);
+  assert.match(html, /InvestmentDashboard — Portfolio Research Sandbox/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/);
 });

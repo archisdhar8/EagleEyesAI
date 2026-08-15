@@ -1,0 +1,52 @@
+{
+  "id": "view-fixture-1",
+  "name": "Inflation sensitivity",
+  "original_prompt": "Which holdings are most sensitive to inflation?",
+  "specification": {
+    "title": "Inflation sensitivity",
+    "description": "Stored macro and portfolio evidence",
+    "compiler_version": "dashboard-spec-compiler-v1",
+    "widgets": [
+      {
+        "id": "macro-trends",
+        "task_id": "macro-trends-task",
+        "widget_type": "macro_trends",
+        "title": "Inflation trend",
+        "visualization": "line",
+        "grid": { "x": 0, "y": 0, "w": 6, "h": 4 }
+      },
+      {
+        "id": "inflation-sensitivity",
+        "task_id": "inflation-sensitivity-task",
+        "widget_type": "holdings_sensitivity",
+        "title": "Holdings inflation sensitivity",
+        "visualization": "table",
+        "grid": { "x": 6, "y": 0, "w": 6, "h": 4 }
+      }
+    ]
+  },
+  "layout": [
+    {
+      "id": "inflation-sensitivity",
+      "task_id": "inflation-sensitivity-task",
+      "widget_type": "holdings_sensitivity",
+      "title": "Holdings inflation sensitivity",
+      "visualization": "table",
+      "grid": { "x": 0, "y": 0, "w": 12, "h": 4 }
+    },
+    {
+      "id": "macro-trends",
+      "task_id": "macro-trends-task",
+      "widget_type": "macro_trends",
+      "title": "Inflation trend",
+      "visualization": "line",
+      "grid": { "x": 0, "y": 4, "w": 12, "h": 4 }
+    }
+  ],
+  "latest_run": {
+    "widget_results": [
+      { "widget_id": "macro-trends", "status": "READY", "result_ref": "result-macro-1" },
+      { "widget_id": "inflation-sensitivity", "status": "READY", "result_ref": "result-sensitivity-1" }
+    ]
+  }
+}

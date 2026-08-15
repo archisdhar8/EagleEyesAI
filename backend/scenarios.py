@@ -13,6 +13,7 @@ from . import database
 
 KALSHI_URL = "https://external-api.kalshi.com/trade-api/v2/markets"
 POLYMARKET_URL = "https://gamma-api.polymarket.com/markets"
+POLYMARKET_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 CACHE_SECONDS = 3600
 
 PRIORS = {
@@ -28,6 +29,13 @@ LABELS = {
     "recession_cuts": "Recession / cutting cycle",
     "growth_reacceleration": "Growth reacceleration",
     "oil_shock": "Oil shock",
+}
+DIMENSIONS = {
+    "soft_landing": ("Economic conditions", "Soft landing / slowdown"),
+    "growth_reacceleration": ("Economic conditions", "Growth reacceleration"),
+    "recession_cuts": ("Economic conditions", "Recession / slowdown"),
+    "sticky_inflation": ("Inflation conditions", "Sticky / accelerating inflation"),
+    "oil_shock": ("Independent market shocks", "Oil-price shock"),
 }
 
 SPORTS_CONTEXT_PATTERN = re.compile(
@@ -215,6 +223,35 @@ def normalize_polymarket(markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return contracts
 
 
+def discover_polymarket_contracts(max_events: int = 400) -> list[dict[str, Any]]:
+    """Discover macro contracts through event pagination.
+
+    The first /markets page is popularity ordered and can contain no macro
+    questions. Polymarket documents event pagination as its complete discovery
+    path; events embed their associated markets.
+    """
+    contracts: list[dict[str, Any]] = []
+    page_size = 100
+    for offset in range(0, max_events, page_size):
+        response = requests.get(
+            POLYMARKET_EVENTS_URL,
+            params={
+                "active": "true", "closed": "false", "order": "volume",
+                "ascending": "false", "limit": page_size, "offset": offset,
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        events = response.json()
+        if not isinstance(events, list):
+            raise ValueError("Polymarket returned an unexpected events payload")
+        markets = [market for event in events for market in (event.get("markets") or [])]
+        contracts.extend(normalize_polymarket(markets))
+        if len(events) < page_size:
+            break
+    return _deduplicate(contracts)
+
+
 def _deduplicate(contracts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     best: dict[tuple[str, str, str], dict[str, Any]] = {}
     for contract in contracts:
@@ -241,41 +278,104 @@ def sanitize_contracts(contracts: list[dict[str, Any]]) -> tuple[list[dict[str, 
     return accepted, rejected
 
 
-def build_scenarios(contracts: list[dict[str, Any]], history: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+def _macro_priors(macro_signal: dict[str, Any] | None) -> tuple[dict[str, float], float, str | None]:
+    """Blend the stable disclosed baseline with the latest point-in-time macro trend model."""
+    if not macro_signal:
+        return dict(PRIORS), 0.0, None
+    supplied = macro_signal.get("probabilities") or {}
+    probabilities = {key: max(0.0, _number(supplied.get(key))) for key in PRIORS}
+    total = sum(probabilities.values())
+    if total <= 0:
+        return dict(PRIORS), 0.0, None
+    probabilities = {key: value / total for key, value in probabilities.items()}
+    quality = max(0.0, min(1.0, _number(macro_signal.get("data_quality"), 0.0)))
+    trend_weight = 0.75 * quality
+    blended = {
+        key: PRIORS[key] * (1 - trend_weight) + probabilities[key] * trend_weight
+        for key in PRIORS
+    }
+    confidence = max(0.20, min(0.75, _number(macro_signal.get("confidence"), 0.0) * quality))
+    return blended, confidence, str(macro_signal.get("as_of_date") or "") or None
+
+
+def build_scenarios(
+    contracts: list[dict[str, Any]],
+    history: list[dict[str, Any]] | None = None,
+    macro_signal: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     contracts = _deduplicate(contracts)
+    macro_priors, macro_confidence, macro_as_of = _macro_priors(macro_signal)
     raw: dict[str, float] = {}
     confidence: dict[str, float] = {}
     now = datetime.now(timezone.utc)
-    for key, prior in PRIORS.items():
+    for key, prior in macro_priors.items():
         subset = [row for row in contracts if row["scenario"] == key]
         if not subset:
             raw[key] = prior
-            confidence[key] = 0.20
+            confidence[key] = max(0.20, macro_confidence)
             continue
         total_weight = sum(max(row["confidence"], 0.05) for row in subset)
         observed = sum(row["probability"] * max(row["confidence"], 0.05) for row in subset) / total_weight
         mean_confidence = min(1.0, total_weight / max(2.0, len(subset)))
         raw[key] = prior * (1 - mean_confidence) + observed * mean_confidence
-        confidence[key] = max(0.20, mean_confidence)
-    total = sum(raw.values()) or 1.0
-    probabilities = {key: value / total for key, value in raw.items()}
+        confidence[key] = max(0.20, min(1.0, macro_confidence * (1 - mean_confidence) + mean_confidence))
+    # These estimates describe overlapping conditions, not five mutually exclusive
+    # outcomes. Do not force them to sum to 100%. The optimizer normalizes the
+    # applicable regime weights internally when it needs a convex mixture.
+    probabilities = {key: max(0.01, min(0.99, value)) for key, value in raw.items()}
     scenarios = []
     for key in PRIORS:
         subset = [row for row in contracts if row["scenario"] == key]
         scenarios.append({
             "key": key,
             "label": LABELS[key],
+            "dimension": DIMENSIONS[key][0],
+            "state": DIMENSIONS[key][1],
             "probability": round(probabilities[key], 4),
             "confidence": round(confidence[key], 4),
             "change_1d": _historical_change(key, probabilities[key], history or [], timedelta(days=1)),
             "change_1w": _historical_change(key, probabilities[key], history or [], timedelta(days=7)),
             "change_1m": _historical_change(key, probabilities[key], history or [], timedelta(days=30)),
-            "indicators": sorted({row["indicator"] for row in subset}),
-            "sources": sorted({row["source"] for row in subset})[:5],
+            "indicators": (["FRED macro trends"] if macro_as_of else []) + sorted({row["indicator"] for row in subset}),
+            "sources": ((["https://fred.stlouisfed.org/"] if macro_as_of else []) + sorted({row["source"] for row in subset}))[:6],
             "as_of": now.isoformat(),
-            "is_prior": not subset,
+            "is_prior": not subset and macro_as_of is None,
+            "evidence_basis": "blended" if subset and macro_as_of else "prediction_market" if subset else "macro_trend_model" if macro_as_of else "disclosed_prior",
+            "macro_as_of": macro_as_of,
+            "probability_model": "independent_conditions_v1",
         })
     return scenarios
+
+
+def build_condition_dimensions(scenarios: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compile legacy-compatible signals into explicit, composable condition dimensions."""
+    by_key={row["key"]:row for row in scenarios}
+    now=datetime.now(timezone.utc).isoformat()
+    def dimension(name: str, values: list[tuple[str,str,float,list[str]]]) -> list[dict[str,Any]]:
+        total=sum(max(value,0.001) for _,_,value,_ in values)
+        return [{
+            "key":key,"label":label,"dimension":name,"state":label,
+            "probability":round(max(value,0.001)/total,4),
+            "confidence":round(max((by_key.get(source) or {}).get("confidence",.2) for source in sources),4),
+            "change_1d":None,"change_1w":None,"change_1m":None,
+            "indicators":sorted({item for source in sources for item in (by_key.get(source) or {}).get("indicators",[])}),
+            "sources":sorted({item for source in sources for item in (by_key.get(source) or {}).get("sources",[])}),
+            "as_of":now,"is_prior":all((by_key.get(source) or {}).get("is_prior",True) for source in sources),
+            "evidence_basis":"dimension_compiler","probability_model":"composable_conditions_v2",
+            "source_signals":sources,
+        } for key,label,value,sources in values]
+    recession=float((by_key.get("recession_cuts") or {}).get("probability",.18))
+    growth=float((by_key.get("growth_reacceleration") or {}).get("probability",.16))
+    slowdown=float((by_key.get("soft_landing") or {}).get("probability",.38))
+    inflation=float((by_key.get("sticky_inflation") or {}).get("probability",.20))
+    easing=min(.85,.15+.65*recession); tightening=min(.85,.10+.70*inflation); stable=max(.05,1-easing-tightening)
+    output=[]
+    output.extend(dimension("Economic state",[("economic_expansion","Expansion",growth,["growth_reacceleration"]),("economic_slowdown","Slowdown",slowdown,["soft_landing"]),("economic_recession","Recession",recession,["recession_cuts"])]))
+    output.extend(dimension("Inflation state",[("inflation_cooling","Cooling",(1-inflation)*.45,["sticky_inflation"]),("inflation_stable","Stable",(1-inflation)*.55,["sticky_inflation"]),("inflation_accelerating","Accelerating",inflation,["sticky_inflation"])]))
+    output.extend(dimension("Rate state",[("rates_easing","Easing",easing,["recession_cuts"]),("rates_stable","Stable",stable,["soft_landing"]),("rates_tightening","Tightening",tightening,["sticky_inflation"])]))
+    oil=by_key.get("oil_shock") or {}
+    output.append({**oil,"key":"shock_oil","label":"Oil-price shock","dimension":"Independent shocks","state":"Oil-price shock","probability_model":"independent_shock_v2","source_signals":["oil_shock"]})
+    return output
 
 
 def _historical_change(key: str, current: float, history: list[dict[str, Any]], delta: timedelta) -> float | None:
@@ -298,6 +398,8 @@ def _historical_change(key: str, current: float, history: list[dict[str, Any]], 
 
 
 def refresh(force: bool = False) -> dict[str, Any]:
+    regime_rows = database.regime_history(limit=1)
+    macro_signal = regime_rows[0] if regime_rows else None
     latest = database.latest_scenario_snapshot()
     latest_contracts: list[dict[str, Any]] = []
     rejected_cached: list[dict[str, Any]] = []
@@ -305,8 +407,12 @@ def refresh(force: bool = False) -> dict[str, Any]:
         latest_contracts, rejected_cached = sanitize_contracts(latest.get("contracts", []))
     if latest and not force:
         fetched = datetime.fromisoformat(latest["fetched_at"].replace("Z", "+00:00"))
-        if not rejected_cached and (datetime.now(timezone.utc) - fetched).total_seconds() < CACHE_SECONDS:
-            return {**latest, "cached": True}
+        current_model = all(
+            row.get("probability_model") == "independent_conditions_v1"
+            for row in latest.get("scenarios", [])
+        )
+        if current_model and not rejected_cached and (datetime.now(timezone.utc) - fetched).total_seconds() < CACHE_SECONDS:
+            return {**latest, "condition_dimensions":build_condition_dimensions(latest.get("scenarios",[])),"condition_model":"composable_conditions_v2","cached": True}
     warnings: list[str] = []
     contracts: list[dict[str, Any]] = []
     try:
@@ -316,9 +422,7 @@ def refresh(force: bool = False) -> dict[str, Any]:
     except (requests.RequestException, ValueError) as exc:
         warnings.append(f"Kalshi refresh unavailable: {type(exc).__name__}")
     try:
-        response = requests.get(POLYMARKET_URL, params={"active": "true", "closed": "false", "limit": 500}, timeout=15)
-        response.raise_for_status()
-        contracts.extend(normalize_polymarket(response.json()))
+        contracts.extend(discover_polymarket_contracts())
     except (requests.RequestException, ValueError) as exc:
         warnings.append(f"Polymarket refresh unavailable: {type(exc).__name__}")
 
@@ -327,7 +431,7 @@ def refresh(force: bool = False) -> dict[str, Any]:
             f"Rejected {len(rejected_cached)} cached contract(s) that failed the current macro-market classifier."
         )
     if not contracts and latest:
-        fallback_scenarios = build_scenarios(latest_contracts)
+        fallback_scenarios = build_scenarios(latest_contracts, macro_signal=macro_signal)
         fallback_warnings = list(latest.get("warnings", [])) + warnings
         if latest_contracts:
             fallback_warnings.append("Using only revalidated contracts from the latest snapshot.")
@@ -337,14 +441,16 @@ def refresh(force: bool = False) -> dict[str, Any]:
         database.save_scenario_snapshot(fallback_scenarios, latest_contracts, fallback_warnings)
         return {
             "scenarios": fallback_scenarios,
+            "condition_dimensions":build_condition_dimensions(fallback_scenarios),
+            "condition_model":"composable_conditions_v2",
             "contracts": latest_contracts,
             "warnings": fallback_warnings,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "cached": True,
         }
     history = database.scenario_history()
-    scenarios = build_scenarios(contracts, history)
+    scenarios = build_scenarios(contracts, history, macro_signal)
     if not contracts:
         warnings.append("No matching macro contracts found; scenario probabilities use disclosed priors.")
     database.save_scenario_snapshot(scenarios, contracts, warnings)
-    return {"scenarios": scenarios, "contracts": contracts, "warnings": warnings, "fetched_at": datetime.now(timezone.utc).isoformat(), "cached": False}
+    return {"scenarios": scenarios,"condition_dimensions":build_condition_dimensions(scenarios),"condition_model":"composable_conditions_v2", "contracts": contracts, "warnings": warnings, "fetched_at": datetime.now(timezone.utc).isoformat(), "cached": False}

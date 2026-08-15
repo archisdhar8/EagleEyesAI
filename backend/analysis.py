@@ -33,6 +33,7 @@ ETF_META = {
     "SPY": ("S&P 500 ETF", "Broad Market", "Large Blend"),
     "VTI": ("Total U.S. Market ETF", "Broad Market", "Total Market"),
     "QQQ": ("Nasdaq-100 ETF", "Broad Market", "Growth"),
+    "ARKK": ("ARK Innovation ETF", "Broad Market", "Active Growth ETF"),
     "IWM": ("Russell 2000 ETF", "Broad Market", "Small Cap"),
     "XLK": ("Technology Select Sector ETF", "Information Technology", "Sector ETF"),
     "XLV": ("Health Care Select Sector ETF", "Health Care", "Sector ETF"),
@@ -44,6 +45,98 @@ ETF_META = {
     "CASH": ("Cash reserve", "Cash", "Cash"),
 }
 
+
+def _valuation_evidence(
+    *,
+    imported_score: float | None,
+    price: float | None,
+    metrics: dict[str, Any],
+    fiscal_period: str | None,
+) -> dict[str, Any]:
+    """Build an auditable valuation signal from available point-in-time inputs.
+
+    The score is only a relative research input. It is deliberately not a DCF,
+    fair-value estimate, or price target.
+    """
+    if imported_score is not None:
+        return {
+            "status": "available",
+            "score": round(imported_score, 1),
+            "source": "imported research ranking",
+            "method": "legacy-valuation-ranking-v1",
+            "raw_metrics": {},
+            "components": [{"metric": "Imported valuation evidence", "value": round(imported_score, 1), "score_effect": 0}],
+            "formula": "The upstream ranking's valuation component is preserved without recomputation.",
+            "limitations": ["The current local dataset does not contain the upstream model's raw multiple inputs."],
+        }
+
+    current_price = price if price and price > 0 else None
+    shares = _num(metrics.get("shares_diluted")) or None
+    revenue = _num(metrics.get("revenue")) or None
+    eps = _num(metrics.get("eps_diluted")) or None
+    free_cash_flow = _num(metrics.get("free_cash_flow")) or None
+    annualizer = 1 if str(fiscal_period or "").upper() == "FY" else 4
+    market_cap = current_price * shares if current_price and shares else None
+    pe = current_price / (eps * annualizer) if current_price and eps and eps > 0 else None
+    price_to_sales = market_cap / (revenue * annualizer) if market_cap and revenue and revenue > 0 else None
+    fcf_yield = (free_cash_flow * annualizer) / market_cap if market_cap and free_cash_flow is not None else None
+
+    score, components = 50.0, []
+    if pe is not None:
+        effect = 15 if pe <= 15 else 7 if pe <= 25 else -3 if pe <= 40 else -12
+        score += effect
+        components.append({"metric": "Price / earnings", "value": round(pe, 2), "score_effect": effect})
+    elif eps is not None and eps <= 0:
+        score -= 15
+        components.append({"metric": "Price / earnings", "value": None, "score_effect": -15, "reason": "Earnings were not positive."})
+    if price_to_sales is not None:
+        effect = 10 if price_to_sales <= 3 else 0 if price_to_sales <= 8 else -10
+        score += effect
+        components.append({"metric": "Price / sales", "value": round(price_to_sales, 2), "score_effect": effect})
+    if fcf_yield is not None:
+        effect = 12 if fcf_yield >= .05 else 5 if fcf_yield >= .02 else -12 if fcf_yield < 0 else -3
+        score += effect
+        components.append({"metric": "Free-cash-flow yield", "value": round(fcf_yield, 4), "score_effect": effect})
+
+    missing = []
+    if current_price is None:
+        missing.append("current adjusted closing price")
+    if shares is None:
+        missing.append("diluted share count")
+    if revenue is None:
+        missing.append("revenue")
+    if eps is None:
+        missing.append("diluted EPS")
+    if free_cash_flow is None:
+        missing.append("free cash flow")
+    available = len(components) >= 2
+    return {
+        "status": "available" if available else "insufficient",
+        "score": round(_clip(score), 1) if available else None,
+        "source": "adjusted prices plus SEC Company Facts" if components else "no usable valuation inputs",
+        "method": "transparent-multiples-v1",
+        "raw_metrics": {
+            "price": None if current_price is None else round(current_price, 2),
+            "market_cap_proxy": None if market_cap is None else round(market_cap, 2),
+            "pe": None if pe is None else round(pe, 2),
+            "price_to_sales": None if price_to_sales is None else round(price_to_sales, 2),
+            "free_cash_flow_yield": None if fcf_yield is None else round(fcf_yield, 4),
+            "annualization_factor": annualizer,
+        },
+        "components": components,
+        "formula": "Start at 50; add threshold adjustments for P/E, price-to-sales, and free-cash-flow yield; clamp to 0–100.",
+        "thresholds": {
+            "pe": "≤15: +15; ≤25: +7; ≤40: −3; >40: −12; non-positive earnings: −15",
+            "price_to_sales": "≤3: +10; ≤8: 0; >8: −10",
+            "free_cash_flow_yield": "≥5%: +12; ≥2%: +5; 0–2%: −3; negative: −12",
+        },
+        "missing_inputs": missing,
+        "limitations": [
+            "Quarterly figures are annualized mechanically when the latest period is not FY.",
+            "This does not estimate intrinsic value, forecast growth, or produce a price target.",
+        ],
+    }
+
 def _num(value: Any, default: float = 0.0) -> float:
     try:
         result = float(value)
@@ -54,6 +147,58 @@ def _num(value: Any, default: float = 0.0) -> float:
 
 def _clip(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, value))
+
+
+def _security_market_statistics(prices: list[dict[str, Any]]) -> dict[str, Any]:
+    """Calculate familiar, auditable market statistics from adjusted closes."""
+    if not prices:
+        return {"status": "unavailable", "reason": "No adjusted daily price history is stored."}
+    frame = pd.DataFrame(prices).copy()
+    frame["date"] = pd.to_datetime(frame["date"], utc=True)
+    frame = frame.sort_values("date").drop_duplicates("date", keep="last")
+    close = pd.to_numeric(frame["close"], errors="coerce").dropna()
+    if close.empty:
+        return {"status": "unavailable", "reason": "Stored daily rows contain no usable adjusted closes."}
+    returns = close.pct_change(fill_method=None).dropna()
+
+    def period_return(sessions: int) -> float | None:
+        if len(close) <= sessions or float(close.iloc[-1 - sessions]) <= 0:
+            return None
+        return float(close.iloc[-1] / close.iloc[-1 - sessions] - 1)
+
+    delta = close.diff()
+    gains = delta.clip(lower=0).tail(14).mean()
+    losses = -delta.clip(upper=0).tail(14).mean()
+    rsi = None
+    if len(delta.dropna()) >= 14:
+        rsi = 100.0 if losses <= 1e-12 else 100 - 100 / (1 + gains / losses)
+    wealth = (1 + returns).cumprod() if not returns.empty else pd.Series(dtype=float)
+    years = len(returns) / 252
+    annualized_return = float(wealth.iloc[-1] ** (1 / years) - 1) if years > 0 and not wealth.empty and wealth.iloc[-1] > 0 else None
+    volatility = float(returns.std(ddof=1) * np.sqrt(252)) if len(returns) > 1 else None
+    max_drawdown = float((wealth / wealth.cummax() - 1).min()) if not wealth.empty else None
+    sharpe = annualized_return / volatility if annualized_return is not None and volatility and volatility > 1e-12 else None
+    sma_50 = float(close.tail(50).mean()) if len(close) >= 50 else None
+    sma_200 = float(close.tail(200).mean()) if len(close) >= 200 else None
+    trailing = close.tail(252)
+    volume = pd.to_numeric(frame.get("volume"), errors="coerce") if "volume" in frame else pd.Series(dtype=float)
+    return {
+        "status": "available", "method": "adjusted-price-statistics-v1",
+        "observations": int(len(close)), "start_date": frame.iloc[0]["date"].date().isoformat(),
+        "end_date": frame.iloc[-1]["date"].date().isoformat(), "last_price": round(float(close.iloc[-1]), 4),
+        "return_1d": period_return(1), "return_1m": period_return(21), "return_3m": period_return(63),
+        "return_1y": period_return(252), "annualized_return": annualized_return,
+        "annualized_volatility": volatility, "sharpe_ratio": sharpe, "max_drawdown": max_drawdown,
+        "rsi_14": None if rsi is None else float(rsi), "sma_50": sma_50, "sma_200": sma_200,
+        "high_52w": float(trailing.max()), "low_52w": float(trailing.min()),
+        "latest_volume": None if volume.empty or pd.isna(volume.iloc[-1]) else float(volume.iloc[-1]),
+        "average_volume_20d": None if volume.dropna().empty else float(volume.tail(20).mean()),
+        "assumptions": [
+            "Prices use the provider's corporate-action-adjusted daily close where available.",
+            "Sharpe ratio uses a 0% risk-free-rate assumption and the available stored history.",
+            "RSI uses the latest 14 daily close-to-close changes.",
+        ],
+    }
 
 
 def load_rankings() -> pd.DataFrame:
@@ -116,6 +261,53 @@ def latest_macro() -> dict[str, Any]:
     return {"regime": str(row.get("macro_regime", "neutral")), "score": round(_num(row.get("macro_score"), 50), 1), "as_of": str(row.get("date"))}
 
 
+def macro_factor_dashboard() -> dict[str, Any]:
+    """Return the five primary macro transmission channels with dated evidence.
+
+    Change is an observed-data trend, not a consensus surprise. The distinction is
+    explicit because FRED does not provide release-consensus expectations.
+    """
+    definitions = {
+        "rates": {"label": "Interest rates", "series": ["FEDFUNDS", "DGS10", "T10Y2Y"], "why": "Discount rates, borrowing costs, and valuation multiples."},
+        "inflation": {"label": "Inflation", "series": ["CPIAUCSL", "PCEPI"], "why": "Policy expectations, purchasing power, and company margins."},
+        "growth": {"label": "Economic growth", "series": ["INDPRO", "RSAFS", "PCE"], "why": "Revenue growth and forward earnings expectations."},
+        "labor": {"label": "Labor market", "series": ["UNRATE", "PAYEMS", "ICSA"], "why": "Consumer demand, wage pressure, and recession risk."},
+        "credit": {"label": "Credit conditions", "series": ["BAMLH0A0HYM2", "DRCCLACBS", "TOTALSL"], "why": "Financing availability and balance-sheet stress."},
+    }
+    series_ids = list(dict.fromkeys(series for item in definitions.values() for series in item["series"]))
+    history = database.macro_observation_history(series_ids, limit_per_series=14) if database.DATABASE_URL else []
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in history:
+        if not any(item["date"] == row["date"] for item in grouped.setdefault(row["series_id"], [])):
+            grouped[row["series_id"]].append(row)
+    factors = []
+    for key, definition in definitions.items():
+        evidence = []
+        for series in definition["series"]:
+            values = grouped.get(series, [])
+            if not values:
+                continue
+            latest, previous = values[0], values[1] if len(values) > 1 else None
+            change = None if previous is None else _num(latest["value"]) - _num(previous["value"])
+            evidence.append({
+                "series_id": series, "value": _num(latest["value"]), "date": latest["date"],
+                "change": None if change is None else round(change, 4),
+                "source": f"https://fred.stlouisfed.org/series/{series}",
+            })
+        factors.append({
+            "key": key, "label": definition["label"], "priority": "primary",
+            "why_it_matters": definition["why"], "evidence": evidence,
+            "as_of": max((item["date"] for item in evidence), default=None),
+            "expectation_surprise": None,
+            "assumption": "Observed change only; consensus-surprise data is not connected yet.",
+        })
+    return {
+        "factors": factors,
+        "framework": "Stock price ≈ expected future earnings ÷ required return",
+        "secondary_factors": ["Consumer spending", "Fiscal policy", "Currency", "Commodities", "Global growth", "Geopolitical risk"],
+    }
+
+
 def security_research(tickers: list[str]) -> list[dict[str, Any]]:
     rankings = load_rankings()
     indexed = rankings.set_index(rankings["ticker"].astype(str).str.upper()) if not rankings.empty else pd.DataFrame()
@@ -137,13 +329,18 @@ def security_research(tickers: list[str]) -> list[dict[str, Any]]:
         stored_company_markets.setdefault(row["ticker"], []).append(row)
     rows: list[dict[str, Any]] = []
     for ticker in dict.fromkeys(t.upper() for t in tickers):
+        component_coverage = {
+            "growth": False, "valuation": False, "business_quality": False,
+            "industry_position": False, "price_behavior": False, "news": False,
+        }
         if not rankings.empty and ticker in indexed.index:
             row = indexed.loc[ticker]
             if isinstance(row, pd.DataFrame):
                 row = row.iloc[0]
             final = _num(row.get("final_score"), 50)
             fundamental = _num(row.get("fundamental_score"), 50)
-            valuation = _num(row.get("valuation_score"), 50)
+            imported_valuation = _num(row.get("valuation_score"), 50)
+            valuation = imported_valuation
             industry_score = _num(row.get("industry_score"), 50)
             technical = _num(row.get("technical_score"), 50)
             news = _num(row.get("news_score"), 50)
@@ -154,9 +351,11 @@ def security_research(tickers: list[str]) -> list[dict[str, Any]]:
             risks = [] if str(row.get("risk_flags", "none")) == "none" else str(row.get("risk_flags", "")).split(";")
             quality = "high" if confidence >= 80 else "medium" if confidence >= 60 else "low"
             source = str(row.get("source_url") or row.get("news_url") or "")
+            component_coverage = {key: True for key in component_coverage}
         else:
             company, sector, industry = ETF_META.get(ticker, (ticker, "Unclassified", "Unclassified"))
             final = fundamental = valuation = industry_score = technical = news = 55 if ticker in ETF_META else 45
+            imported_valuation = None
             confidence = 70 if ticker in ETF_META else 30
             risks = [] if ticker in ETF_META else ["limited_research_coverage"]
             quality = "medium" if ticker in ETF_META else "low"
@@ -171,6 +370,7 @@ def security_research(tickers: list[str]) -> list[dict[str, Any]]:
         if len(prices) >= 2 and _num(prices[max(0, len(prices) - 252)]["close"]) > 0:
             price_change_1y = price / _num(prices[max(0, len(prices) - 252)]["close"]) - 1
             technical = _clip(50 + price_change_1y * 65)
+            component_coverage["price_behavior"] = True
         revenue_growth = None
         latest_metrics = fundamentals[0].get("metrics", {}) if fundamentals else {}
         current_revenue = _num(latest_metrics.get("revenue"))
@@ -186,21 +386,42 @@ def security_research(tickers: list[str]) -> list[dict[str, Any]]:
         if current_revenue and prior_revenue:
             revenue_growth = current_revenue / prior_revenue - 1
             fundamental = _clip(fundamental * 0.65 + _clip(50 + revenue_growth * 140) * 0.35)
+            component_coverage["growth"] = True
         net_income = _num(latest_metrics.get("net_income"))
         net_margin = net_income / current_revenue if current_revenue else None
         debt = _num(latest_metrics.get("total_debt"))
         assets = _num(latest_metrics.get("total_assets"))
         if net_margin is not None:
             fundamental = _clip(fundamental + max(-8, min(8, net_margin * 40)))
+            component_coverage["business_quality"] = True
         if assets and debt / assets > 0.55:
             risks = list(dict.fromkeys([*risks, "elevated_balance_sheet_leverage"]))
             fundamental = _clip(fundamental - 7)
+        valuation_evidence = _valuation_evidence(
+            imported_score=imported_valuation,
+            price=price,
+            metrics=latest_metrics,
+            fiscal_period=fundamentals[0].get("fiscal_period") if fundamentals else None,
+        )
+        if valuation_evidence.get("score") is not None:
+            valuation = _num(valuation_evidence["score"], valuation)
+            component_coverage["valuation"] = True
         sentiment_values = []
         for item in news_items:
             metadata = item.get("metadata") or {}
             sentiment_values.append(_num(metadata.get("sentiment_score")))
         if sentiment_values:
             news = _clip(50 + float(np.mean(sentiment_values)) * 35)
+            component_coverage["news"] = True
+        mean_sentiment = float(np.mean(sentiment_values)) if sentiment_values else None
+        sentiment_label = (
+            "positive" if mean_sentiment is not None and mean_sentiment >= .15 else
+            "negative" if mean_sentiment is not None and mean_sentiment <= -.15 else
+            "mixed / neutral" if mean_sentiment is not None else "unavailable"
+        )
+        market_statistics = _security_market_statistics(prices)
+        if security and (security.get("industry") or security.get("sector")):
+            component_coverage["industry_position"] = True
         growth = _clip(fundamental * 0.40 + industry_score * 0.25 + technical * 0.20 + news * 0.15)
         coverage = (30 if len(prices) >= 252 else 15 if prices else 0) + (30 if fundamentals else 0) + (20 if news_items else 0) + (10 if security else 0)
         if database.DATABASE_URL:
@@ -227,9 +448,29 @@ def security_research(tickers: list[str]) -> list[dict[str, Any]]:
             "fundamentals_as_of": fundamentals[0]["period_end"] if fundamentals else None,
             "revenue_growth": None if revenue_growth is None else round(revenue_growth, 4),
             "net_margin": None if net_margin is None else round(net_margin, 4),
+            "valuation_evidence": valuation_evidence,
+            "market_statistics": market_statistics,
+            "fundamental_statistics": {
+                "revenue": latest_metrics.get("revenue"), "net_income": latest_metrics.get("net_income"),
+                "eps_diluted": latest_metrics.get("eps_diluted"), "free_cash_flow": latest_metrics.get("free_cash_flow"),
+                "total_assets": latest_metrics.get("total_assets"), "total_debt": latest_metrics.get("total_debt"),
+                "shares_diluted": latest_metrics.get("shares_diluted"),
+                "net_margin": None if net_margin is None else round(net_margin, 6),
+                "debt_to_assets": round(debt / assets, 6) if assets else None,
+                "period_end": fundamentals[0].get("period_end") if fundamentals else None,
+                "fiscal_period": fundamentals[0].get("fiscal_period") if fundamentals else None,
+                "source": fundamentals[0].get("source_url") if fundamentals else None,
+            },
+            "news_sentiment": {
+                "label": sentiment_label, "mean_score": mean_sentiment,
+                "article_count": len(sentiment_values),
+                "latest_published_at": news_items[0].get("published_at") if news_items else None,
+                "method": "Mean stored provider article-sentiment score; descriptive and coverage-dependent.",
+            },
             "news_count": len(news_items),
             "latest_news": news_items[0] if news_items else None,
             "prediction_markets": company_markets,
+            "component_coverage": component_coverage,
             "data_source": "supabase" if database.DATABASE_URL and (prices or fundamentals or news_items or company_markets) else "local_fallback",
         })
     return rows
@@ -294,6 +535,7 @@ def _price_coverage_diagnostics(
 def _return_model(
     research: list[dict[str, Any]], scenarios: list[dict[str, Any]],
     prices: pd.DataFrame | None = None, labels: list[dict[str, Any]] | None = None,
+    research_preferences: dict[str, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float], dict[str, Any], dict[str, np.ndarray]]:
     tickers = [row["ticker"] for row in research]
     prices = prices if prices is not None else _price_matrix(tickers)
@@ -310,7 +552,28 @@ def _return_model(
         regime_estimate.returns[key] * probabilities.get(key, 0) / probability_total
         for key in REGIME_KEYS
     )
-    score_expected = np.array([row["expected_return"] * (0.55 + row["confidence"] / 200) for row in research])
+    preferences = research_preferences or {"fundamentals": .25, "growth": .20, "valuation": .20, "dividend_income": .10, "macro_resilience": .15, "price_behavior": .10}
+    preference_total = sum(preferences.values()) or 1.0
+    def preference_score(row: dict[str, Any]) -> float:
+        dividend = 70 if row["sector"] == "Fixed Income" else 62 if row["sector"] in {"Energy", "Utilities", "Real Estate"} else 48
+        resilience = 70 if row["sector"] in {"Fixed Income", "Healthcare", "Utilities", "Consumer Staples"} else 55 if row["sector"] == "Broad Market" else 45
+        components = {"fundamentals": row["fundamental_score"], "growth": row["growth_rating"], "valuation": row["valuation_score"], "dividend_income": dividend, "macro_resilience": resilience, "price_behavior": row["technical_score"]}
+        return sum(float(preferences.get(key, 0)) * float(value) for key, value in components.items()) / preference_total
+    preference_scores = np.array([preference_score(row) for row in research])
+    score_expected = np.array([row["expected_return"] * (0.45 + row["confidence"] / 250) for row in research]) * (.80 + preference_scores / 250)
+    history_confidence: dict[str, float] = {}
+    for row in research:
+        ticker = row["ticker"]
+        values = prices[ticker].dropna() if ticker in prices else pd.Series(dtype=float)
+        if len(values) < 2:
+            history_confidence[ticker] = 0.35 if ticker != "CASH" else 1.0
+            continue
+        years = (pd.Timestamp(values.index[-1]) - pd.Timestamp(values.index[0])).days / 365.25
+        history_confidence[ticker] = 1.0 if years >= 7 else 0.75 if years >= 2 else 0.5
+    if len(score_expected):
+        score_prior = float(np.median(score_expected))
+        confidence_vector = np.array([history_confidence.get(row["ticker"], 0.35) for row in research])
+        score_expected = confidence_vector * score_expected + (1 - confidence_vector) * score_prior
     labelled_months = regime_estimate.diagnostics["labelled_forward_months"]
     empirical_weight = 0.0 if labelled_months == 0 else float(np.clip(labelled_months / 48, 0.45, 0.85))
     expected = empirical_expected * empirical_weight + score_expected * (1 - empirical_weight)
@@ -321,6 +584,9 @@ def _return_model(
             "empirical_regime_weight": round(empirical_weight, 6),
             "company_research_weight": round(1 - empirical_weight, 6),
             "scenario_probability_source": "prediction markets with macro-prior fallback",
+            "research_customization": {"method": "policy_weighted_transparent_research_v1", "preferences": preferences},
+            "history_confidence": history_confidence,
+            "history_treatment": "Security research return adjustments are shrunk toward the cross-sectional prior when adjusted-price history is shorter than seven years.",
         },
     }
     return expected, covariance_estimate.matrix, vol_by_ticker, diagnostics, regime_estimate.returns
@@ -641,11 +907,12 @@ def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> di
     labels = database.regime_history(limit=1000)
     ml_evaluation = evaluate_regime_classifier(labels)
     expected, covariance, _, model_diagnostics, regime_returns = _return_model(
-        research, scenarios, prices, labels
+        research, scenarios, prices, labels, profile.research_preferences
     )
     model_diagnostics["price_coverage"] = _price_coverage_diagnostics(
         prices, research, proxy_tickers
     )
+    insufficient_history = model_diagnostics["price_coverage"]["insufficient_full_cycle"]
     current, portfolio_value = _current_weights(holdings, research)
     walk_forward = _walk_forward(prices, labels, research, profile, current)
     alternatives = []
@@ -685,12 +952,84 @@ def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> di
                 "Risk, return, drawdown, tax, and retirement figures are estimates rather than guarantees.",
             ],
         })
+    balanced = next((item for item in alternatives if item["name"] == "Balanced"), alternatives[0] if alternatives else None)
+    current_return = float(expected @ current) if len(current) else 0.0
+    current_volatility = float(np.sqrt(max(0, current @ covariance @ current))) if len(current) else 0.0
+    contribution_capacity = min(1.0, profile.annual_contribution / max(portfolio_value, 1.0))
+    contribution_allocations = []
+    if balanced:
+        underweights = [item for item in balanced["allocations"] if item["delta"] > 0.002]
+        underweight_total = sum(item["delta"] for item in underweights) or 1.0
+        contribution_allocations = [
+            {
+                "ticker": item["ticker"],
+                "contribution_share": round(item["delta"] / underweight_total, 4),
+                "estimated_annual_dollars": round(profile.annual_contribution * item["delta"] / underweight_total, 2),
+            }
+            for item in underweights
+        ]
+    gradual_weights = current.copy()
+    if balanced and len(current):
+        balanced_map = {item["ticker"]: item["target_weight"] for item in balanced["allocations"]}
+        balanced_weights = np.array([balanced_map.get(row["ticker"], 0.0) for row in research], dtype=float)
+        gradual_weights = current + 0.5 * (balanced_weights - current)
+        if gradual_weights.sum() > 0:
+            gradual_weights /= gradual_weights.sum()
+    gradual_return = float(expected @ gradual_weights) if len(gradual_weights) else 0.0
+    gradual_volatility = float(np.sqrt(max(0, gradual_weights @ covariance @ gradual_weights))) if len(gradual_weights) else 0.0
+    balanced_tax = (balanced or {}).get("tax", {})
+    balanced_tax_value = balanced_tax.get("estimated_tax") if balanced_tax.get("available") else None
+    implementation_paths = [
+        {
+            "key": "current", "name": "Current / do nothing", "implementation": "Keep the current portfolio unchanged",
+            "expected_return": round(current_return, 4), "volatility": round(current_volatility, 4),
+            "drawdown_range": [round(-current_volatility * 2.2, 4), round(-current_volatility * 1.2, 4)],
+            "turnover": 0.0, "estimated_tax": 0.0,
+            "expected_benefit": "Avoids trading costs and taxable realization while preserving the present exposures.",
+            "costs_and_risks": "Existing concentration, correlation, and scenario exposures remain unchanged.",
+            "consequence": "No implementation work is required; review again when evidence or constraints materially change.",
+            "assumptions": ["Current saved weights are held constant.", "No deposits, withdrawals, or trades are modeled."],
+        },
+        {
+            "key": "contributions_only", "name": "Contributions only", "implementation": "Direct new cash toward underweights; do not sell existing holdings.",
+            "expected_return": round(current_return + contribution_capacity * ((balanced or {}).get("expected_return", current_return) - current_return), 4),
+            "volatility": round(current_volatility + contribution_capacity * ((balanced or {}).get("volatility", current_volatility) - current_volatility), 4),
+            "drawdown_range": [round(-current_volatility * 2.2, 4), round(-current_volatility * 1.2, 4)],
+            "turnover": 0.0, "estimated_tax": 0.0, "contribution_allocations": contribution_allocations,
+            "expected_benefit": "Improves diversification without realizing gains from sales.",
+            "costs_and_risks": "Progress can be slow when contributions are small relative to the portfolio.",
+            "consequence": "Existing overweights decline only as new money is added elsewhere.",
+            "assumptions": ["Annual contributions are available as entered in Plan.", "No security is sold."],
+        },
+        {
+            "key": "gradual", "name": "Gradual transition", "implementation": "Move halfway from current weights toward the Balanced target in this review period.",
+            "expected_return": round(gradual_return, 4), "volatility": round(gradual_volatility, 4),
+            "drawdown_range": [round(-gradual_volatility * 2.2, 4), round(-gradual_volatility * 1.2, 4)],
+            "turnover": round((balanced or {}).get("turnover", 0.0) * 0.5, 4),
+            "estimated_tax": round(balanced_tax_value * 0.5, 2) if balanced_tax_value is not None else None,
+            "expected_benefit": "Captures part of the modeled diversification benefit while spreading implementation risk.",
+            "costs_and_risks": "Retains some current concentration and may require multiple future reviews.",
+            "consequence": "The portfolio remains between its current allocation and the model target.",
+            "assumptions": ["Each Balanced allocation delta is implemented at 50%.", "Tax estimates use aggregate cost basis when available."],
+        },
+        {
+            "key": "immediate", "name": "Immediate transition", "implementation": "Move to the Balanced target ranges in one implementation period.",
+            "expected_return": (balanced or {}).get("expected_return", current_return),
+            "volatility": (balanced or {}).get("volatility", current_volatility),
+            "drawdown_range": (balanced or {}).get("drawdown_range", [round(-current_volatility * 2.2, 4), round(-current_volatility * 1.2, 4)]),
+            "turnover": (balanced or {}).get("turnover", 0.0), "estimated_tax": balanced_tax_value,
+            "expected_benefit": "Reaches the Balanced model ranges immediately.",
+            "costs_and_risks": "Creates the highest near-term turnover and may realize taxable gains.",
+            "consequence": "The full model change is taken now rather than phased over time.",
+            "assumptions": ["Balanced target weights are implemented at once.", "Market impact and tax-lot selection are outside v1."],
+        },
+    ]
     run_id = str(uuid.uuid4())
     result = {
         "id": run_id, "created_at": datetime.now(timezone.utc).isoformat(), "model_version": "walk-forward-regime-shrinkage-v2",
         "macro": latest_macro(), "scenarios": scenarios, "scenario_warnings": scenario_payload["warnings"],
         "portfolio_value": round(portfolio_value, 2), "current_weights": {row["ticker"]: round(float(current[i]), 4) for i, row in enumerate(research) if current[i] > 0},
-        "research": research, "alternatives": alternatives,
+        "research": research, "alternatives": alternatives, "implementation_paths": implementation_paths,
         "model_diagnostics": model_diagnostics, "walk_forward": walk_forward,
         "benchmarks": walk_forward.get("benchmarks", []),
         "ml_regime_evaluation": ml_evaluation,
@@ -698,6 +1037,7 @@ def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> di
             "Decision-support research only; no trades are submitted.",
             "Expected returns and projections are model estimates, not guarantees.",
             *(["Walk-forward validation is unavailable until more overlapping price and point-in-time regime history exists."] if walk_forward["status"] != "complete" else []),
+            *([f"Full-cycle adjusted-price history is insufficient for: {', '.join(insufficient_history)}. Regime estimates use disclosed sector/broad-ETF priors and company-return adjustments are shrunk."] if insufficient_history else []),
         ],
         "data_lineage": {
             "research": "supabase" if database.DATABASE_URL else str(RANKINGS_PATH),
@@ -716,7 +1056,7 @@ def _allocation_reason(label: str, row: dict[str, Any], delta: float) -> str:
         return f"{direction}: balances {row['confidence']:.0f}% research confidence with diversification and downside control."
     if label == "Goal-Tilted":
         return f"{direction}: goal tilt reflects growth {row['growth_rating']:.0f} and valuation {row['valuation_score']:.0f}."
-    return f"{direction}: composite score {row['final_score']:.0f} with {row['data_quality']} data quality."
+    return f"{direction}: relative research evidence is supported by {row['data_quality']} data quality and portfolio constraints."
 
 
 def _tradeoff(label: str) -> str:
