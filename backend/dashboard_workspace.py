@@ -19,12 +19,16 @@ from .analysis import latest_macro, macro_factor_dashboard, security_research
 from .chat import _candidate, _gemini_request
 from .guidance import guidance_disclosure
 from .scenarios import refresh as refresh_scenarios
+from .resilience import RetryPolicy, retry_call
 
 
 PLAN_VERSION = "dashboard-plan-v2"
 COMPILER_VERSION = "dashboard-spec-compiler-v2"
 CALCULATION_VERSION = "ai-workspace-calculations-v1.4.0"
 TERMINAL_STATES = {"COMPLETE", "PARTIAL_SUCCESS", "FAILED", "CANCELLED", "EXPIRED"}
+PLANNER_MAX_ATTEMPTS = max(1, min(2, int(os.getenv("DASHBOARD_PLANNER_MAX_ATTEMPTS", "2"))))
+DASHBOARD_TASK_WAIT_SECONDS = max(10, min(60, int(os.getenv("DASHBOARD_TASK_TIMEOUT_SECONDS", "45"))))
+DASHBOARD_NARRATIVE_WAIT_SECONDS = max(10, min(45, int(os.getenv("DASHBOARD_NARRATIVE_TIMEOUT_SECONDS", "30"))))
 INTENTS = (
     "portfolio_review", "compare_securities", "research_candidates",
     "macro_analysis", "correlation_analysis", "scenario_analysis",
@@ -88,6 +92,7 @@ class DashboardPlan(BaseModel):
 class DraftRequest(BaseModel):
     prompt: str = Field(min_length=3, max_length=3000)
     portfolio_id: str | None = None
+    conversation_id: str | None = None
 
 
 class RevisionRequest(BaseModel):
@@ -279,7 +284,7 @@ def plan_dashboard(prompt: str, portfolio: dict[str, Any] | None = None) -> Dash
     if not api_key:
         return fallback
     contents = [{"role": "user", "parts": [{"text": _planner_prompt(prompt, fallback, portfolio)}]}]
-    for _ in range(2):
+    for _ in range(PLANNER_MAX_ATTEMPTS):
         try:
             payload = _gemini_request(api_key, model, contents, 1800)
             text, _ = _candidate(payload)
@@ -1140,6 +1145,16 @@ JOB_EXECUTOR=ThreadPoolExecutor(max_workers=4,thread_name_prefix="dashboard-job"
 TASK_EXECUTOR=ThreadPoolExecutor(max_workers=8,thread_name_prefix="dashboard-task")
 ACTIVE_JOBS: dict[str,Future[Any]]={}
 ACTIVE_LOCK=threading.Lock()
+TASK_RETRY_POLICY=RetryPolicy(attempts=max(1,min(3,int(os.getenv("DASHBOARD_TASK_MAX_ATTEMPTS","2")))))
+
+
+def _run_task_bounded(context: dict[str, Any], task: dict[str, Any], deps: dict[str, Any]) -> dict[str, Any]:
+    return retry_call(
+        lambda: _run_task(context, task, deps),
+        policy=TASK_RETRY_POLICY,
+        retryable=lambda exc: any(token in type(exc).__name__.lower() for token in ("timeout", "connection", "operational")),
+        metric="dashboard.task",
+    )
 
 
 def submit_dashboard_job(job: dict[str, Any], user_id: str) -> None:
@@ -1184,11 +1199,11 @@ def run_dashboard_job(job_id: str, user_id: str) -> None:
                 task=tasks[task_id]
                 if all(dep in results for dep in task["depends_on"]):
                     dep_values={dep:results[dep] for dep in task["depends_on"]}; database.save_dashboard_task(job_id,task,state="RUNNING")
-                    running[TASK_EXECUTOR.submit(_run_task,context,task,dep_values)]=task_id; pending.remove(task_id)
+                    running[TASK_EXECUTOR.submit(_run_task_bounded,context,task,dep_values)]=task_id; pending.remove(task_id)
             if not running and pending:
                 raise RuntimeError("No runnable tasks remain in the dashboard graph")
             if running:
-                future=next(as_completed(list(running),timeout=60)); task_id=running.pop(future); task=tasks[task_id]
+                future=next(as_completed(list(running),timeout=DASHBOARD_TASK_WAIT_SECONDS)); task_id=running.pop(future); task=tasks[task_id]
                 try:
                     result=future.result(); results[task_id]=result; database.save_dashboard_task(job_id,task,state="READY",result=result)
                 except Exception as exc:
@@ -1206,7 +1221,7 @@ def run_dashboard_job(job_id: str, user_id: str) -> None:
         narrative=""; narrative_error=None
         if narrative_future:
             database.update_dashboard_job(job_id,user_id,state="NARRATING",progress=90)
-            try: narrative=narrative_future.result(timeout=75)
+            try: narrative=narrative_future.result(timeout=DASHBOARD_NARRATIVE_WAIT_SECONDS)
             except Exception as exc: narrative_error=str(exc); failures.append(f"Narrative: {exc}")
         elif evidence_gate and evidence_gate["issues"]:
             narrative=unsupported_evidence_feedback(job["prompt"],evidence_gate["issues"])
@@ -1230,7 +1245,9 @@ def run_dashboard_job(job_id: str, user_id: str) -> None:
 def create_draft(user_id: str, request: DraftRequest, source_view_id: str | None = None) -> dict[str, Any]:
     # Validate prompt synchronously so adversarial actions fail before a worker is scheduled.
     deterministic_plan(request.prompt,request.portfolio_id)
-    job=database.create_dashboard_job(user_id,request.prompt,request.portfolio_id,source_view_id)
+    if request.conversation_id:
+        database.get_conversation(user_id, request.conversation_id)
+    job=database.create_dashboard_job(user_id,request.prompt,request.portfolio_id,source_view_id,request.conversation_id)
     submit_dashboard_job(job,user_id)
     return job
 

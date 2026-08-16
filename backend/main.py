@@ -6,7 +6,7 @@ import os
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 from . import database
 from .analysis import latest_macro, macro_factor_dashboard, run_analysis, security_research
-from .auth import AuthenticatedUser, require_user
+from .auth import AuthenticatedUser, optional_user, require_user
 from .chat import ask_gemini, retrieve_evidence
 from .company_markets import refresh_company_markets
 from .dashboard_workspace import (
@@ -35,8 +35,13 @@ from .ingestion import refresh_fred, refresh_polygon, refresh_sec, refresh_secur
 from .models import (
     AnalysisRequest, ExplanationRequest, FinancialGoal, GoalProjectionRequest, InvestmentPolicy,
     Holding, InvestorProfile, PortfolioPayload, TransactionCsvImport, AccountPerformanceRequest,
-    StatementReconciliationRequest,
+    StatementReconciliationRequest, SimulationRunInput, ETFAllocationRequest, StockBasketRequest,
 )
+from .simulation_engine import goal_projection as shared_goal_projection, run_simulation
+from .allocation_builders import optimize_etfs, optimize_stocks
+from .security_snapshot import overview as security_snapshot_overview
+from .security_snapshot import sentiment as security_snapshot_sentiment
+from .security_snapshot import technicals as security_snapshot_technicals
 from .portfolio_import import parse_portfolio_csv
 from .portfolio_ledger import calculate_performance, parse_transaction_csv, reconstruct_positions, tax_lot_coverage
 from .portfolio_diagnostics import build_portfolio_diagnostics
@@ -53,9 +58,13 @@ from .today_briefing import INDEXES, MARKET_SERIES, SECTORS, build_today_briefin
 from .error_monitoring import configure_error_monitoring
 from .operational_monitoring import operational_snapshot
 from .production_middleware import production_guard
+from .resilience import TTLCache
 from .market_context import (
     PolygonSnapshotProvider, ResearchMarketEventProvider, normalize_observation,
     overlay_observations,
+)
+from .learning import (
+    calculate_lab, catalog_payload, grade_quiz, learning_tutor_answer, lesson_payload,
 )
 
 
@@ -130,82 +139,51 @@ class TerminalLayoutPayload(BaseModel):
 class ChatRequest(BaseModel):
     question: str = Field(min_length=2, max_length=2000)
     conversation_id: str | None = None
+    workspace: Literal["general", "research", "portfolio"] = "general"
+
+
+class ConversationCreate(BaseModel):
+    workspace: Literal["research", "portfolio"]
+    title: str = Field(default="New conversation", min_length=1, max_length=120)
+
+
+class ConversationUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+
+
+class LearningPreferencesPayload(BaseModel):
+    selected_path: str | None = Field(default=None, max_length=80)
+    knowledge_level: Literal["beginner", "developing", "confident"] = "beginner"
+    interests: list[str] = Field(default_factory=list, max_length=20)
+    portfolio_context_enabled: bool = False
+
+
+class LearningProgressPayload(BaseModel):
+    module_id: str = Field(min_length=2, max_length=80)
+    content_version: str = Field(min_length=2, max_length=40)
+    status: Literal["not_started", "in_progress", "completed", "mastered"]
+    completion_percentage: float = Field(ge=0, le=1)
+
+
+class LearningQuizAttemptPayload(BaseModel):
+    answers: list[int] = Field(min_length=1, max_length=20)
+
+
+class LearningLabPayload(BaseModel):
+    inputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class LearningTutorThreadPayload(BaseModel):
+    lesson_id: str = Field(min_length=2, max_length=80)
+    title: str | None = Field(default=None, max_length=120)
+
+
+class LearningTutorMessagePayload(BaseModel):
+    question: str = Field(min_length=2, max_length=1200)
 
 
 def _goal_projection(payload: GoalProjectionRequest) -> dict[str, Any]:
-    goal = payload.goal
-    years = max(1, math.ceil((goal.target_date - date.today()).days / 365.25))
-    contribution = goal.annual_contribution + payload.additional_annual_contribution
-    expected_return = 0.03 + payload.risk_tolerance * 0.008
-    volatility = 0.06 + payload.risk_tolerance * 0.018
-    seed = sum(ord(char) for char in f"{goal.name}|{goal.target_date}|{goal.target_amount}|{payload.risk_tolerance}")
-    def simulate(annual_contribution: float, annual_return: float, annual_volatility: float, seed_offset: int = 0) -> list[float]:
-        rng = random.Random(seed + seed_offset)
-        values: list[float] = []
-        for _ in range(2500):
-            value = goal.current_value
-            for _year in range(years):
-                value = max(0, value * (1 + max(-0.95, rng.gauss(annual_return, annual_volatility))) + annual_contribution)
-            values.append(value)
-        return sorted(values)
-
-    outcomes = simulate(contribution, expected_return, volatility)
-    outcomes.sort()
-    percentile = lambda probability: outcomes[min(len(outcomes) - 1, round((len(outcomes) - 1) * probability))]
-    goal_probability = sum(value >= goal.target_amount for value in outcomes) / len(outcomes)
-    inflation = 0.025
-    real_divisor = (1 + inflation) ** years if goal.inflation_adjusted else 1
-    annuity_factor = ((1.05 ** years) - 1) / 0.05
-    required_contribution = max(0, (goal.target_amount - goal.current_value * (1.05 ** years)) / annuity_factor)
-    extra_monthly = 300
-    extra_outcomes = simulate(contribution + extra_monthly * 12, expected_return, volatility, 31)
-    lower_risk_outcomes = simulate(contribution, max(.02, expected_return - .012), max(.04, volatility - .025), 71)
-    median = percentile(.50)
-    extra_median = extra_outcomes[len(extra_outcomes) // 2]
-    lower_risk_median = lower_risk_outcomes[len(lower_risk_outcomes) // 2]
-    on_track_range = "strong" if goal_probability >= .75 else "moderate" if goal_probability >= .45 else "needs attention"
-    earliest_years = years
-    deterministic_value = goal.current_value
-    for candidate_year in range(1, 61):
-        deterministic_value = deterministic_value * 1.05 + contribution
-        if deterministic_value >= goal.target_amount:
-            earliest_years = candidate_year
-            break
-    earliest_date = date.today() + timedelta(days=round(earliest_years * 365.25))
-    return {
-        "goal_id": goal.id, "as_of": date.today().isoformat(), "years": years,
-        "nominal_p10": round(percentile(.10), 2), "nominal_p50": round(percentile(.50), 2),
-        "nominal_p90": round(percentile(.90), 2), "real_p50": round(percentile(.50) / real_divisor, 2),
-        "goal_probability": round(goal_probability, 4), "required_annual_contribution": round(required_contribution, 2),
-        "on_track_range": on_track_range,
-        "earliest_plausible_goal_date": earliest_date.isoformat(),
-        "monthly_contribution_adjustment": round(max(0, required_contribution - goal.annual_contribution) / 12, 2),
-        "contribution_comparison": {
-            "additional_monthly": extra_monthly, "projected_median": round(extra_median, 2),
-            "median_improvement": round(extra_median - median, 2),
-            "goal_probability": round(sum(value >= goal.target_amount for value in extra_outcomes) / len(extra_outcomes), 4),
-        },
-        "lower_risk_comparison": {
-            "projected_median": round(lower_risk_median, 2),
-            "median_difference": round(lower_risk_median - median, 2),
-            "goal_probability": round(sum(value >= goal.target_amount for value in lower_risk_outcomes) / len(lower_risk_outcomes), 4),
-            "return_assumption": round(max(.02, expected_return - .012), 4),
-        },
-        "most_influential_assumptions": [
-            f"${goal.annual_contribution:,.0f} annual contribution",
-            f"{years}-year time horizon", f"{expected_return:.1%} return assumption",
-            f"{goal.flexibility.replace('_', ' ')} target flexibility",
-        ],
-        "assumptions": [
-            f"{expected_return:.1%} arithmetic annual return assumption", f"{volatility:.1%} annual volatility",
-            "2,500 seeded annual paths", "2.5% inflation when inflation-adjusted", "Contributions occur annually",
-        ],
-        "limitations": [
-            "This is a planning range, not a guarantee.",
-            "Taxes, fees, account-specific withdrawal rules, and transaction history are not modeled at goal level.",
-        ],
-        "calculation": {"method": "seeded_goal_monte_carlo", "version": "goal-projection-v2"},
-    }
+    return shared_goal_projection(payload)
 
 
 def regime_summary() -> dict[str, Any]:
@@ -436,7 +414,14 @@ def import_portfolio(payload: CsvImport, user: AuthenticatedUser = Depends(requi
         raise HTTPException(422, str(exc)) from exc
     holdings = result["holdings"]
     portfolio = database.save_portfolio(payload.name, holdings, user_id=user.id)
-    return {"portfolio": portfolio, "validated_rows": len(holdings), **{key: result[key] for key in ("warnings", "detected_columns", "ignored_columns", "source_rows")}}
+    return {
+        "portfolio": portfolio,
+        "validated_rows": len(holdings),
+        **{key: result[key] for key in (
+            "warnings", "detected_columns", "ignored_columns", "source_rows",
+            "review_rows", "excluded_market_value",
+        )},
+    }
 
 
 @app.get("/api/portfolio/diagnostics")
@@ -456,6 +441,131 @@ def portfolio_diagnostics(user: AuthenticatedUser = Depends(require_user)) -> di
 @app.get("/api/profile")
 def get_profile(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     return database.load_profile(user.id) or InvestorProfile().model_dump(mode="json")
+
+
+@app.get("/api/learn/catalog")
+def learning_catalog(user: AuthenticatedUser | None = Depends(optional_user)) -> dict[str, Any]:
+    payload = catalog_payload(public_only=user is None)
+    if user is not None:
+        payload["preferences"] = database.load_learning_preferences(user.id)
+        payload["progress"] = database.list_learning_progress(user.id)
+    return payload
+
+
+@app.get("/api/learn/lessons/{lesson_id}")
+def learning_lesson(lesson_id: str, user: AuthenticatedUser | None = Depends(optional_user)) -> dict[str, Any]:
+    try:
+        return lesson_payload(lesson_id, public_only=user is None)
+    except KeyError as exc:
+        raise HTTPException(404, "Learning lesson not found") from exc
+    except PermissionError as exc:
+        raise HTTPException(401, "Sign in to continue this learning path") from exc
+
+
+@app.post("/api/learn/labs/{lab_id}/calculate")
+def learning_lab(lab_id: str, payload: LearningLabPayload) -> dict[str, Any]:
+    try:
+        return calculate_lab(lab_id, payload.inputs)
+    except KeyError as exc:
+        raise HTTPException(404, "Learning lab not found") from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/learn/preferences")
+def learning_preferences(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    return database.load_learning_preferences(user.id)
+
+
+@app.put("/api/learn/preferences")
+def update_learning_preferences(payload: LearningPreferencesPayload, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    catalog = catalog_payload()
+    paths = {module["id"] for module in catalog["modules"]}
+    if payload.selected_path is not None and payload.selected_path not in paths:
+        raise HTTPException(422, "Unknown learning path")
+    return database.save_learning_preferences(user.id, payload.model_dump(mode="json"))
+
+
+@app.get("/api/learn/progress")
+def learning_progress(user: AuthenticatedUser = Depends(require_user)) -> list[dict[str, Any]]:
+    return database.list_learning_progress(user.id)
+
+
+@app.put("/api/learn/progress/{lesson_id}")
+def update_learning_progress(lesson_id: str, payload: LearningProgressPayload,
+                             user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        lesson = lesson_payload(lesson_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Learning lesson not found") from exc
+    if payload.module_id != lesson["module_id"] or payload.content_version != lesson["content_version"]:
+        raise HTTPException(422, "Progress must reference the current lesson and content version")
+    if payload.status == "mastered":
+        attempts = database.list_learning_quiz_attempts(user.id, lesson_id)
+        if not attempts or max(float(item["percentage"]) for item in attempts) < .80 or payload.completion_percentage < 1:
+            raise HTTPException(422, "Mastery requires lesson completion and a quiz score of at least 80%")
+    return database.save_learning_progress(
+        user.id, lesson["module_id"], lesson_id, lesson["content_version"],
+        payload.status, payload.completion_percentage,
+    )
+
+
+@app.post("/api/learn/quizzes/{quiz_id}/attempts", status_code=201)
+def submit_learning_quiz(quiz_id: str, payload: LearningQuizAttemptPayload,
+                         user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        result = grade_quiz(quiz_id, payload.answers)
+    except KeyError as exc:
+        raise HTTPException(404, "Learning quiz not found") from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    attempt = database.save_learning_quiz_attempt(user.id, result, payload.answers)
+    progress = next((item for item in database.list_learning_progress(user.id)
+                     if item["lesson_id"] == result["lesson_id"] and item["content_version"] == result["content_version"]), None)
+    return {**result, "attempt": attempt, "progress": progress}
+
+
+@app.get("/api/learn/tutor/threads")
+def learning_tutor_threads(user: AuthenticatedUser = Depends(require_user)) -> list[dict[str, Any]]:
+    return database.list_learning_tutor_threads(user.id)
+
+
+@app.post("/api/learn/tutor/threads", status_code=201)
+def create_learning_tutor_thread(payload: LearningTutorThreadPayload,
+                                 user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        lesson = lesson_payload(payload.lesson_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Learning lesson not found") from exc
+    return database.create_learning_tutor_thread(user.id, lesson["id"], payload.title or lesson["title"])
+
+
+@app.get("/api/learn/tutor/threads/{thread_id}/messages")
+def get_learning_tutor_messages(thread_id: str, user: AuthenticatedUser = Depends(require_user)) -> list[dict[str, Any]]:
+    try:
+        return database.learning_tutor_messages(user.id, thread_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Learning tutor thread not found") from exc
+
+
+@app.post("/api/learn/tutor/threads/{thread_id}/messages")
+def post_learning_tutor_message(thread_id: str, payload: LearningTutorMessagePayload,
+                                user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    thread = next((item for item in database.list_learning_tutor_threads(user.id) if item["id"] == thread_id), None)
+    if thread is None:
+        raise HTTPException(404, "Learning tutor thread not found")
+    lesson = lesson_payload(thread["lesson_id"])
+    history = database.learning_tutor_messages(user.id, thread_id)
+    user_message = database.save_learning_tutor_message(user.id, thread_id, "user", payload.question)
+    try:
+        answer, model, sources = learning_tutor_answer(payload.question, lesson, history)
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    assistant = database.save_learning_tutor_message(
+        user.id, thread_id, "assistant", answer, sources,
+        {"data_quality": "high", "source_count": len(sources), "method": "lesson-structured-retrieval-v1"}, model,
+    )
+    return {"thread_id": thread_id, "user_message": user_message, "message": assistant, "sources": sources}
 
 
 @app.put("/api/profile")
@@ -685,6 +795,24 @@ def research_security(ticker: str, user: AuthenticatedUser = Depends(require_use
     if not payload["results"]:
         raise HTTPException(404, "Security research is not available")
     return {"security": payload["results"][0], "universe": payload["universe"], "method": payload["method"], "historical_coverage": coverage}
+
+
+@app.get("/api/research/securities/{ticker}/overview")
+def research_security_overview(ticker: str, _: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    payload = security_snapshot_overview(ticker.strip().upper())
+    if payload.get("status") == "unavailable":
+        raise HTTPException(404, payload["warnings"][0])
+    return payload
+
+
+@app.get("/api/research/securities/{ticker}/technicals")
+def research_security_technicals(ticker: str, _: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    return security_snapshot_technicals(ticker.strip().upper())
+
+
+@app.get("/api/research/securities/{ticker}/sentiment")
+def research_security_sentiment(ticker: str, _: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    return security_snapshot_sentiment(ticker.strip().upper())
 
 
 @app.get("/api/research/coverage")
@@ -984,6 +1112,71 @@ def portfolio_analysis(request: AnalysisRequest, user: AuthenticatedUser = Depen
     return create_analysis(request, user)
 
 
+@app.post("/api/simulations/runs")
+def create_simulation_run(payload: SimulationRunInput, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        result = run_simulation(payload)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    database.save_simulation_run(user.id, result)
+    return result
+
+
+@app.get("/api/simulations/runs/{run_id}")
+def get_simulation_run(run_id: str, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    result = database.load_simulation_run(user.id, run_id)
+    if not result:
+        raise HTTPException(404, "Simulation run not found")
+    return result
+
+
+@app.post("/api/simulations/runs/{run_id}/compare")
+def compare_simulation_run(run_id: str, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    result = database.load_simulation_run(user.id, run_id)
+    if not result:
+        raise HTTPException(404, "Simulation run not found")
+    return {"id": run_id, "shared_path_fingerprint": result["shared_path_fingerprint"], "outcomes": result["outcomes"], "model_version": result["model_version"]}
+
+
+@app.post("/api/simulations/runs/{run_id}/optimize")
+def optimize_simulation_run(run_id: str, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    result = database.load_simulation_run(user.id, run_id)
+    if not result:
+        raise HTTPException(404, "Simulation run not found")
+    outcomes = result["outcomes"]
+    candidates = [
+        ("Least disruptive", min(outcomes, key=lambda row: (row.get("turnover", 1), row.get("regret", 0)))),
+        ("Lower downside", min(outcomes, key=lambda row: (row.get("probability_of_loss", 1), row.get("drawdown_percentiles", {}).get("p10", -1) * -1))),
+        ("Balanced tradeoff", next((row for row in outcomes if row.get("strategy_key") == "balanced"), outcomes[0])),
+        ("Higher goal potential", max(outcomes, key=lambda row: row.get("wealth_percentiles", {}).get("p50", 0))),
+    ]
+    choices = []
+    used: set[str] = set()
+    for label, outcome in candidates:
+        key = outcome.get("strategy_key", label)
+        if key in used:
+            alternative = next((row for row in outcomes if row.get("strategy_key") not in used), None)
+            if alternative is not None:
+                outcome, key = alternative, alternative.get("strategy_key", label)
+        used.add(key)
+        choices.append({"frontier_label": label, **outcome})
+    return {"id": run_id, "decision_frontier": choices, "diagnostics": [], "note": "No option is labeled the single best portfolio."}
+
+
+@app.post("/api/builders/etf/optimize")
+def build_etf_allocation(payload: ETFAllocationRequest, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    result = optimize_etfs(payload)
+    result["id"] = database.save_builder_run(user.id, "etf", payload.model_dump(mode="json"), result)
+    return result
+
+
+@app.post("/api/builders/stocks/optimize")
+def build_stock_basket(payload: StockBasketRequest, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    result = optimize_stocks(payload)
+    result["id"] = database.save_builder_run(user.id, "stock", payload.model_dump(mode="json"), result)
+    return result
+
+
 @app.post("/api/portfolio/transactions/import")
 def portfolio_transaction_import(payload: TransactionCsvImport, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     parsed = parse_transaction_csv(payload.csv_text, payload.account_id)
@@ -1088,13 +1281,304 @@ def macro_factors(_: AuthenticatedUser = Depends(require_user)) -> dict[str, Any
 
 
 @app.get("/api/chat/conversations")
-def conversations(user: AuthenticatedUser = Depends(require_user)) -> list[dict[str, Any]]:
-    return database.list_conversations(user.id)
+def conversations(workspace: Literal["research", "portfolio"] | None = None,
+                  user: AuthenticatedUser = Depends(require_user)) -> list[dict[str, Any]]:
+    return database.list_conversations(user.id, workspace)
+
+
+@app.post("/api/chat/conversations", status_code=201)
+def create_chat_conversation(payload: ConversationCreate,
+                             user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    portfolio = (database.list_portfolios(user.id) or [{}])[0]
+    return database.create_conversation(user.id, payload.title, portfolio.get("id"), payload.workspace)
 
 
 @app.get("/api/chat/conversations/{conversation_id}")
 def conversation(conversation_id: str, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    return {"id": conversation_id, "messages": database.conversation_messages(user.id, conversation_id)}
+    try:
+        item = database.get_conversation(user.id, conversation_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Conversation not found") from exc
+    return {**item, "messages": database.conversation_messages(user.id, conversation_id),
+            "artifacts": database.conversation_artifacts(user.id, conversation_id)}
+
+
+@app.patch("/api/chat/conversations/{conversation_id}")
+def rename_chat_conversation(conversation_id: str, payload: ConversationUpdate,
+                             user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        return database.rename_conversation(user.id, conversation_id, payload.title)
+    except KeyError as exc:
+        raise HTTPException(404, "Conversation not found") from exc
+
+
+@app.delete("/api/chat/conversations/{conversation_id}", status_code=204)
+def delete_chat_conversation(conversation_id: str,
+                             user: AuthenticatedUser = Depends(require_user)) -> None:
+    try:
+        database.delete_conversation(user.id, conversation_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Conversation not found") from exc
+
+
+_CHAT_SECURITY_STOPWORDS = {
+    "AI", "ETF", "ETFS", "SEC", "CPI", "GDP", "FED", "USD", "CEO", "THE", "WHEN", "WHAT", "WHY",
+    "HOW", "WILL", "WITH", "HIGH", "LOW", "SELL", "BUY", "HOLD", "STOCK", "PRICE", "PRICES", "MARKET",
+    "MEMORY", "DATACENTERS", "DATA", "CENTER", "CENTERS", "TIMEFRAME", "NEWS", "CURRENT", "LATEST",
+}
+
+_CHAT_RESEARCH_CACHE = TTLCache(max_entries=128)
+_CHAT_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=6, thread_name_prefix="chat-tool")
+
+
+def _resolve_chat_tickers(question: str) -> list[str]:
+    """Resolve explicit symbols and unambiguous company-name tokens against the supported master."""
+    resolved: list[str] = []
+    explicit = [value for value in re.findall(r"\b[A-Z]{1,5}\b", question) if value not in _CHAT_SECURITY_STOPWORDS]
+    for token in explicit[:8]:
+        try:
+            matches = database.search_security_master(token, limit=5).get("results", [])
+        except Exception:
+            matches = []
+        exact = next((row for row in matches if str(row.get("ticker", "")).upper() == token), None)
+        if exact:
+            resolved.append(token)
+    if resolved:
+        return list(dict.fromkeys(resolved))[:3]
+    candidate_words = [
+        word for word in re.findall(r"\b[A-Za-z][A-Za-z.&-]{3,}\b", question)
+        if word.upper() not in _CHAT_SECURITY_STOPWORDS
+    ]
+    for word in candidate_words[:10]:
+        try:
+            matches = database.search_security_master(word, limit=5).get("results", [])
+        except Exception:
+            continue
+        exact_names = [row for row in matches if str(row.get("name", "")).lower().split(" ")[0] == word.lower()]
+        if len(exact_names) == 1:
+            resolved.append(str(exact_names[0]["ticker"]).upper())
+    return list(dict.fromkeys(resolved))[:3]
+
+
+def _evidence_age_days(value: Any) -> int | None:
+    parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return max(0, (datetime.now(timezone.utc) - parsed.to_pydatetime()).days)
+
+
+def _company_research_chat_tools(question: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    tickers = _resolve_chat_tickers(question)
+    if not tickers:
+        return [], []
+    cache_key = ",".join(sorted(tickers))
+    cached = _CHAT_RESEARCH_CACHE.get(cache_key)
+    if cached is not None:
+        from .operational_monitoring import record_metric
+        record_metric("chat.company_research_cache_hit")
+        return cached
+    before = {row["ticker"]: row for row in security_research(tickers)}
+    refresh_tickers = [
+        ticker for ticker in tickers
+        if before.get(ticker, {}).get("price") is None
+        or (_evidence_age_days(before.get(ticker, {}).get("price_as_of")) or 999) > 3
+        or before.get(ticker, {}).get("fundamentals_as_of") is None
+        or before.get(ticker, {}).get("latest_news") is None
+    ]
+    refresh_result = {"providers": {}, "warnings": []}
+    if refresh_tickers:
+        refresh_result = refresh_security_evidence(refresh_tickers, news_lookback_days=90)
+    rows = {row["ticker"]: row for row in security_research(tickers)}
+    raw = database.security_data(tickers, price_limit=10) if database.DATABASE_URL else {"news": []}
+    news_by_ticker: dict[str, list[dict[str, Any]]] = {}
+    for item in raw.get("news", []):
+        news_by_ticker.setdefault(str(item.get("ticker", "")).upper(), []).append(item)
+    tools: list[dict[str, Any]] = []
+    evidence: list[dict[str, Any]] = []
+    for ticker in tickers:
+        row = rows.get(ticker, {})
+        articles = news_by_ticker.get(ticker, [])[:12]
+        article_summaries = [{
+            "title": item.get("title"), "published_at": item.get("published_at"), "source_url": item.get("source_url"),
+            "source": (item.get("metadata") or {}).get("source"), "summary": (item.get("metadata") or {}).get("summary"),
+        } for item in articles]
+        missing = [label for key, label in (
+            ("price", "current price history"), ("fundamentals_as_of", "recent fundamentals"),
+        ) if row.get(key) is None]
+        if not articles:
+            missing.append("recent company news")
+        warnings = [*refresh_result.get("warnings", [])]
+        if missing:
+            warnings.append(f"Missing: {', '.join(missing)}.")
+        tool = {
+            "tool_name": "company_research_refresh", "status": "partial" if warnings else "complete", "title": f"{ticker} company evidence", "ticker": ticker,
+            "input_summary": {"news_lookback_days": 90, "refresh_performed": ticker in refresh_tickers},
+            "summary": {
+                "company": row.get("company") or ticker, "price": row.get("price"), "price_as_of": row.get("price_as_of"),
+                "fundamentals_as_of": row.get("fundamentals_as_of"), "revenue_growth": row.get("revenue_growth"),
+                "net_margin": row.get("net_margin"), "valuation": row.get("valuation_evidence") or {},
+                "market_statistics": row.get("market_statistics") or {}, "component_coverage": row.get("component_coverage") or {},
+                "news": {"article_count": len(articles), "articles": article_summaries},
+                "warnings": warnings, "model_version": "company-chat-research-v1",
+            },
+        }
+        tools.append(tool)
+        evidence.append({
+            "label": f"{ticker} refreshed company research", "as_of": row.get("price_as_of") or row.get("fundamentals_as_of"),
+            "url": row.get("fundamental_statistics", {}).get("source") or row.get("source"),
+            "data": {key: row.get(key) for key in (
+                "ticker", "company", "sector", "industry", "price", "price_as_of", "fundamentals_as_of", "revenue_growth",
+                "net_margin", "valuation_evidence", "market_statistics", "fundamental_statistics", "news_sentiment",
+                "component_coverage", "risk_flags", "data_quality",
+            )} | {"refresh_warnings": warnings},
+        })
+        for article in article_summaries[:8]:
+            evidence.append({
+                "label": f"{ticker} news: {article.get('title') or 'Untitled article'}", "as_of": article.get("published_at"),
+                "url": article.get("source_url"), "data": {"ticker": ticker, **article},
+            })
+    result = (tools, evidence)
+    _CHAT_RESEARCH_CACHE.put(cache_key, result, ttl_seconds=120)
+    return result
+
+
+def _simulation_scenario_from_question(question: str) -> dict[str, Any]:
+    lowered = question.lower()
+    if "recession" in lowered or "market falls" in lowered or "market fell" in lowered:
+        economic = "recession"
+    elif "slowdown" in lowered:
+        economic = "slowdown"
+    elif "expansion" in lowered:
+        economic = "expansion"
+    else:
+        economic = "unconditioned"
+    if "accelerating inflation" in lowered or "higher inflation" in lowered or "inflation rises" in lowered:
+        inflation = "accelerating"
+    elif "cooling inflation" in lowered or "lower inflation" in lowered:
+        inflation = "cooling"
+    else:
+        inflation = "unconditioned"
+    if "rate hike" in lowered or "higher rates" in lowered or "tightening" in lowered:
+        rates = "tightening"
+    elif "rate cut" in lowered or "lower rates" in lowered or "easing" in lowered:
+        rates = "easing"
+    else:
+        rates = "unconditioned"
+    shocks = [shock for shock in ("oil", "credit", "geopolitical") if shock in lowered]
+    return {"economic_state": economic, "inflation_state": inflation, "rate_state": rates, "shocks": shocks}
+
+
+def _portfolio_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Route portfolio questions to a small allowlist of deterministic, read-only tools."""
+    lowered = question.lower()
+    tool_results: list[dict[str, Any]] = []
+    tool_evidence: list[dict[str, Any]] = []
+    simulation_requested = any(term in lowered for term in (
+        "simulate", "simulation", "what if", "stress test", "market falls", "market fell",
+        "drawdown scenario", "recession scenario", "oil shock", "credit shock",
+    ))
+    if simulation_requested:
+        portfolios = database.list_portfolios(user_id)
+        if not portfolios or not portfolios[0].get("holdings"):
+            tool_results.append({
+                "tool_name": "portfolio_decision_lab", "status": "failed", "title": "Portfolio simulation",
+                "error": "Save at least one supported holding before running a portfolio simulation.",
+            })
+        else:
+            portfolio = portfolios[0]
+            try:
+                simulation_input = SimulationRunInput.model_validate({
+                    "portfolio_id": portfolio.get("id"),
+                    "holdings": portfolio["holdings"],
+                    "profile": database.load_profile(user_id) or {},
+                    "goals": database.list_goals(user_id),
+                    "scenario": _simulation_scenario_from_question(question),
+                    "paths": 1000,
+                    "seed": 90210,
+                })
+                result = run_simulation(simulation_input)
+                if re.search(r"\b\d{1,2}\s*%", question):
+                    result.setdefault("warnings", []).append(
+                        "The engine conditions on historical states; it does not impose the question's exact percentage as an instantaneous market shock."
+                    )
+                database.save_simulation_run(user_id, result)
+                strategies = [{
+                    "key": item["strategy_key"], "label": item.get("label") or item["strategy_key"].replace("_", " ").title(),
+                    "median_wealth": item["wealth_percentiles"]["p50"],
+                    "probability_of_loss": item["probability_of_loss"],
+                    "modeled_drawdown": item["drawdown_percentiles"]["p10"],
+                    "robustness": item["robustness"],
+                } for item in result["outcomes"]]
+                tool_result = {
+                    "tool_name": "portfolio_decision_lab", "status": "complete", "title": "Portfolio simulation",
+                    "run_id": result["id"],
+                    "input_summary": {"paths": simulation_input.paths, "horizon_years": simulation_input.horizon_years or simulation_input.profile.horizon_years, "scenario": simulation_input.scenario.model_dump()},
+                    "summary": {"strategies": strategies, "warnings": result.get("warnings", []), "model_version": result["model_version"]},
+                }
+                tool_results.append(tool_result)
+                tool_evidence.append({
+                    "label": "Portfolio Decision Lab tool result", "as_of": result["created_at"], "url": None,
+                    "data": {"run_id": result["id"], "input": tool_result["input_summary"], "outcomes": strategies, "warnings": result.get("warnings", []), "assumptions": result.get("assumptions", []), "lineage": result.get("lineage", [])},
+                })
+            except Exception as exc:
+                tool_results.append({
+                    "tool_name": "portfolio_decision_lab", "status": "failed", "title": "Portfolio simulation",
+                    "error": str(exc),
+                })
+    if any(term in lowered for term in ("rebalance", "alternative", "optimizer", "allocation", "concentration", "risk")):
+        analysis = database.latest_analysis(user_id)
+        if analysis:
+            tool_results.append({
+                "tool_name": "latest_portfolio_analysis", "status": "complete",
+                "title": "Latest portfolio analysis", "run_id": analysis.get("id"),
+            })
+    if any(term in lowered for term in ("stock", "holding", "research", "evidence", "replacement", "strongest", "weakest")):
+        tool_results.append({"tool_name": "security_research", "status": "complete", "title": "Stored security research"})
+    return tool_results, tool_evidence
+
+
+def _conversation_summary(messages: list[dict[str, Any]], previous: str = "") -> str:
+    """Create compact deterministic memory without asking the LLM to invent context."""
+    user_topics = [
+        " ".join(str(item.get("content", "")).split())[:220]
+        for item in messages if item.get("role") == "user" and item.get("content")
+    ][-8:]
+    tools: list[str] = []
+    for item in messages[-20:]:
+        structured = item.get("structured_content") or {}
+        for result in structured.get("tool_results", []) if isinstance(structured, dict) else []:
+            label = str(result.get("title") or result.get("tool_name") or "tool result")
+            identifier = result.get("run_id") or result.get("ticker")
+            tools.append(f"{label}{f' ({identifier})' if identifier else ''}")
+    sections = []
+    if previous:
+        sections.append(f"Earlier context: {previous[:1400]}")
+    if user_topics:
+        sections.append("User topics: " + " | ".join(user_topics))
+    if tools:
+        sections.append("Validated tools used: " + ", ".join(dict.fromkeys(tools[-10:])))
+    return "\n".join(sections)[-4000:]
+
+
+def _persist_chat_tool_links(user_id: str, conversation_id: str, message_id: str,
+                             tool_results: list[dict[str, Any]]) -> None:
+    for result in tool_results:
+        tool_name = result.get("tool_name")
+        artifact_type: str | None = None
+        artifact_id: str | None = None
+        if tool_name == "portfolio_decision_lab" and result.get("run_id"):
+            artifact_type, artifact_id = "simulation_run", str(result["run_id"])
+        elif tool_name == "latest_portfolio_analysis" and result.get("run_id"):
+            artifact_type, artifact_id = "analysis_run", str(result["run_id"])
+        elif tool_name == "company_research_refresh" and result.get("ticker"):
+            as_of = (result.get("summary") or {}).get("price_as_of") or "latest"
+            artifact_type, artifact_id = "research_snapshot", f"{result['ticker']}:{as_of}"
+        if artifact_type and artifact_id:
+            database.link_conversation_artifact(
+                user_id, conversation_id, artifact_type, artifact_id,
+                str(result.get("title") or tool_name), message_id=message_id,
+                metadata={"tool_name": tool_name, "status": result.get("status")},
+            )
 
 
 @app.post("/api/chat/messages")
@@ -1104,18 +1588,65 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
     conversation_id = payload.conversation_id
     if conversation_id is None:
         portfolio = (database.list_portfolios(user.id) or [{}])[0]
-        created = database.create_conversation(user.id, payload.question[:72], portfolio.get("id"))
+        workspace = payload.workspace if payload.workspace in {"research", "portfolio"} else "research"
+        created = database.create_conversation(user.id, payload.question[:72], portfolio.get("id"), workspace)
         conversation_id = created["id"]
-    history = database.conversation_messages(user.id, conversation_id)
-    database.save_chat_message(user.id, conversation_id, "user", payload.question)
-    evidence = retrieve_evidence(user.id, payload.question)
     try:
-        answer, model = ask_gemini(payload.question, evidence, history)
+        conversation_meta = database.get_conversation(user.id, conversation_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Conversation not found") from exc
+    if payload.workspace in {"research", "portfolio"} and conversation_meta.get("workspace") != payload.workspace:
+        raise HTTPException(409, "This conversation belongs to a different workspace")
+    history = database.conversation_messages(user.id, conversation_id)
+    if not history and str(conversation_meta.get("title", "")).lower().startswith("new conversation"):
+        conversation_meta = database.rename_conversation(user.id, conversation_id, payload.question[:72])
+    database.save_chat_message(user.id, conversation_id, "user", payload.question)
+    evidence_future = _CHAT_TOOL_EXECUTOR.submit(retrieve_evidence, user.id, payload.question)
+    company_future = _CHAT_TOOL_EXECUTOR.submit(_company_research_chat_tools, payload.question)
+    portfolio_future = (
+        _CHAT_TOOL_EXECUTOR.submit(_portfolio_chat_tools, user.id, payload.question)
+        if payload.workspace == "portfolio" else None
+    )
+    tool_results: list[dict[str, Any]] = []
+    try:
+        evidence = evidence_future.result(timeout=12)
+    except (FuturesTimeoutError, Exception) as exc:
+        evidence = []
+        tool_results.append({"tool_name": "stored_evidence", "status": "failed", "title": "Stored evidence", "error": f"Evidence lookup did not complete quickly: {type(exc).__name__}"})
+    try:
+        company_tools, company_evidence = company_future.result(timeout=18)
+        tool_results.extend(company_tools)
+        evidence = company_evidence + evidence
+    except (FuturesTimeoutError, Exception) as exc:
+        tool_results.append({"tool_name": "company_research_refresh", "status": "failed", "title": "Company evidence", "error": f"Provider refresh timed out; the answer uses other available evidence ({type(exc).__name__})."})
+    if portfolio_future is not None:
+        try:
+            portfolio_tools, tool_evidence = portfolio_future.result(timeout=18)
+            tool_results.extend(portfolio_tools)
+            evidence.extend(tool_evidence)
+        except (FuturesTimeoutError, Exception) as exc:
+            tool_results.append({"tool_name": "portfolio_tools", "status": "failed", "title": "Portfolio calculation", "error": f"Calculation timed out; no result was invented ({type(exc).__name__})."})
+    # Keep the grounded prompt bounded even when several securities each have
+    # multiple articles. On-demand company evidence is ordered first so the
+    # tool the user explicitly requested cannot be crowded out by older context.
+    evidence = evidence[:36]
+    try:
+        answer, model = ask_gemini(payload.question, evidence, history, conversation_meta.get("summary") or "")
     except RuntimeError as exc:
         raise HTTPException(502, str(exc)) from exc
     sources = [{"id": f"S{index + 1}", "label": item["label"], "url": item.get("url"), "as_of": item.get("as_of")} for index, item in enumerate(evidence)]
-    message = database.save_chat_message(user.id, conversation_id, "assistant", answer, {"sources": sources}, model)
-    return {"conversation_id": conversation_id, "message": message, "sources": sources}
+    structured_content = {"sources": sources, "tool_results": tool_results}
+    message = database.save_chat_message(user.id, conversation_id, "assistant", answer, structured_content, model)
+    _persist_chat_tool_links(user.id, conversation_id, message["id"], tool_results)
+    updated_history = [*history, {"role": "user", "content": payload.question}, message]
+    summarized_count = int(conversation_meta.get("summary_message_count") or 0)
+    if len(updated_history) >= 12 and len(updated_history) - summarized_count >= 8:
+        database.update_conversation_summary(
+            user.id, conversation_id,
+            _conversation_summary(updated_history, conversation_meta.get("summary") or ""),
+            len(updated_history),
+        )
+    return {"conversation_id": conversation_id, "message": message, "sources": sources, "tool_results": tool_results}
 
 
 @app.post("/api/dashboard/drafts", status_code=202)
@@ -1214,7 +1745,14 @@ def save_dashboard_draft(job_id: str, payload: SaveViewRequest,
         job = database.get_dashboard_job(job_id, user.id)
         if job["state"] not in {"COMPLETE", "PARTIAL_SUCCESS"}:
             raise HTTPException(409, "Dashboard draft must finish before it can be saved")
-        return database.save_dashboard_view(user.id, job_id, payload.name, payload.layout)
+        saved = database.save_dashboard_view(user.id, job_id, payload.name, payload.layout)
+        if job.get("conversation_id"):
+            database.link_conversation_artifact(
+                user.id, job["conversation_id"], "dashboard_view", saved["id"],
+                saved.get("name") or "Saved research board",
+                metadata={"job_id": job_id},
+            )
+        return saved
     except KeyError as exc:
         raise HTTPException(404, "Dashboard draft not found") from exc
     except ValueError as exc:

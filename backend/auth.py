@@ -70,3 +70,10 @@ def require_user(authorization: str | None = Header(default=None)) -> Authentica
     if not payload or not payload.get("id"):
         raise HTTPException(status_code=401, detail="Your session is invalid")
     return AuthenticatedUser(id=str(payload["id"]), email=payload.get("email"))
+
+
+def optional_user(authorization: str | None = Header(default=None)) -> AuthenticatedUser | None:
+    """Return no user for public endpoints, but fully validate any supplied session."""
+    if not authorization:
+        return None
+    return require_user(authorization)

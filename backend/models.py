@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -76,6 +76,7 @@ class InvestorProfile(BaseModel):
     account_type: AccountType = "taxable"
     annual_contribution: float = Field(default=12000, ge=0)
     annual_withdrawal: float = Field(default=0, ge=0)
+    inflation_rate: float = Field(default=.025, ge=0, le=.25)
     target_value: float = Field(default=1_000_000, ge=0)
     tax_rate: float = Field(default=0.20, ge=0, le=0.60)
     risk_tolerance: int = Field(default=6, ge=1, le=10)
@@ -240,3 +241,173 @@ class ExplanationRequest(BaseModel):
     provider: Literal["disabled", "ollama", "openai_compatible"] = "disabled"
     endpoint: str | None = None
     model: str | None = None
+
+
+EconomicState = Literal["unconditioned", "expansion", "slowdown", "recession"]
+InflationState = Literal["unconditioned", "cooling", "stable", "accelerating"]
+RateState = Literal["unconditioned", "easing", "stable", "tightening"]
+
+
+class SimulationScenario(BaseModel):
+    economic_state: EconomicState = "unconditioned"
+    inflation_state: InflationState = "unconditioned"
+    rate_state: RateState = "unconditioned"
+    shocks: list[Literal["oil", "credit", "geopolitical"]] = Field(default_factory=list)
+
+
+class SimulationStrategy(BaseModel):
+    key: str = Field(min_length=1, max_length=80)
+    label: str = Field(min_length=1, max_length=120)
+    weights: dict[str, float]
+    transition_months: int = Field(default=0, ge=0, le=120)
+    contribution_weights: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_weights(self) -> "SimulationStrategy":
+        if not self.weights or any(value < 0 or value > 1 for value in self.weights.values()):
+            raise ValueError("Strategy weights must be decimal values between 0 and 1")
+        total = sum(self.weights.values())
+        if total <= 0:
+            raise ValueError("Strategy weights must have a positive total")
+        self.weights = {ticker.upper(): value / total for ticker, value in self.weights.items()}
+        if self.contribution_weights:
+            contribution_total = sum(self.contribution_weights.values())
+            if contribution_total > 0:
+                self.contribution_weights = {
+                    ticker.upper(): value / contribution_total
+                    for ticker, value in self.contribution_weights.items()
+                }
+        return self
+
+
+class SimulationRunInput(BaseModel):
+    portfolio_id: str | int | None = None
+    holdings: list[Holding] = Field(min_length=1, max_length=500)
+    profile: InvestorProfile = Field(default_factory=InvestorProfile)
+    goals: list[FinancialGoal] = Field(default_factory=list, max_length=25)
+    scenario: SimulationScenario = Field(default_factory=SimulationScenario)
+    strategies: list[SimulationStrategy] = Field(default_factory=list, max_length=12)
+    horizon_years: int | None = Field(default=None, ge=1, le=60)
+    paths: int = Field(default=5000, ge=250, le=10000)
+    block_months: int = Field(default=6, ge=1, le=24)
+    seed: int = Field(default=90210, ge=0, le=2_147_483_647)
+
+
+class ETFAllocationRequest(BaseModel):
+    candidate_tickers: list[str] = Field(default_factory=list, max_length=100)
+    current_holdings: list[Holding] = Field(default_factory=list, max_length=500)
+    objective: Literal["balanced", "lower_downside", "income", "growth", "lowest_cost"] = "balanced"
+    time_horizon_years: int = Field(default=15, ge=1, le=60)
+    risk_tolerance: int = Field(default=6, ge=1, le=10)
+    loss_capacity: int = Field(default=6, ge=1, le=10)
+    income_stability: Literal["unstable", "variable", "stable"] = "stable"
+    initial_investment: float = Field(default=10_000, ge=0)
+    annual_contribution: float = Field(default=0, ge=0)
+    annual_withdrawal: float = Field(default=0, ge=0)
+    account_type: AccountType = "taxable"
+    tax_rate: float = Field(default=.20, ge=0, le=.60)
+    required_asset_classes: list[str] = Field(default_factory=list)
+    themes: list[str] = Field(default_factory=list)
+    max_expense_ratio: float = Field(default=.01, ge=0, le=.10)
+    minimum_history_years: float = Field(default=3, ge=0, le=30)
+    minimum_liquidity: float = Field(default=0, ge=0)
+    max_fund_weight: float = Field(default=.40, ge=.01, le=1)
+    max_issuer_weight: float = Field(default=.60, ge=.01, le=1)
+    excluded_tickers: list[str] = Field(default_factory=list)
+    excluded_sectors: list[str] = Field(default_factory=list)
+
+
+class StockBasketRequest(BaseModel):
+    candidate_tickers: list[str] = Field(min_length=1, max_length=100)
+    current_holdings: list[Holding] = Field(default_factory=list, max_length=500)
+    benchmark: str = Field(default="SPY", min_length=1, max_length=10)
+    objective: Literal[
+        "diversification", "lower_downside", "quality_growth", "value", "income",
+        "macro_resilience", "custom",
+    ] = "diversification"
+    factor_weights: dict[str, float] = Field(default_factory=dict)
+    max_security_weight: float = Field(default=.20, ge=.01, le=1)
+    max_sector_weight: float = Field(default=.40, ge=.01, le=1)
+    max_industry_weight: float = Field(default=.30, ge=.01, le=1)
+    minimum_history_years: float = Field(default=3, ge=0, le=30)
+    minimum_data_quality: Literal["low", "medium", "high"] = "medium"
+    excluded_tickers: list[str] = Field(default_factory=list)
+    tax_rate: float = Field(default=.20, ge=0, le=.60)
+    turnover_limit: float = Field(default=1, ge=0, le=1)
+
+
+class ETFAllocationResult(BaseModel):
+    id: str | None = None
+    builder_type: Literal["etf"] = "etf"
+    model_version: str
+    objective: str
+    universe: dict[str, Any]
+    allocations: list[dict[str, Any]]
+    portfolio_metrics: dict[str, Any]
+    benchmarks: list[dict[str, Any]] = Field(default_factory=list)
+    overlap: list[dict[str, Any]] = Field(default_factory=list)
+    constraints: dict[str, Any]
+    lineage: list[dict[str, Any]] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class StockBasketResult(BaseModel):
+    id: str | None = None
+    builder_type: Literal["stock"] = "stock"
+    model_version: str
+    objective: str
+    universe: dict[str, Any]
+    allocations: list[dict[str, Any]]
+    portfolio_metrics: dict[str, Any]
+    benchmarks: list[dict[str, Any]] = Field(default_factory=list)
+    constraints: dict[str, Any]
+    lineage: list[dict[str, Any]] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class SecurityResearchSnapshot(BaseModel):
+    ticker: str
+    as_of: datetime
+    market: dict[str, Any] = Field(default_factory=dict)
+    fundamentals: dict[str, Any] = Field(default_factory=dict)
+    valuation: dict[str, Any] = Field(default_factory=dict)
+    technicals: dict[str, Any] = Field(default_factory=dict)
+    sentiment: dict[str, Any] = Field(default_factory=dict)
+    conclusions: dict[str, str] = Field(default_factory=dict)
+    lineage: list[dict[str, Any]] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    calculation_version: str
+
+
+class SimulationOutcome(BaseModel):
+    strategy_key: str
+    wealth_percentiles: dict[str, float]
+    real_wealth_percentiles: dict[str, float]
+    probability_of_loss: float
+    drawdown_percentiles: dict[str, float]
+    recovery_months: dict[str, float | None]
+    goal_results: list[dict[str, Any]] = Field(default_factory=list)
+    turnover: float
+    estimated_taxes: float | None = None
+    estimated_fees: float
+    concentration: dict[str, float]
+    scenario_summary: dict[str, Any]
+    regret: float
+    robustness: str
+    representative_paths: list[list[float]] = Field(default_factory=list)
+    histograms: dict[str, dict[str, list[float | int]]] = Field(default_factory=dict)
+
+
+class SimulationRun(BaseModel):
+    id: str
+    input: SimulationRunInput
+    outcomes: list[SimulationOutcome]
+    shared_path_fingerprint: str
+    model_version: str
+    created_at: datetime
+    lineage: list[dict[str, Any]]
+    assumptions: list[str]
+    warnings: list[str]

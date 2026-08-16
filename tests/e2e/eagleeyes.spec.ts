@@ -86,6 +86,22 @@ test("legacy routes canonicalize without losing the requested subview", async ({
   }
 });
 
+test("Learn saves, masters, and resumes a versioned lesson", async ({ page }) => {
+  await installApiMock(page);
+  await signIn(page);
+  await page.goto("/learn");
+  await expect(page.getByRole("heading", { name: "Learn", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /^Continue: Why save and invest/ }).click();
+  await expect(page).toHaveURL(/\/learn\/start-safely\/why-invest/);
+  await page.getByRole("button", { name: "Mark lesson complete" }).click();
+  await page.getByText("Which money belongs in savings?").locator("..").getByText("Emergency money").click();
+  await page.getByText("What is compounding?").locator("..").getByText("Earlier growth can earn later growth").click();
+  await page.getByRole("button", { name: "Submit knowledge check" }).click();
+  await expect(page.getByText("Mastery score reached")).toBeVisible();
+  await page.getByRole("button", { name: "← Learning hub" }).click();
+  await expect(page.getByText("1/1 mastered")).toBeVisible();
+});
+
 test("manual terminal adds, resizes, moves, saves, reopens, and resets", async ({ page }) => {
   await installApiMock(page);
   await signIn(page);
@@ -158,6 +174,46 @@ test("stale fallback and no-portfolio mode remain useful", async ({ page }) => {
   await page.goto("/research?view=stocks");
   await expect(page.getByText("Browser fixture universe")).toBeVisible();
   await expect(page.getByText("Apple Inc.")).toBeVisible();
+});
+
+test("ETF Builder produces disclosed ranges, costs, and a benchmark", async ({ page }) => {
+  await installApiMock(page);
+  await signIn(page);
+  await page.goto("/research?view=etf-builder");
+  await page.getByRole("button", { name: "Build ETF allocation" }).click();
+  await expect(page.getByRole("heading", { name: "ETF research allocation" })).toBeVisible();
+  await expect(page.getByText("Vanguard Total Stock Market ETF")).toBeVisible();
+  await expect(page.getByText("55.0%–60.0%")).toBeVisible();
+  await expect(page.getByText("Estimated first-year expenses")).toBeVisible();
+  await expect(page.getByText("Equal weight")).toBeVisible();
+  await page.getByRole("button", { name: "Send to Decision Lab" }).click();
+  await expect(page.getByText("Paired paths browser-shared-paths")).toBeVisible();
+  await expect(page.getByText("today’s dollars", { exact: false }).first()).toBeVisible();
+});
+
+test("Stock Basket Builder discloses its universe, risk contribution, and benchmark", async ({ page }) => {
+  await installApiMock(page);
+  await signIn(page);
+  await page.goto("/research?view=stock-builder");
+  await page.getByRole("button", { name: "Build stock basket" }).click();
+  await expect(page.getByRole("heading", { name: "Stock research allocation" })).toBeVisible();
+  await expect(page.getByText("2 eligible of 5 requested", { exact: false })).toBeVisible();
+  await expect(page.getByText("Risk contribution")).toBeVisible();
+  await expect(page.getByText("SPY", { exact: true })).toBeVisible();
+  await expect(page.locator(".builder-allocation-table")).not.toContainText(/\b(BUY|HOLD|SELL)\b/);
+  await page.getByRole("button", { name: "Send to Decision Lab" }).click();
+  await expect(page.getByText("Paired paths browser-shared-paths")).toBeVisible();
+});
+
+test("Decision Lab compares six choices on one paired path set", async ({ page }) => {
+  await installApiMock(page);
+  await signIn(page);
+  await page.goto("/portfolio?view=analysis");
+  await page.getByRole("button", { name: "Run Decision Lab" }).click();
+  await expect(page.getByText("Paired paths browser-shared-paths")).toBeVisible();
+  await expect(page.getByText("Today’s dollars", { exact: false }).first()).toBeVisible();
+  await expect(page.locator(".decision-frontier-table").locator("> div")).toHaveCount(7);
+  await expect(page.getByText("decision-lab-block-bootstrap-v1.0.0")).toBeVisible();
 });
 
 test("presentation levels transform the same stored widget result", async ({ page }) => {

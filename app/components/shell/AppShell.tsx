@@ -3,10 +3,11 @@
 import type { ReactNode } from "react";
 import { NAV_ITEMS, type Tab } from "../../lib/routes";
 import { PRESENTATION_LEVELS, presentationCopy, type PresentationLevel } from "../../lib/presentation-level";
+import { ConceptGlossary } from "../learn/ConceptGlossary";
 
 export function AppShell({
   activeTab, density, connected, dark, email, freshness, presentationLevel, children,
-  onNavigate, onPresentationLevel, onToggleTheme, onSignOut, topAction, drawer, status, notice, onDismissNotice,
+  onNavigate, onPresentationLevel, onToggleTheme, onSignOut, onLearnConcept, topAction, drawer, status, notice, onDismissNotice,
 }: {
   activeTab: Tab;
   density: "compact" | "comfortable";
@@ -20,6 +21,7 @@ export function AppShell({
   onPresentationLevel: (level: PresentationLevel) => void;
   onToggleTheme: () => void;
   onSignOut: () => void;
+  onLearnConcept: (module: string, lesson: string) => void;
   topAction: ReactNode;
   drawer?: ReactNode;
   status?: string;
@@ -34,6 +36,7 @@ export function AppShell({
       </nav>
       <div className="sidebar-foot">
         <div className={`connection ${connected ? "online" : ""}`}><i />{connected ? "Research engine connected" : "Research engine offline"}</div>
+        <ConceptGlossary onOpen={onLearnConcept} />
         <button className="theme-button" onClick={onToggleTheme}>{dark ? "☀" : "◐"} {dark ? "Light mode" : "Dark mode"}</button>
         <button className="theme-button" onClick={onSignOut}>↪ Sign out</button>
         <small className="signed-in-email">{email}</small>

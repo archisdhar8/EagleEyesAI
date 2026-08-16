@@ -1,4 +1,5 @@
 node_modules/
+.DS_Store
 .venv/
 .next/
 .vinext/
@@ -12,6 +13,7 @@ __pycache__/
 test-results/
 playwright-report/
 .playwright/
+FinLearnAI/
 .env
 .env.*
 !.env.example

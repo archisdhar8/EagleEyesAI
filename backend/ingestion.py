@@ -949,12 +949,12 @@ def refresh_fred() -> int:
     return len(values)
 
 
-def refresh_news(tickers: Iterable[str] | None = None) -> int:
+def refresh_news(tickers: Iterable[str] | None = None, lookback_days: int = 7) -> int:
     api_key = os.getenv("POLYGON_API_KEY")
     if not api_key:
         raise RuntimeError("POLYGON_API_KEY is required")
     rows: list[dict[str, Any]] = []
-    since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    since = (datetime.now(timezone.utc) - timedelta(days=max(1, min(int(lookback_days), 180)))).isoformat()
     session = requests.Session()
     selected = sorted({
         str(ticker).strip().upper() for ticker in (tickers or active_tickers())
@@ -1068,7 +1068,7 @@ def refresh_sec(tickers: Iterable[str] | None = None) -> int:
     return upsert_sec_periods(pd.concat(frames, ignore_index=True)) if frames else 0
 
 
-def refresh_security_evidence(tickers: Iterable[str]) -> dict[str, Any]:
+def refresh_security_evidence(tickers: Iterable[str], news_lookback_days: int = 7) -> dict[str, Any]:
     """Fetch durable evidence for newly selected securities without blocking saves.
 
     Each provider is isolated so partial outages are reported as coverage warnings
@@ -1097,7 +1097,7 @@ def refresh_security_evidence(tickers: Iterable[str]) -> dict[str, Any]:
     else:
         warnings.append("No Tiingo or Polygon key is configured for automatic price history.")
     if os.getenv("POLYGON_API_KEY"):
-        operations.append(("polygon_news", lambda: refresh_news(selected)))
+        operations.append(("polygon_news", lambda: refresh_news(selected) if news_lookback_days == 7 else refresh_news(selected, news_lookback_days)))
     else:
         warnings.append("Polygon news refresh is not configured.")
     if os.getenv("SEC_USER_AGENT"):

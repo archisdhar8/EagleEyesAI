@@ -1,6 +1,6 @@
-export type Tab = "today" | "plan" | "portfolio" | "explore" | "ask" | "advanced";
-export type ExploreView = "stocks" | "etfs" | "sectors" | "themes" | "macro" | "scenarios" | "prediction-markets" | "compare" | "watchlist";
-export type PortfolioView = "holdings" | "analysis";
+export type Tab = "today" | "plan" | "portfolio" | "explore" | "learn" | "ask" | "advanced";
+export type ExploreView = "stocks" | "etfs" | "etf-builder" | "stock-builder" | "sectors" | "themes" | "macro" | "scenarios" | "prediction-markets" | "compare" | "watchlist";
+export type PortfolioView = "holdings" | "analysis" | "lab";
 export type AdvancedView = "terminal" | "diagnostics" | "validation" | "lineage" | "providers";
 
 export type RouteState = {
@@ -8,6 +8,8 @@ export type RouteState = {
   exploreView?: ExploreView;
   portfolioView?: PortfolioView;
   advancedView?: AdvancedView;
+  learningModule?: string;
+  learningLesson?: string;
   canonicalPath: string;
 };
 
@@ -16,6 +18,7 @@ export const NAV_ITEMS: ReadonlyArray<readonly [Tab, string, string]> = [
   ["plan", "◌", "Plan"],
   ["portfolio", "◫", "Portfolio"],
   ["explore", "◎", "Research"],
+  ["learn", "◇", "Learn"],
   ["ask", "✦", "Ask EagleEyes"],
   ["advanced", "▦", "Advanced"],
 ];
@@ -30,6 +33,7 @@ const ROUTES: Record<string, Omit<RouteState, "canonicalPath"> & { canonicalPath
   "/optimize": { tab: "portfolio", portfolioView: "analysis", canonicalPath: "/portfolio?view=analysis" },
   "/explore": { tab: "explore", canonicalPath: "/research" },
   "/research": { tab: "explore", exploreView: "stocks" },
+  "/learn": { tab: "learn" },
   "/scenarios": { tab: "explore", exploreView: "scenarios", canonicalPath: "/research?view=scenarios" },
   "/ask": { tab: "ask" },
   "/ai-workspace": { tab: "ask", canonicalPath: "/ask" },
@@ -42,15 +46,24 @@ function oneOf<T extends string>(value: string | null, allowed: readonly T[]): T
 }
 
 export function resolveAppRoute(pathname: string, search = ""): RouteState | null {
+  const lessonRoute = pathname.match(/^\/learn\/([a-z0-9-]+)\/([a-z0-9-]+)\/?$/i);
+  if (lessonRoute) {
+    return {
+      tab: "learn",
+      learningModule: lessonRoute[1],
+      learningLesson: lessonRoute[2],
+      canonicalPath: pathname,
+    };
+  }
   const definition = ROUTES[pathname];
   if (!definition) return null;
   const requestedView = new URLSearchParams(search).get("view");
   const normalizedExploreView = requestedView === "securities" ? "stocks" : requestedView === "comparisons" ? "compare" : requestedView;
   const exploreView = definition.tab === "explore"
-    ? oneOf(normalizedExploreView, ["stocks", "etfs", "sectors", "themes", "macro", "scenarios", "prediction-markets", "compare", "watchlist"] as const) || definition.exploreView || "stocks"
+    ? oneOf(normalizedExploreView, ["stocks", "etfs", "etf-builder", "stock-builder", "sectors", "themes", "macro", "scenarios", "prediction-markets", "compare", "watchlist"] as const) || definition.exploreView || "stocks"
     : undefined;
   const portfolioView = definition.tab === "portfolio"
-    ? oneOf(requestedView, ["holdings", "analysis"] as const) || definition.portfolioView
+    ? oneOf(requestedView, ["holdings", "analysis", "lab"] as const) || definition.portfolioView
     : undefined;
   const advancedView = definition.tab === "advanced"
     ? oneOf(requestedView, ["terminal", "diagnostics", "validation", "lineage", "providers"] as const) || definition.advancedView
@@ -60,6 +73,8 @@ export function resolveAppRoute(pathname: string, search = ""): RouteState | nul
     exploreView,
     portfolioView,
     advancedView,
+    learningModule: undefined,
+    learningLesson: undefined,
     canonicalPath: definition.canonicalPath || `${pathname}${search}`,
   };
 }

@@ -30,6 +30,20 @@ const research = [
   { ticker: "SPY", company: "SPDR S&P 500 ETF", sector: "Broad Market", industry: "ETF", final_score: 69, growth_rating: 61, valuation_score: 65, fundamental_score: 70, industry_score: 73, technical_score: 69, news_score: 50, confidence: 92, data_quality: "high", risk_flags: [], price: 650, price_change_1y: .11, price_as_of: now, fundamentals_as_of: now, revenue_growth: null, net_margin: null, news_count: 0, data_source: "fixture" },
 ];
 
+const learnLesson = {
+  id: "why-invest", module_id: "start-safely", title: "Why save and invest?", estimated_minutes: 8,
+  concept_ids: ["saving", "investing", "compounding", "inflation"], source_refs: ["investor-gov"],
+  lab_ids: ["compound-growth", "inflation"], eagleeyes_links: [{ label: "Open Plan assumptions", route: "/plan" }],
+  content_version: "2026.08.1", content: "# Why save and invest?\n\n## The central idea\n\nSaving protects money needed soon. Investing accepts uncertainty for longer-term growth.",
+  sources: [{ id: "investor-gov", title: "Saving and Investing", publisher: "SEC Investor.gov", url: "https://www.investor.gov/" }],
+  quiz: { id: "why-invest-v1", version: "1", questions: [{ question: "Which money belongs in savings?", options: ["Emergency money", "Thirty-year retirement money"] }, { question: "What is compounding?", options: ["Guaranteed returns", "Earlier growth can earn later growth"] }] },
+};
+const learnCatalog = {
+  version: "learn-catalog-v1", preview_lesson_id: "why-invest",
+  modules: [{ id: "start-safely", slug: "start-safely", title: "Start Investing Safely", description: "Build a financial foundation.", outcomes: ["Separate saving from investing"], prerequisites: [], lesson_ids: ["why-invest"], content_version: "2026.08.1" }, { id: "build-portfolio", slug: "build-portfolio", title: "Build a Portfolio", description: "Understand risk and diversification.", outcomes: ["Measure diversification"], prerequisites: ["start-safely"], lesson_ids: [], content_version: "2026.08.1" }, { id: "understand-markets", slug: "understand-markets", title: "Understand Markets", description: "Judge market evidence.", outcomes: ["Interpret evidence"], prerequisites: ["start-safely"], lesson_ids: [], content_version: "2026.08.1" }],
+  lessons: [{ ...learnLesson, content: undefined, sources: undefined, quiz: undefined, quiz_id: "why-invest-v1", quiz_question_count: 2 }],
+};
+
 const briefing = {
   version: "today-briefing-v2", as_of: now, evidence_state: "current",
   guidance: { level: "General Market Research", reason: "No saved holdings are used; conclusions describe general market or security evidence.", missing_context: ["saved portfolio"] },
@@ -81,7 +95,7 @@ function createState(options: { portfolio?: boolean; stale?: boolean; partial?: 
   return {
     options, holdings, terminalWidgets: structuredClone(defaultWidgets), terminalLayouts: [] as TerminalLayoutFixture[],
     views: [] as Array<ReturnType<typeof viewFromJob>>, job: makeJob("job-1", options.partial), requests: [] as Array<{ method: string; path: string; body: unknown }>,
-    authGrants: [] as string[],
+    authGrants: [] as string[], learningProgress: [] as Array<Record<string, unknown>>,
   };
 }
 
@@ -121,6 +135,13 @@ export async function installApiMock(page: Page, options: { portfolio?: boolean;
     let body: MockRequestBody = {};
     try { body = request.postDataJSON() as MockRequestBody; } catch { body = {}; }
     state.requests.push({ method, path, body });
+
+    if (path === "/learn/catalog") return json(route, { ...learnCatalog, preferences: { selected_path: null, knowledge_level: "beginner", interests: [], portfolio_context_enabled: false }, progress: state.learningProgress });
+    if (path === "/learn/lessons/why-invest") return json(route, learnLesson);
+    if (path === "/learn/labs/compound-growth/calculate" && method === "POST") return json(route, { lab_id: "compound-growth", calculation_version: "learn-labs-v1", inputs: body.inputs, result: { final_value: 105092.51, contributed: 49000, modeled_growth: 56092.51 }, assumptions: ["Constant illustrative return"], warning: "Educational illustration only; not a forecast or recommendation." });
+    if (path === "/learn/progress/why-invest" && method === "PUT") { state.learningProgress = [{ id: "progress-1", module_id: "start-safely", lesson_id: "why-invest", content_version: "2026.08.1", status: "completed", completion_percentage: 1, best_score: null, updated_at: now }]; return json(route, state.learningProgress[0]); }
+    if (path === "/learn/progress" && method === "GET") return json(route, state.learningProgress);
+    if (path === "/learn/quizzes/why-invest-v1/attempts" && method === "POST") { state.learningProgress = [{ id: "progress-1", module_id: "start-safely", lesson_id: "why-invest", content_version: "2026.08.1", status: "mastered", completion_percentage: 1, best_score: 1, updated_at: now }]; return json(route, { score: 2, total_questions: 2, percentage: 1, mastery_eligible: true, feedback: [{ correct: true, correct_index: 0, explanation: "Emergency money needs stability." }, { correct: true, correct_index: 1, explanation: "Earlier growth can earn later growth." }], progress: state.learningProgress[0] }, 201); }
 
     if (path === "/home/briefing") return json(route, {
       portfolio: state.holdings.length ? { id: "portfolio-1", name: "Browser portfolio", holdings: state.holdings } : null,
@@ -163,6 +184,27 @@ export async function installApiMock(page: Page, options: { portfolio?: boolean;
     if (path === "/research/refresh" && method === "POST") return json(route, { research, searched: research.length, markets_found: 0, warnings: [] });
     if (path === "/research" || path.startsWith("/research?")) return json(route, research);
     if (path === "/research/search") return json(route, { query: url.searchParams.get("q") || "", filters: {}, universe: { definition: "Browser fixture universe", source: "fixture", total: research.length, holdings: state.holdings.length, watchlist: 2, explicitly_requested: 0, sector_or_broad_etfs: 1, tickers: research.map(row => row.ticker) }, results: research.map((row, index) => ({ ...row, relative_rank: index + 1, evidence_bucket: index ? "Constructive evidence" : "Leading evidence", bucket_explanation: "Deterministic fixture bucket", strengths: [{ label: "Fundamentals", evidence: row.fundamental_score }], weaknesses: [{ label: "Valuation", evidence: row.valuation_score }], valuation_range: { label: "Reasonable", basis: "Fixture valuation" }, fundamental_trend: { label: "Stable", revenue_growth: row.revenue_growth, net_margin: row.net_margin }, price_behavior: { label: "Positive", one_year_change: row.price_change_1y }, catalysts: [], thesis_risks: row.risk_flags, portfolio_fit: "Review concentration", what_would_change_the_view: "Material earnings deterioration", freshness: { status: "current", price_as_of: now, fundamentals_as_of: now, coverage: "high", confidence_reasons: ["fixture"] }, disclaimer: "Research only" })), method: { name: "fixture", version: "v1", ranking_use: "ordering" }, disclaimer: "Not a recommendation" });
+    if (path === "/builders/etf/optimize" && method === "POST") return json(route, {
+      id: "etf-builder-1", builder_type: "etf", model_version: "etf-allocation-builder-v1.0.0", objective: body.objective,
+      universe: { requested: body.candidate_tickers, eligible: ["VTI", "BND"], excluded: [], count: 2 },
+      allocations: [
+        { ticker: "VTI", name: "Vanguard Total Stock Market ETF", target_range: [.55,.60], reference_weight: .575, expense_ratio: .0003, what_it_contributes: "U.S. total-market exposure." },
+        { ticker: "BND", name: "Vanguard Total Bond Market ETF", target_range: [.40,.45], reference_weight: .425, expense_ratio: .0003, what_it_contributes: "Diversified bond exposure." },
+      ], portfolio_metrics: { annual_return: .075, volatility: .11, sharpe_ratio: .42, maximum_drawdown: -.22 }, expected_expense_dollars_year_one: 3,
+      benchmarks: [{ name: "Equal weight", annual_return: .07, volatility: .105, sharpe_ratio: .38 }], overlap: [], constraints: { status: "satisfied", diagnostics: [] }, assumptions: [], warnings: [],
+    });
+    if (path === "/builders/stocks/optimize" && method === "POST") return json(route, {
+      id: "stock-builder-1", builder_type: "stock", model_version: "stock-basket-builder-v1.0.0", objective: body.objective,
+      universe: { requested: body.candidate_tickers, eligible: ["AAPL", "MSFT"], excluded: [], count: 2 },
+      allocations: [
+        { ticker: "AAPL", company: "Apple Inc.", target_range: [.45,.50], reference_weight: .475, marginal_contribution_to_risk: .52, included_because: "Eligible under the disclosed objective." },
+        { ticker: "MSFT", company: "Microsoft", target_range: [.50,.55], reference_weight: .525, marginal_contribution_to_risk: .48, included_because: "Eligible under the disclosed objective." },
+      ], portfolio_metrics: { annual_return: .12, volatility: .20, sharpe_ratio: .40, maximum_drawdown: -.30 }, benchmarks: [{ name: "SPY", annual_return: .09, volatility: .15, sharpe_ratio: .33 }], constraints: { status: "satisfied", diagnostics: [] }, assumptions: [], warnings: [],
+    });
+    if (path === "/simulations/runs" && method === "POST") return json(route, {
+      id: "simulation-1", model_version: "decision-lab-block-bootstrap-v1.0.0", shared_path_fingerprint: "browser-shared-paths", coverage: { start: "2006-01-31", end: "2026-07-31", monthly_observations: 247, symbols_simulated: ["AAPL","SPY"] },
+      outcomes: ["current","contributions_only","gradual","immediate","risk_controlled","balanced"].map((key,index)=>({ strategy_key:key, label:key.replaceAll("_"," "), wealth_percentiles:{p10:700000,p50:1200000+index*10000,p90:1900000}, real_wealth_percentiles:{p10:500000,p50:900000+index*7500,p90:1400000}, probability_of_loss:.08, drawdown_percentiles:{p10:-.32,p50:-.20,p90:-.12}, recovery_months:{median:14,unrecovered_share:.1}, goal_results:[], turnover:index*.05, estimated_taxes:index*100, estimated_fees:3000, concentration:{largest_weight:.55,effective_holdings:2}, regret:index*5000, robustness:"Moderate" })), assumptions:["5,000 reproducible block-bootstrap paths."], warnings:[],
+    });
     if (path === "/portfolios/import" && method === "POST") { state.holdings = [{ ticker: "AAPL", weight: .5, market_value: 50000, cost_basis: 40000, account_type: "taxable" }, { ticker: "SPY", weight: .5, market_value: 50000, cost_basis: 45000, account_type: "taxable" }]; return json(route, { portfolio: { id: "portfolio-imported", name: body.name, holdings: state.holdings }, validated_rows: 2, warnings: [] }); }
     if (path === "/portfolio/transactions/import" && method === "POST") return json(route, {
       valid: true, rows: [{ account_id: body.account_id, trade_date: "2025-01-02", transaction_type: "buy", ticker: "AAPL", quantity: 5, price: 100, amount: null, fee: 0 }],

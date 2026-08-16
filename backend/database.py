@@ -74,7 +74,15 @@ def sqlite_connection() -> Iterator[sqlite3.Connection]:
 def postgres_connection() -> Iterator[psycopg.Connection]:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured")
-    with psycopg.connect(DATABASE_URL, connect_timeout=15, sslmode="require", row_factory=dict_row) as conn:
+    connect_timeout = max(2, min(15, int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))))
+    statement_timeout = max(2_000, min(60_000, int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))))
+    with psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=connect_timeout,
+        sslmode="require",
+        row_factory=dict_row,
+        options=f"-c statement_timeout={statement_timeout} -c lock_timeout=5000",
+    ) as conn:
         yield conn
 
 
@@ -174,6 +182,43 @@ def initialize() -> None:
             id TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE, policy_json TEXT NOT NULL,
             status TEXT NOT NULL, approved_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         )""",
+        """CREATE TABLE IF NOT EXISTS learning_preferences (
+            user_id TEXT PRIMARY KEY, selected_path TEXT, knowledge_level TEXT NOT NULL,
+            interests_json TEXT NOT NULL, portfolio_context_enabled INTEGER NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS learning_progress (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, module_id TEXT NOT NULL, lesson_id TEXT NOT NULL,
+            content_version TEXT NOT NULL, status TEXT NOT NULL, completion_percentage REAL NOT NULL,
+            started_at TEXT, completed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(user_id,lesson_id,content_version)
+        )""",
+        """CREATE TABLE IF NOT EXISTS learning_quiz_attempts (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, module_id TEXT NOT NULL, lesson_id TEXT NOT NULL,
+            content_version TEXT NOT NULL, quiz_id TEXT NOT NULL, quiz_version TEXT NOT NULL,
+            score INTEGER NOT NULL, total_questions INTEGER NOT NULL, percentage REAL NOT NULL,
+            answers_json TEXT NOT NULL, attempted_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS learning_tutor_threads (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, lesson_id TEXT NOT NULL, title TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS learning_tutor_messages (
+            id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL,
+            content TEXT NOT NULL, source_references_json TEXT NOT NULL, retrieval_quality_json TEXT NOT NULL,
+            model_version TEXT, created_at TEXT NOT NULL,
+            FOREIGN KEY(thread_id) REFERENCES learning_tutor_threads(id) ON DELETE CASCADE
+        )""",
+        """CREATE TABLE IF NOT EXISTS simulation_runs (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, portfolio_id TEXT,
+            input_json TEXT NOT NULL, result_json TEXT NOT NULL, model_version TEXT NOT NULL,
+            seed INTEGER NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS allocation_builder_runs (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, builder_type TEXT NOT NULL,
+            request_json TEXT NOT NULL, result_json TEXT NOT NULL, model_version TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
     ]
     with sqlite_connection() as conn:
         for statement in statements:
@@ -190,13 +235,22 @@ def initialize() -> None:
             conn.execute("ALTER TABLE dashboard_views ADD COLUMN layout_version TEXT NOT NULL DEFAULT 'dashboard-layout-v1'")
         if "conversation_id" not in view_columns:
             conn.execute("ALTER TABLE dashboard_views ADD COLUMN conversation_id TEXT")
+        job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(dashboard_jobs)").fetchall()}
+        if "conversation_id" not in job_columns:
+            conn.execute("ALTER TABLE dashboard_jobs ADD COLUMN conversation_id TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS scenario_fetched_idx ON scenario_snapshots(fetched_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS analysis_created_idx ON analysis_runs(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS dashboard_jobs_user_idx ON dashboard_jobs(user_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS dashboard_views_user_idx ON dashboard_views(user_id, updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS dashboard_view_revisions_view_idx ON dashboard_view_revisions(view_id, revision_number)")
         conn.execute("CREATE INDEX IF NOT EXISTS financial_goals_user_idx ON financial_goals(user_id, priority, target_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS simulation_runs_user_idx ON simulation_runs(user_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS allocation_builder_runs_user_idx ON allocation_builder_runs(user_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS terminal_layouts_user_idx ON terminal_layouts(user_id, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS learning_progress_user_idx ON learning_progress(user_id, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS learning_quiz_user_lesson_idx ON learning_quiz_attempts(user_id, lesson_id, attempted_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS learning_threads_user_idx ON learning_tutor_threads(user_id, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS learning_messages_thread_idx ON learning_tutor_messages(thread_id, created_at)")
 
 
 def save_portfolio(
@@ -2103,6 +2157,64 @@ def price_history(tickers: list[str], limit_per_ticker: int = 5000) -> list[dict
     ]
 
 
+def save_simulation_run(user_id: str, result: dict[str, Any]) -> str:
+    run_id = str(result["id"])
+    payload = result.get("input") or {}
+    created_at = result.get("created_at") or utc_now()
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            conn.execute(
+                """INSERT INTO public.simulation_runs(
+                id,user_id,portfolio_id,input_snapshot,result_summary,model_version,seed,status,created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,'complete',%s)""",
+                (run_id, user_id, payload.get("portfolio_id"), _jsonb(payload), _jsonb(result),
+                 result["model_version"], payload.get("seed", 0), created_at),
+            )
+    else:
+        with sqlite_connection() as conn:
+            conn.execute(
+                """INSERT INTO simulation_runs(id,user_id,portfolio_id,input_json,result_json,model_version,seed,status,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (run_id, user_id, payload.get("portfolio_id"), json.dumps(payload, default=str),
+                 json.dumps(result, default=str), result["model_version"], payload.get("seed", 0), "complete", created_at),
+            )
+    return run_id
+
+
+def load_simulation_run(user_id: str, run_id: str) -> dict[str, Any] | None:
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                "SELECT result_summary FROM public.simulation_runs WHERE id=%s AND user_id=%s",
+                (run_id, user_id),
+            ).fetchone()
+        return dict(row["result_summary"]) if row else None
+    with sqlite_connection() as conn:
+        row = conn.execute("SELECT result_json FROM simulation_runs WHERE id=? AND user_id=?", (run_id, user_id)).fetchone()
+    return json.loads(row["result_json"]) if row else None
+
+
+def save_builder_run(user_id: str, builder_type: str, request: dict[str, Any], result: dict[str, Any]) -> str:
+    run_id = str(uuid.uuid4())
+    created_at = utc_now()
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            conn.execute(
+                """INSERT INTO public.allocation_builder_runs(
+                id,user_id,builder_type,request_snapshot,result,model_version,created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                (run_id, user_id, builder_type, _jsonb(request), _jsonb(result), result["model_version"], created_at),
+            )
+    else:
+        with sqlite_connection() as conn:
+            conn.execute(
+                """INSERT INTO allocation_builder_runs(id,user_id,builder_type,request_json,result_json,model_version,created_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                (run_id, user_id, builder_type, json.dumps(request, default=str), json.dumps(result, default=str), result["model_version"], created_at),
+            )
+    return run_id
+
+
 def price_coverage_by_symbol(tickers: list[str]) -> list[dict[str, Any]]:
     """Return one coherent daily-price provider and adjustment coverage per symbol."""
     normalized = sorted({
@@ -2255,23 +2367,118 @@ def save_preferences(user_id: str, preferences: dict[str, Any]) -> dict[str, Any
     return clean
 
 
-def create_conversation(user_id: str, title: str, portfolio_id: str | None = None) -> dict[str, Any]:
+def create_conversation(user_id: str, title: str, portfolio_id: str | None = None,
+                        workspace: str = "research") -> dict[str, Any]:
+    workspace = workspace if workspace in {"research", "portfolio"} else "research"
     with postgres_connection() as conn:
         row = conn.execute(
-            """INSERT INTO public.chat_conversations(user_id, portfolio_id, title)
-            VALUES (%s,%s,%s) RETURNING id, title, created_at, updated_at""",
-            (user_id, portfolio_id, title[:120]),
+            """INSERT INTO public.chat_conversations(user_id, portfolio_id, title, workspace)
+            VALUES (%s,%s,%s,%s)
+            RETURNING id, title, workspace, summary, summary_message_count, created_at, updated_at""",
+            (user_id, portfolio_id, title[:120], workspace),
         ).fetchone()
     return {**dict(row), "id": str(row["id"]), "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"])}
 
 
-def list_conversations(user_id: str) -> list[dict[str, Any]]:
+def list_conversations(user_id: str, workspace: str | None = None) -> list[dict[str, Any]]:
+    workspace_clause = " AND c.workspace=%s" if workspace else ""
+    params: tuple[Any, ...] = (user_id, workspace) if workspace else (user_id,)
     with postgres_connection() as conn:
         rows = conn.execute(
-            "SELECT id, title, created_at, updated_at FROM public.chat_conversations WHERE user_id=%s ORDER BY updated_at DESC LIMIT 50",
-            (user_id,),
+            f"""SELECT c.id, c.title, c.workspace, c.summary, c.summary_message_count,
+                      c.created_at, c.updated_at,
+                      (SELECT count(*)::int FROM public.chat_messages m WHERE m.conversation_id=c.id) AS message_count,
+                      (SELECT left(m.content, 180) FROM public.chat_messages m
+                       WHERE m.conversation_id=c.id ORDER BY m.created_at DESC LIMIT 1) AS last_message_preview,
+                      (SELECT count(*)::int FROM public.chat_artifact_links a WHERE a.conversation_id=c.id) AS artifact_count
+               FROM public.chat_conversations c
+               WHERE c.user_id=%s{workspace_clause}
+               ORDER BY c.updated_at DESC LIMIT 50""",
+            params,
         ).fetchall()
     return [{**dict(row), "id": str(row["id"]), "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"])} for row in rows]
+
+
+def get_conversation(user_id: str, conversation_id: str) -> dict[str, Any]:
+    with postgres_connection() as conn:
+        row = conn.execute(
+            """SELECT id,title,workspace,summary,summary_message_count,created_at,updated_at
+               FROM public.chat_conversations WHERE id=%s AND user_id=%s""",
+            (conversation_id, user_id),
+        ).fetchone()
+    if not row:
+        raise KeyError(conversation_id)
+    return {**dict(row), "id": str(row["id"]), "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"])}
+
+
+def rename_conversation(user_id: str, conversation_id: str, title: str) -> dict[str, Any]:
+    with postgres_connection() as conn:
+        row = conn.execute(
+            """UPDATE public.chat_conversations SET title=%s,updated_at=now()
+               WHERE id=%s AND user_id=%s
+               RETURNING id,title,workspace,summary,summary_message_count,created_at,updated_at""",
+            (title.strip()[:120], conversation_id, user_id),
+        ).fetchone()
+    if not row:
+        raise KeyError(conversation_id)
+    return {**dict(row), "id": str(row["id"]), "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"])}
+
+
+def delete_conversation(user_id: str, conversation_id: str) -> None:
+    with postgres_connection() as conn:
+        row = conn.execute(
+            "DELETE FROM public.chat_conversations WHERE id=%s AND user_id=%s RETURNING id",
+            (conversation_id, user_id),
+        ).fetchone()
+    if not row:
+        raise KeyError(conversation_id)
+
+
+def update_conversation_summary(user_id: str, conversation_id: str, summary: str,
+                                message_count: int) -> None:
+    with postgres_connection() as conn:
+        row = conn.execute(
+            """UPDATE public.chat_conversations
+               SET summary=%s,summary_message_count=%s,updated_at=now()
+               WHERE id=%s AND user_id=%s RETURNING id""",
+            (summary[:4000], message_count, conversation_id, user_id),
+        ).fetchone()
+    if not row:
+        raise KeyError(conversation_id)
+
+
+def conversation_artifacts(user_id: str, conversation_id: str) -> list[dict[str, Any]]:
+    with postgres_connection() as conn:
+        rows = conn.execute(
+            """SELECT a.id,a.artifact_type,a.artifact_id,a.label,a.metadata,a.created_at
+               FROM public.chat_artifact_links a JOIN public.chat_conversations c ON c.id=a.conversation_id
+               WHERE a.conversation_id=%s AND c.user_id=%s ORDER BY a.created_at DESC""",
+            (conversation_id, user_id),
+        ).fetchall()
+    return [{**dict(row), "id": str(row["id"]), "created_at": _iso(row["created_at"])} for row in rows]
+
+
+def link_conversation_artifact(user_id: str, conversation_id: str, artifact_type: str,
+                               artifact_id: str, label: str, *, message_id: str | None = None,
+                               metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    with postgres_connection() as conn:
+        owned = conn.execute(
+            "SELECT 1 FROM public.chat_conversations WHERE id=%s AND user_id=%s",
+            (conversation_id, user_id),
+        ).fetchone()
+        if not owned:
+            raise KeyError(conversation_id)
+        row = conn.execute(
+            """INSERT INTO public.chat_artifact_links(
+                 user_id,conversation_id,message_id,artifact_type,artifact_id,label,metadata
+               ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT(conversation_id,artifact_type,artifact_id) DO UPDATE SET
+                 message_id=coalesce(excluded.message_id,public.chat_artifact_links.message_id),
+                 label=excluded.label,metadata=excluded.metadata
+               RETURNING id,artifact_type,artifact_id,label,metadata,created_at""",
+            (user_id, conversation_id, message_id, artifact_type, artifact_id, label, _jsonb(metadata or {})),
+        ).fetchone()
+    return {**dict(row), "id": str(row["id"]), "created_at": _iso(row["created_at"])}
 
 
 def conversation_messages(user_id: str, conversation_id: str) -> list[dict[str, Any]]:
@@ -2312,7 +2519,7 @@ def _dashboard_job(row: Any) -> dict[str, Any]:
         for key in DASHBOARD_JOB_JSON_FIELDS:
             raw = item.pop(f"{key}_json", None)
             item[key] = json.loads(raw) if raw else ([] if key in {"widget_results", "warnings"} else None)
-    for key in ("id", "portfolio_id", "source_view_id"):
+    for key in ("id", "portfolio_id", "source_view_id", "conversation_id"):
         if item.get(key) is not None:
             item[key] = str(item[key])
     for key in ("created_at", "updated_at", "expires_at", "cancelled_at"):
@@ -2321,7 +2528,8 @@ def _dashboard_job(row: Any) -> dict[str, Any]:
 
 
 def create_dashboard_job(user_id: str, prompt: str, portfolio_id: str | None = None,
-                         source_view_id: str | None = None) -> dict[str, Any]:
+                         source_view_id: str | None = None,
+                         conversation_id: str | None = None) -> dict[str, Any]:
     job_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     expires = now + timedelta(hours=24)
@@ -2329,18 +2537,18 @@ def create_dashboard_job(user_id: str, prompt: str, portfolio_id: str | None = N
         with postgres_connection() as conn:
             row = conn.execute(
                 """INSERT INTO public.dashboard_jobs(
-                    id,user_id,portfolio_id,source_view_id,prompt,state,progress
-                ) VALUES (%s,%s,%s,%s,%s,'PLANNING',0) RETURNING *""",
-                (job_id, user_id, portfolio_id, source_view_id, prompt),
+                    id,user_id,portfolio_id,source_view_id,conversation_id,prompt,state,progress
+                ) VALUES (%s,%s,%s,%s,%s,%s,'PLANNING',0) RETURNING *""",
+                (job_id, user_id, portfolio_id, source_view_id, conversation_id, prompt),
             ).fetchone()
         return _dashboard_job(row)
     with sqlite_connection() as conn:
         conn.execute(
             """INSERT INTO dashboard_jobs(
-                id,user_id,portfolio_id,source_view_id,prompt,state,progress,plan_json,
+                id,user_id,portfolio_id,source_view_id,conversation_id,prompt,state,progress,plan_json,
                 specification_json,widget_results_json,warnings_json,expires_at,created_at,updated_at
-            ) VALUES (?,?,?,?,?,'PLANNING',0,NULL,NULL,'[]','[]',?,?,?)""",
-            (job_id, user_id, portfolio_id, source_view_id, prompt, expires.isoformat(), now.isoformat(), now.isoformat()),
+            ) VALUES (?,?,?,?,?,?,'PLANNING',0,NULL,NULL,'[]','[]',?,?,?)""",
+            (job_id, user_id, portfolio_id, source_view_id, conversation_id, prompt, expires.isoformat(), now.isoformat(), now.isoformat()),
         )
     return get_dashboard_job(job_id, user_id)
 
@@ -2754,3 +2962,224 @@ def delete_dashboard_view(view_id: str, user_id: str) -> None:
     with connection() as conn:
         cursor = conn.execute(f"DELETE FROM {table} WHERE id={marker} AND user_id={marker}", (view_id,user_id))
         if cursor.rowcount == 0: raise KeyError(view_id)
+
+
+def load_learning_preferences(user_id: str) -> dict[str, Any]:
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute("SELECT * FROM public.learning_preferences WHERE user_id=%s", (user_id,)).fetchone()
+    else:
+        with sqlite_connection() as conn:
+            row = conn.execute("SELECT * FROM learning_preferences WHERE user_id=?", (user_id,)).fetchone()
+    if row is None:
+        return {"selected_path": None, "knowledge_level": "beginner", "interests": [], "portfolio_context_enabled": False}
+    item = dict(row)
+    interests = item.get("interests") if DATABASE_URL else json.loads(item.get("interests_json") or "[]")
+    return {
+        "selected_path": item.get("selected_path"), "knowledge_level": item.get("knowledge_level", "beginner"),
+        "interests": interests or [], "portfolio_context_enabled": bool(item.get("portfolio_context_enabled")),
+        "updated_at": _iso(item.get("updated_at")),
+    }
+
+
+def save_learning_preferences(user_id: str, preferences: dict[str, Any]) -> dict[str, Any]:
+    now = utc_now()
+    selected_path = preferences.get("selected_path") or None
+    level = preferences.get("knowledge_level", "beginner")
+    interests = list(dict.fromkeys(str(item).strip() for item in preferences.get("interests", []) if str(item).strip()))[:20]
+    portfolio_context = bool(preferences.get("portfolio_context_enabled", False))
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            conn.execute(
+                """INSERT INTO public.learning_preferences(user_id,selected_path,knowledge_level,interests,portfolio_context_enabled,updated_at)
+                VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(user_id) DO UPDATE SET selected_path=excluded.selected_path,
+                knowledge_level=excluded.knowledge_level,interests=excluded.interests,
+                portfolio_context_enabled=excluded.portfolio_context_enabled,updated_at=excluded.updated_at""",
+                (user_id, selected_path, level, _jsonb(interests), portfolio_context, now),
+            )
+    else:
+        with sqlite_connection() as conn:
+            conn.execute(
+                """INSERT INTO learning_preferences(user_id,selected_path,knowledge_level,interests_json,portfolio_context_enabled,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET selected_path=excluded.selected_path,
+                knowledge_level=excluded.knowledge_level,interests_json=excluded.interests_json,
+                portfolio_context_enabled=excluded.portfolio_context_enabled,updated_at=excluded.updated_at""",
+                (user_id, selected_path, level, json.dumps(interests), int(portfolio_context), now, now),
+            )
+    return load_learning_preferences(user_id)
+
+
+def list_learning_quiz_attempts(user_id: str, lesson_id: str | None = None) -> list[dict[str, Any]]:
+    if DATABASE_URL:
+        query = "SELECT * FROM public.learning_quiz_attempts WHERE user_id=%s"
+        params: tuple[Any, ...] = (user_id,)
+        if lesson_id:
+            query += " AND lesson_id=%s"; params += (lesson_id,)
+        query += " ORDER BY attempted_at DESC"
+        with postgres_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+    else:
+        query = "SELECT * FROM learning_quiz_attempts WHERE user_id=?"
+        params = (user_id,)
+        if lesson_id:
+            query += " AND lesson_id=?"; params += (lesson_id,)
+        query += " ORDER BY attempted_at DESC"
+        with sqlite_connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+    return [{
+        **dict(row), "id": str(row["id"]), "percentage": float(row["percentage"]),
+        "answers": row.get("answers") if DATABASE_URL else json.loads(row["answers_json"]),
+        "attempted_at": _iso(row["attempted_at"]),
+    } for row in rows]
+
+
+def list_learning_progress(user_id: str) -> list[dict[str, Any]]:
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            rows = conn.execute("SELECT * FROM public.learning_progress WHERE user_id=%s ORDER BY updated_at DESC", (user_id,)).fetchall()
+    else:
+        with sqlite_connection() as conn:
+            rows = conn.execute("SELECT * FROM learning_progress WHERE user_id=? ORDER BY updated_at DESC", (user_id,)).fetchall()
+    attempts = list_learning_quiz_attempts(user_id)
+    best: dict[tuple[str, str], float] = {}
+    for attempt in attempts:
+        key = (attempt["lesson_id"], attempt["content_version"])
+        best[key] = max(best.get(key, 0), float(attempt["percentage"]))
+    return [{
+        **dict(row), "id": str(row["id"]), "completion_percentage": float(row["completion_percentage"]),
+        "best_score": best.get((row["lesson_id"], row["content_version"])),
+        "started_at": _iso(row["started_at"]), "completed_at": _iso(row["completed_at"]), "updated_at": _iso(row["updated_at"]),
+    } for row in rows]
+
+
+def save_learning_progress(user_id: str, module_id: str, lesson_id: str, content_version: str,
+                           status: str, completion_percentage: float) -> dict[str, Any]:
+    now = utc_now()
+    current = next((item for item in list_learning_progress(user_id) if item["lesson_id"] == lesson_id and item["content_version"] == content_version), None)
+    started_at = current.get("started_at") if current else now
+    best = current.get("best_score") if current else None
+    completion = min(1.0, max(0.0, float(completion_percentage)))
+    if completion >= 1 and status in {"completed", "mastered"} and best is not None and best >= .80:
+        status = "mastered"
+    completed_at = (current or {}).get("completed_at") or (now if completion >= 1 else None)
+    progress_id = (current or {}).get("id") or str(uuid.uuid4())
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                """INSERT INTO public.learning_progress(id,user_id,module_id,lesson_id,content_version,status,completion_percentage,started_at,completed_at,updated_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(user_id,lesson_id,content_version)
+                DO UPDATE SET module_id=excluded.module_id,status=excluded.status,completion_percentage=excluded.completion_percentage,
+                started_at=coalesce(public.learning_progress.started_at,excluded.started_at),
+                completed_at=coalesce(public.learning_progress.completed_at,excluded.completed_at),updated_at=excluded.updated_at RETURNING *""",
+                (progress_id, user_id, module_id, lesson_id, content_version, status, completion, started_at, completed_at, now),
+            ).fetchone()
+    else:
+        with sqlite_connection() as conn:
+            conn.execute(
+                """INSERT INTO learning_progress(id,user_id,module_id,lesson_id,content_version,status,completion_percentage,started_at,completed_at,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,lesson_id,content_version) DO UPDATE SET
+                module_id=excluded.module_id,status=excluded.status,completion_percentage=excluded.completion_percentage,
+                started_at=coalesce(learning_progress.started_at,excluded.started_at),completed_at=coalesce(learning_progress.completed_at,excluded.completed_at),
+                updated_at=excluded.updated_at""",
+                (progress_id, user_id, module_id, lesson_id, content_version, status, completion, started_at, completed_at, now, now),
+            )
+            row = conn.execute("SELECT * FROM learning_progress WHERE user_id=? AND lesson_id=? AND content_version=?", (user_id, lesson_id, content_version)).fetchone()
+    item = dict(row)
+    return {**item, "id": str(item["id"]), "completion_percentage": float(item["completion_percentage"]), "best_score": best,
+            "started_at": _iso(item["started_at"]), "completed_at": _iso(item["completed_at"]), "updated_at": _iso(item["updated_at"])}
+
+
+def save_learning_quiz_attempt(user_id: str, result: dict[str, Any], answers: list[int]) -> dict[str, Any]:
+    attempt_id, now = str(result.get("attempt_id") or uuid.uuid4()), utc_now()
+    values = (attempt_id, user_id, result["module_id"], result["lesson_id"], result["content_version"], result["quiz_id"],
+              result["quiz_version"], result["score"], result["total_questions"], result["percentage"])
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            conn.execute(
+                """INSERT INTO public.learning_quiz_attempts(id,user_id,module_id,lesson_id,content_version,quiz_id,quiz_version,
+                score,total_questions,percentage,answers,attempted_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(id) DO NOTHING""",
+                (*values, _jsonb(answers), now),
+            )
+    else:
+        with sqlite_connection() as conn:
+            conn.execute(
+                """INSERT INTO learning_quiz_attempts(id,user_id,module_id,lesson_id,content_version,quiz_id,quiz_version,
+                score,total_questions,percentage,answers_json,attempted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO NOTHING""",
+                (*values, json.dumps(answers), now),
+            )
+    progress = next((item for item in list_learning_progress(user_id) if item["lesson_id"] == result["lesson_id"] and item["content_version"] == result["content_version"]), None)
+    if progress:
+        save_learning_progress(user_id, result["module_id"], result["lesson_id"], result["content_version"], progress["status"], progress["completion_percentage"])
+    return next(item for item in list_learning_quiz_attempts(user_id, result["lesson_id"]) if item["id"] == attempt_id)
+
+
+def create_learning_tutor_thread(user_id: str, lesson_id: str, title: str) -> dict[str, Any]:
+    thread_id, now = str(uuid.uuid4()), utc_now()
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                "INSERT INTO public.learning_tutor_threads(id,user_id,lesson_id,title,updated_at) VALUES(%s,%s,%s,%s,%s) RETURNING *",
+                (thread_id, user_id, lesson_id, title[:120], now),
+            ).fetchone()
+    else:
+        with sqlite_connection() as conn:
+            conn.execute("INSERT INTO learning_tutor_threads(id,user_id,lesson_id,title,created_at,updated_at) VALUES(?,?,?,?,?,?)", (thread_id, user_id, lesson_id, title[:120], now, now))
+            row = conn.execute("SELECT * FROM learning_tutor_threads WHERE id=?", (thread_id,)).fetchone()
+    item = dict(row); item["id"] = str(item["id"]); item["created_at"] = _iso(item["created_at"]); item["updated_at"] = _iso(item["updated_at"])
+    return item
+
+
+def list_learning_tutor_threads(user_id: str) -> list[dict[str, Any]]:
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            rows = conn.execute("SELECT * FROM public.learning_tutor_threads WHERE user_id=%s ORDER BY updated_at DESC", (user_id,)).fetchall()
+    else:
+        with sqlite_connection() as conn:
+            rows = conn.execute("SELECT * FROM learning_tutor_threads WHERE user_id=? ORDER BY updated_at DESC", (user_id,)).fetchall()
+    return [{**dict(row), "id": str(row["id"]), "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"])} for row in rows]
+
+
+def learning_tutor_messages(user_id: str, thread_id: str) -> list[dict[str, Any]]:
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            owner = conn.execute("SELECT id FROM public.learning_tutor_threads WHERE id=%s AND user_id=%s", (thread_id, user_id)).fetchone()
+            if owner is None: raise KeyError(thread_id)
+            rows = conn.execute("SELECT * FROM public.learning_tutor_messages WHERE thread_id=%s AND user_id=%s ORDER BY created_at", (thread_id, user_id)).fetchall()
+    else:
+        with sqlite_connection() as conn:
+            owner = conn.execute("SELECT id FROM learning_tutor_threads WHERE id=? AND user_id=?", (thread_id, user_id)).fetchone()
+            if owner is None: raise KeyError(thread_id)
+            rows = conn.execute("SELECT * FROM learning_tutor_messages WHERE thread_id=? AND user_id=? ORDER BY created_at", (thread_id, user_id)).fetchall()
+    return [{
+        **dict(row), "id": str(row["id"]),
+        "source_references": row.get("source_references") if DATABASE_URL else json.loads(row["source_references_json"]),
+        "retrieval_quality": row.get("retrieval_quality") if DATABASE_URL else json.loads(row["retrieval_quality_json"]),
+        "created_at": _iso(row["created_at"]),
+    } for row in rows]
+
+
+def save_learning_tutor_message(user_id: str, thread_id: str, role: str, content: str,
+                                source_references: list[dict[str, Any]] | None = None,
+                                retrieval_quality: dict[str, Any] | None = None,
+                                model_version: str | None = None) -> dict[str, Any]:
+    learning_tutor_messages(user_id, thread_id)
+    message_id, now = str(uuid.uuid4()), utc_now()
+    sources, quality = source_references or [], retrieval_quality or {}
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            conn.execute(
+                """INSERT INTO public.learning_tutor_messages(id,thread_id,user_id,role,content,source_references,retrieval_quality,model_version,created_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (message_id, thread_id, user_id, role, content, _jsonb(sources), _jsonb(quality), model_version, now),
+            )
+            conn.execute("UPDATE public.learning_tutor_threads SET updated_at=%s WHERE id=%s AND user_id=%s", (now, thread_id, user_id))
+    else:
+        with sqlite_connection() as conn:
+            conn.execute(
+                """INSERT INTO learning_tutor_messages(id,thread_id,user_id,role,content,source_references_json,retrieval_quality_json,model_version,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""", (message_id, thread_id, user_id, role, content, json.dumps(sources), json.dumps(quality), model_version, now),
+            )
+            conn.execute("UPDATE learning_tutor_threads SET updated_at=? WHERE id=? AND user_id=?", (now, thread_id, user_id))
+    return next(item for item in learning_tutor_messages(user_id, thread_id) if item["id"] == message_id)

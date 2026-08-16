@@ -16,10 +16,17 @@ FIELD_ALIASES = {
     "weight_percent": {"weightpercent", "allocationpercent", "weightpct", "allocationpct", "percentofaccount", "portfolio_percent"},
     "market_value": {"marketvalue", "currentvalue", "positionvalue", "value", "market_value"},
     "price": {"price", "lastprice", "currentprice", "marketprice"},
+    "unit_cost": {"pricepaid", "averagecost", "avgcost", "costpershare", "unitcost"},
     "cost_basis": {"costbasis", "totalcost", "bookvalue", "cost", "cost_basis"},
     "account_type": {"accounttype", "account", "accountname", "registration", "account_type"},
     "acquisition_date": {"acquisitiondate", "purchasedate", "acquired", "dateacquired", "acquisition_date"},
 }
+
+TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9.-]{0,9}$")
+FIXED_INCOME_HINTS = (
+    " CERTIFICATE", " CTF DEP", " CD ", " NOTE ", " BOND ", " DEBENTURE",
+    " TREASURY", " MUNICIPAL", " MUNI ", " FID ",
+)
 
 
 def _key(value: str) -> str:
@@ -56,6 +63,14 @@ def _dialect(text: str) -> csv.Dialect:
         return csv.excel
 
 
+def _unsupported_classification(identifier: str) -> str:
+    padded = f" {identifier.upper()} "
+    has_maturity = bool(re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", padded))
+    if any(hint in padded for hint in FIXED_INCOME_HINTS) or ("%" in padded and has_maturity):
+        return "fixed_income"
+    return "unrecognized_identifier"
+
+
 def parse_portfolio_csv(csv_text: str, name: str = "Imported portfolio") -> dict[str, Any]:
     text = csv_text.strip().lstrip("\ufeff")
     if not text:
@@ -82,10 +97,21 @@ def parse_portfolio_csv(csv_text: str, name: str = "Imported portfolio") -> dict
         warnings.append(f"Ignored {len(ignored)} unrelated column(s): {', '.join(ignored[:8])}{'…' if len(ignored) > 8 else ''}")
 
     parsed_rows: list[dict[str, Any]] = []
+    review_rows: list[dict[str, Any]] = []
     inferred_percent = False
     for line_number, row in enumerate(reader, start=2):
         ticker = str(row.get(detected["ticker"], "") or "").strip().upper()
         if not ticker or ticker in {"TOTAL", "SUBTOTAL", "CASH TOTAL", "ACCOUNT TOTAL"}:
+            continue
+        if not TICKER_PATTERN.fullmatch(ticker):
+            market_value = _number(row.get(detected.get("market_value", ""))) if "market_value" in detected else None
+            review_rows.append({
+                "line": line_number,
+                "identifier": ticker,
+                "classification": _unsupported_classification(ticker),
+                "market_value": max(0.0, market_value) if market_value is not None else None,
+                "reason": "This row does not contain a supported stock, ETF, or mutual-fund ticker.",
+            })
             continue
         values: dict[str, Any] = {"ticker": ticker, "account_type": _account(row.get(detected.get("account_type", "")))}
         for field in ("shares", "market_value", "cost_basis"):
@@ -96,6 +122,10 @@ def parse_portfolio_csv(csv_text: str, name: str = "Imported portfolio") -> dict
         price = _number(row.get(detected.get("price", ""))) if "price" in detected else None
         if values.get("market_value") is None and values.get("shares") is not None and price is not None:
             values["market_value"] = max(0.0, values["shares"] * price)
+        if values.get("cost_basis") is None and values.get("shares") is not None and "unit_cost" in detected:
+            unit_cost = _number(row.get(detected["unit_cost"]))
+            if unit_cost is not None:
+                values["cost_basis"] = max(0.0, values["shares"] * unit_cost)
         weight_field = "weight_percent" if "weight_percent" in detected else "weight" if "weight" in detected else None
         if weight_field:
             raw = row.get(detected[weight_field])
@@ -113,6 +143,19 @@ def parse_portfolio_csv(csv_text: str, name: str = "Imported portfolio") -> dict
         raise ValueError("No security rows were found")
     if inferred_percent:
         warnings.append("Weight values above 1 were interpreted as percentages.")
+    excluded_market_value = sum(float(row.get("market_value") or 0) for row in review_rows)
+    if review_rows:
+        fixed_income_count = sum(row["classification"] == "fixed_income" for row in review_rows)
+        label = f"{fixed_income_count} fixed-income" if fixed_income_count == len(review_rows) else f"{len(review_rows)} unsupported"
+        value_note = f" totaling ${excluded_market_value:,.2f}" if excluded_market_value else ""
+        row_note = "; ".join(
+            f"row {row['line']}: {row['identifier']}" for row in review_rows[:4]
+        )
+        warnings.append(
+            f"Excluded {label} row(s){value_note} from security analysis and saved the remaining positions. "
+            f"Review required ({row_note}{'; …' if len(review_rows) > 4 else ''}). "
+            "Descriptions are never truncated or converted into stock tickers."
+        )
 
     grouped: OrderedDict[str, dict[str, Any]] = OrderedDict()
     duplicate_count = 0
@@ -154,5 +197,7 @@ def parse_portfolio_csv(csv_text: str, name: str = "Imported portfolio") -> dict
         "warnings": warnings,
         "detected_columns": detected,
         "ignored_columns": ignored,
-        "source_rows": len(parsed_rows),
+        "source_rows": len(parsed_rows) + len(review_rows),
+        "review_rows": review_rows,
+        "excluded_market_value": round(excluded_market_value, 2),
     }

@@ -130,3 +130,23 @@ test("progressive planning, combined macro analysis, and saved-board deletion st
   assert.match(source, /planSection/);
   assert.match(source, /deleteDashboardView/);
 });
+
+test("research and portfolio chats expose durable conversation controls", async () => {
+  const source = await dashboardSurface();
+  for (const action of [
+    "newChatConversation", "openChatConversation", "renameChatConversation",
+    "deleteChatConversation", "buildBoardFromConversation",
+  ]) assert.match(source, new RegExp(`function ${action}\\(`));
+  for (const copy of ["Research conversations", "Portfolio conversations", "Linked evidence", "＋ New"]) {
+    assert.match(source, new RegExp(copy));
+  }
+  assert.match(source, /eagleeyes-research-conversation/);
+  assert.match(source, /eagleeyes-portfolio-conversation/);
+});
+
+test("chat history remains beside the conversation on desktop", async () => {
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(css, /\.chat-history-shell\{display:grid;grid-template-columns:300px minmax\(0,1fr\)/);
+  assert.match(css, /\.chat-history-shell>\.portfolio-analysis-chat\{grid-column:auto/);
+  assert.match(css, /@media\(max-width:860px\)\{\.chat-history-shell\{grid-template-columns:1fr\}/);
+});

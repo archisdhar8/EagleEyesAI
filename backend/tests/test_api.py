@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from backend.main import app
+from backend.main import _company_research_chat_tools, _conversation_summary, _portfolio_chat_tools, app
 
 
 def test_health_reports_storage_and_disables_trading() -> None:
@@ -279,6 +279,30 @@ def test_csv_import_accepts_symbol_alias_extra_columns_and_broker_numbers() -> N
     assert "Description" in response.json()["ignored_columns"]
 
 
+def test_csv_import_keeps_valid_rows_and_reports_fixed_income_for_review() -> None:
+    text = "\n".join([
+        "Symbol,Last Price $,Quantity,Price Paid $,Value $",
+        "AAPL,200,10,150,2000",
+        "JPMORGAN CHASE BK N A FID 4.25% 03/31/2028,99.39,40000,100,39756",
+        "CASH,,,,5000",
+    ])
+    with TestClient(app) as client:
+        response = client.post("/api/portfolios/import", json={"name": "Mixed brokerage export", "csv_text": text})
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert [row["ticker"] for row in payload["portfolio"]["holdings"]] == ["AAPL", "CASH"]
+    assert payload["portfolio"]["holdings"][0]["cost_basis"] == 1500
+    assert payload["review_rows"] == [{
+        "line": 3,
+        "identifier": "JPMORGAN CHASE BK N A FID 4.25% 03/31/2028",
+        "classification": "fixed_income",
+        "market_value": 39756.0,
+        "reason": "This row does not contain a supported stock, ETF, or mutual-fund ticker.",
+    }]
+    assert payload["excluded_market_value"] == 39756
+    assert any("never truncated" in warning for warning in payload["warnings"])
+
+
 def test_investment_policy_approval_and_guidance() -> None:
     policy = {
         "name": "Test policy", "status": "draft",
@@ -362,16 +386,129 @@ def test_chat_returns_grounded_reply(monkeypatch) -> None:
     monkeypatch.setattr("backend.main.database.DATABASE_URL", "postgresql://test")
     monkeypatch.setattr("backend.main.database.initialize", lambda: None)
     monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{"id": "portfolio-1"}])
-    monkeypatch.setattr("backend.main.database.create_conversation", lambda user_id, title, portfolio_id: {"id": "conversation-1"})
+    monkeypatch.setattr("backend.main.database.create_conversation", lambda user_id, title, portfolio_id, workspace="research": {"id": "conversation-1", "workspace": workspace})
+    monkeypatch.setattr("backend.main.database.get_conversation", lambda user_id, conversation_id: {"id": conversation_id, "title": "Existing research", "workspace": "research", "summary": "", "summary_message_count": 0})
     monkeypatch.setattr("backend.main.database.conversation_messages", lambda user_id, conversation_id: [])
     monkeypatch.setattr("backend.main.database.save_chat_message", lambda user_id, conversation_id, role, content, structured=None, model=None: {"id": "message-1", "role": role, "content": content, "structured_content": structured or {}})
     monkeypatch.setattr("backend.main.retrieve_evidence", lambda user_id, question: [{"label": "Portfolio", "url": None, "as_of": "2026-08-09", "data": {}}])
-    monkeypatch.setattr("backend.main.ask_gemini", lambda question, evidence, history: ("Grounded answer [S1]", "gemini-test"))
+    monkeypatch.setattr("backend.main.ask_gemini", lambda question, evidence, history, summary="": ("Grounded answer [S1]", "gemini-test"))
     with TestClient(app) as client:
         response = client.post("/api/chat/messages", json={"question": "What changed?"})
     assert response.status_code == 200
     assert response.json()["message"]["content"] == "Grounded answer [S1]"
     assert response.json()["sources"][0]["id"] == "S1"
+
+
+def test_portfolio_chat_runs_simulation_as_visible_tool(monkeypatch) -> None:
+    monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{"id": "portfolio-1", "holdings": [{"ticker": "SPY", "weight": 1.0}]}])
+    monkeypatch.setattr("backend.main.database.load_profile", lambda user_id: {"horizon_years": 10})
+    monkeypatch.setattr("backend.main.database.list_goals", lambda user_id: [])
+    monkeypatch.setattr("backend.main.database.save_simulation_run", lambda user_id, result: result["id"])
+    monkeypatch.setattr("backend.main.run_simulation", lambda payload: {
+        "id": "simulation-1", "created_at": "2026-08-15T12:00:00Z", "model_version": "simulation-v-test",
+        "warnings": [], "assumptions": ["Shared paths"], "lineage": [{"provider": "fixture"}],
+        "outcomes": [{
+            "strategy_key": "current", "label": "Current / do nothing",
+            "wealth_percentiles": {"p50": 125000.0}, "probability_of_loss": .12,
+            "drawdown_percentiles": {"p10": -.28}, "robustness": "Moderate",
+        }],
+    })
+    tools, evidence = _portfolio_chat_tools("user-1", "Simulate a recession with accelerating inflation and an oil shock")
+    assert tools[0]["tool_name"] == "portfolio_decision_lab"
+    assert tools[0]["status"] == "complete"
+    assert tools[0]["input_summary"]["scenario"] == {
+        "economic_state": "recession", "inflation_state": "accelerating",
+        "rate_state": "unconditioned", "shocks": ["oil"],
+    }
+    assert tools[0]["summary"]["strategies"][0]["median_wealth"] == 125000.0
+    assert evidence[0]["label"] == "Portfolio Decision Lab tool result"
+
+
+def test_company_chat_refreshes_approved_research_and_returns_article_lineage(monkeypatch) -> None:
+    monkeypatch.setattr("backend.main.database.DATABASE_URL", "postgresql://test")
+    monkeypatch.setattr("backend.main.database.search_security_master", lambda query, limit=5: {
+        "results": [{"ticker": "MU", "name": "Micron Technology, Inc."}] if query.upper() == "MU" else [],
+    })
+    research_rows = [{
+        "ticker": "MU", "company": "Micron Technology", "sector": "Information Technology",
+        "industry": "Semiconductors", "price": 142.5, "price_as_of": "2026-08-14",
+        "fundamentals_as_of": "2026-06-30", "revenue_growth": .18, "net_margin": .12,
+        "valuation_evidence": {"label": "Near peer range"}, "market_statistics": {"rsi_14": 58.0},
+        "fundamental_statistics": {"source": "https://data.sec.gov/"},
+        "news_sentiment": {}, "component_coverage": {"fundamentals": True, "news": True},
+        "risk_flags": [], "data_quality": "medium",
+    }]
+    monkeypatch.setattr("backend.main.security_research", lambda tickers: research_rows)
+    refreshed: list[tuple[list[str], int]] = []
+    monkeypatch.setattr(
+        "backend.main.refresh_security_evidence",
+        lambda tickers, news_lookback_days=7: refreshed.append((list(tickers), news_lookback_days)) or {"providers": {"polygon_news": 1}, "warnings": []},
+    )
+    monkeypatch.setattr("backend.main.database.security_data", lambda tickers, price_limit=10: {"news": [{
+        "ticker": "MU", "title": "Micron updates its data-center outlook",
+        "published_at": "2026-08-14T15:00:00Z", "source_url": "https://example.com/mu-outlook",
+        "metadata": {"source": "Example Wire", "summary": "Management discussed demand."},
+    }]})
+
+    tools, evidence = _company_research_chat_tools("What is the latest outlook for MU and memory pricing?")
+
+    assert refreshed == [(["MU"], 90)]
+    assert tools[0]["tool_name"] == "company_research_refresh"
+    assert tools[0]["status"] == "complete"
+    assert tools[0]["summary"]["news"]["article_count"] == 1
+    assert tools[0]["summary"]["revenue_growth"] == .18
+    assert evidence[0]["label"] == "MU refreshed company research"
+    assert evidence[1]["url"] == "https://example.com/mu-outlook"
+
+
+def test_conversation_memory_summary_is_bounded_and_tracks_tools() -> None:
+    messages = [
+        {"role": "user", "content": f"Question {index} about MU memory demand"}
+        for index in range(12)
+    ]
+    messages.append({
+        "role": "assistant", "content": "Validated response",
+        "structured_content": {"tool_results": [{
+            "tool_name": "company_research_refresh", "title": "MU company evidence", "ticker": "MU",
+        }]},
+    })
+    summary = _conversation_summary(messages, "Earlier portfolio context")
+    assert "Question 11 about MU memory demand" in summary
+    assert "MU company evidence (MU)" in summary
+    assert len(summary) <= 4000
+
+
+def test_conversation_crud_routes_keep_workspaces_and_artifacts_separate(monkeypatch) -> None:
+    deleted: list[str] = []
+    monkeypatch.setattr("backend.main.database.list_conversations", lambda user_id, workspace=None: [{
+        "id": "research-1", "title": "MU outlook", "workspace": workspace or "research",
+        "message_count": 2, "artifact_count": 1, "created_at": "2026-08-15", "updated_at": "2026-08-15",
+    }])
+    monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id=None: [])
+    monkeypatch.setattr("backend.main.database.create_conversation", lambda user_id, title, portfolio_id, workspace="research": {
+        "id": f"{workspace}-new", "title": title, "workspace": workspace,
+    })
+    monkeypatch.setattr("backend.main.database.get_conversation", lambda user_id, conversation_id: {
+        "id": conversation_id, "title": "MU outlook", "workspace": "research", "summary": "Memory demand",
+    })
+    monkeypatch.setattr("backend.main.database.conversation_messages", lambda user_id, conversation_id: [{"role": "user", "content": "MU outlook"}])
+    monkeypatch.setattr("backend.main.database.conversation_artifacts", lambda user_id, conversation_id: [{
+        "id": "artifact-1", "artifact_type": "research_snapshot", "artifact_id": "MU:2026-08-15", "label": "MU evidence",
+    }])
+    monkeypatch.setattr("backend.main.database.rename_conversation", lambda user_id, conversation_id, title: {"id": conversation_id, "title": title, "workspace": "research"})
+    monkeypatch.setattr("backend.main.database.delete_conversation", lambda user_id, conversation_id: deleted.append(conversation_id))
+    with TestClient(app) as client:
+        listed = client.get("/api/chat/conversations?workspace=research")
+        created = client.post("/api/chat/conversations", json={"workspace": "portfolio", "title": "New risk review"})
+        opened = client.get("/api/chat/conversations/research-1")
+        renamed = client.patch("/api/chat/conversations/research-1", json={"title": "Renamed research"})
+        removed = client.delete("/api/chat/conversations/research-1")
+    assert listed.json()[0]["workspace"] == "research"
+    assert created.json()["workspace"] == "portfolio"
+    assert opened.json()["artifacts"][0]["artifact_id"] == "MU:2026-08-15"
+    assert renamed.json()["title"] == "Renamed research"
+    assert removed.status_code == 204
+    assert deleted == ["research-1"]
 
 
 def test_combined_macro_conditions_intersect_independent_dimensions(monkeypatch) -> None:

@@ -1,0 +1,187 @@
+{
+  "version": "learn-catalog-v1",
+  "preview_lesson_id": "why-invest",
+  "modules": [
+    {
+      "id": "start-safely",
+      "slug": "start-safely",
+      "title": "Start Investing Safely",
+      "description": "Build the financial foundation for a first investment without rushing past cash, debt, or account basics.",
+      "outcomes": ["Separate short-term savings from long-term investments", "Explain compounding and inflation", "Recognize the main investment and account types"],
+      "prerequisites": [],
+      "lesson_ids": ["why-invest", "money-before-markets", "accounts-and-assets"],
+      "content_version": "2026.08.1"
+    },
+    {
+      "id": "build-portfolio",
+      "slug": "build-portfolio",
+      "title": "Build a Portfolio",
+      "description": "Learn how risk, diversification, costs, and behavior fit together before changing an allocation.",
+      "outcomes": ["Distinguish risk tolerance from loss capacity", "Measure diversification and overlap", "Explain fees, rebalancing, and drawdown recovery"],
+      "prerequisites": ["start-safely"],
+      "lesson_ids": ["risk-and-time", "diversification-and-etfs", "costs-rebalancing-and-declines"],
+      "content_version": "2026.08.1"
+    },
+    {
+      "id": "understand-markets",
+      "slug": "understand-markets",
+      "title": "Understand Markets",
+      "description": "Connect company results, valuation, macro conditions, and news without turning every signal into a trade.",
+      "outcomes": ["Explain why prices react to changing expectations", "Separate company quality from valuation", "Judge macro, news, and correlation evidence carefully"],
+      "prerequisites": ["start-safely"],
+      "lesson_ids": ["prices-and-expectations", "fundamentals-and-valuation", "macro-news-and-evidence"],
+      "content_version": "2026.08.1"
+    }
+  ],
+  "lessons": [
+    {
+      "id": "why-invest",
+      "module_id": "start-safely",
+      "title": "Why save and invest?",
+      "estimated_minutes": 8,
+      "concept_ids": ["saving", "investing", "compounding", "inflation"],
+      "content_file": "lessons/why-invest.md",
+      "source_refs": ["investor-gov-saving-investing", "investor-gov-compound-interest", "bls-inflation"],
+      "lab_ids": ["compound-growth", "inflation"],
+      "quiz": {
+        "id": "why-invest-v1",
+        "version": "1",
+        "questions": [
+          {"question": "Which money is normally best kept out of volatile investments?", "options": ["Money needed for an emergency next month", "Money intended for retirement in 30 years", "Money with no planned use", "A long-term contribution"], "correct": 0, "explanation": "Near-term and emergency money needs stability and access; market investments can fall when the money is needed."},
+          {"question": "What does compounding mean?", "options": ["Returns are guaranteed", "Earlier growth can itself earn later growth", "Inflation stops affecting money", "Risk disappears with time"], "correct": 1, "explanation": "Compounding is growth on both the original amount and earlier gains. It does not guarantee a positive outcome."}
+        ]
+      },
+      "eagleeyes_links": [{"label": "Open Plan assumptions", "route": "/plan"}],
+      "content_version": "2026.08.1",
+      "public_preview": true
+    },
+    {
+      "id": "money-before-markets",
+      "module_id": "start-safely",
+      "title": "Money before markets",
+      "estimated_minutes": 7,
+      "concept_ids": ["emergency-reserve", "high-interest-debt", "liquidity", "fraud-awareness"],
+      "content_file": "lessons/money-before-markets.md",
+      "source_refs": ["finra-financial-foundations", "consumer-finance-emergency", "investor-gov-fraud"],
+      "lab_ids": ["contribution-timing"],
+      "quiz": {"id": "money-before-markets-v1", "version": "1", "questions": [{"question": "Why can high-interest debt come before investing additional money?", "options": ["All debt is illegal", "Paying it down can provide a known interest-cost reduction", "Investments never grow", "Brokerages prohibit debt"], "correct": 1, "explanation": "Reducing expensive debt produces a known reduction in interest expense, while investment returns are uncertain."}]},
+      "eagleeyes_links": [{"label": "Review planning context", "route": "/plan"}],
+      "content_version": "2026.08.1"
+    },
+    {
+      "id": "accounts-and-assets",
+      "module_id": "start-safely",
+      "title": "Accounts, stocks, bonds, and funds",
+      "estimated_minutes": 10,
+      "concept_ids": ["brokerage-account", "retirement-account", "stock", "bond", "etf"],
+      "content_file": "lessons/accounts-and-assets.md",
+      "source_refs": ["investor-gov-products", "irs-retirement-plans", "investor-gov-etfs"],
+      "lab_ids": [],
+      "quiz": {"id": "accounts-and-assets-v1", "version": "1", "questions": [{"question": "What is the difference between an account and an investment?", "options": ["There is no difference", "The account is the container; investments are assets held inside it", "An ETF is always an account", "A retirement account can only hold cash"], "correct": 1, "explanation": "Brokerage and retirement accounts are containers that can hold assets such as funds, stocks, bonds, and cash."}]},
+      "eagleeyes_links": [{"label": "Research an ETF", "route": "/research?view=etfs"}],
+      "content_version": "2026.08.1"
+    },
+    {
+      "id": "risk-and-time",
+      "module_id": "build-portfolio",
+      "title": "Risk and time horizon",
+      "estimated_minutes": 9,
+      "concept_ids": ["risk-tolerance", "loss-capacity", "required-risk", "time-horizon"],
+      "content_file": "lessons/risk-and-time.md",
+      "source_refs": ["finra-risk", "investor-gov-risk"],
+      "lab_ids": ["drawdown-recovery"],
+      "quiz": {"id": "risk-and-time-v1", "version": "1", "questions": [{"question": "Which statement describes loss capacity?", "options": ["How much volatility feels comfortable", "How much financial loss a person can absorb without jeopardizing needs", "The return a stock earned last year", "A prediction-market probability"], "correct": 1, "explanation": "Loss capacity is financial ability, which can differ from emotional willingness to take risk."}]},
+      "eagleeyes_links": [{"label": "Review risk assumptions", "route": "/plan"}],
+      "content_version": "2026.08.1"
+    },
+    {
+      "id": "diversification-and-etfs",
+      "module_id": "build-portfolio",
+      "title": "Diversification and ETF overlap",
+      "estimated_minutes": 10,
+      "concept_ids": ["diversification", "correlation", "etf-overlap", "concentration"],
+      "content_file": "lessons/diversification-and-etfs.md",
+      "source_refs": ["investor-gov-diversification", "finra-funds"],
+      "lab_ids": ["diversification", "etf-overlap"],
+      "quiz": {"id": "diversification-and-etfs-v1", "version": "1", "questions": [{"question": "Why can owning several ETFs still leave a portfolio concentrated?", "options": ["ETFs cannot own stocks", "Different ETFs may hold many of the same securities or sectors", "Diversification is illegal", "Every ETF follows the same bond index"], "correct": 1, "explanation": "Fund names can differ while their underlying holdings overlap substantially."}]},
+      "eagleeyes_links": [{"label": "Inspect ETF holdings", "route": "/research?view=etfs"}, {"label": "Review portfolio concentration", "route": "/portfolio"}],
+      "content_version": "2026.08.1"
+    },
+    {
+      "id": "costs-rebalancing-and-declines",
+      "module_id": "build-portfolio",
+      "title": "Costs, rebalancing, and market declines",
+      "estimated_minutes": 11,
+      "concept_ids": ["expense-ratio", "tax-drag", "rebalancing", "drawdown"],
+      "content_file": "lessons/costs-rebalancing-and-declines.md",
+      "source_refs": ["investor-gov-fees", "finra-rebalancing"],
+      "lab_ids": ["fee-drag", "drawdown-recovery"],
+      "quiz": {"id": "costs-rebalancing-and-declines-v1", "version": "1", "questions": [{"question": "What is rebalancing?", "options": ["Changing investments after every headline", "Returning an allocation toward its intended ranges", "Guaranteeing a profit", "Removing every declining asset"], "correct": 1, "explanation": "Rebalancing restores an allocation toward chosen ranges; taxes, fees, and the reason for the change still matter."}]},
+      "eagleeyes_links": [{"label": "Compare portfolio change paths", "route": "/portfolio?view=analysis"}],
+      "content_version": "2026.08.1"
+    },
+    {
+      "id": "prices-and-expectations",
+      "module_id": "understand-markets",
+      "title": "Prices and changing expectations",
+      "estimated_minutes": 8,
+      "concept_ids": ["expected-earnings", "required-return", "market-surprise", "price-volatility"],
+      "content_file": "lessons/prices-and-expectations.md",
+      "source_refs": ["investor-gov-stocks", "federal-reserve-education"],
+      "lab_ids": [],
+      "quiz": {"id": "prices-and-expectations-v1", "version": "1", "questions": [{"question": "Why can a company report growth and still see its stock fall?", "options": ["Growth is always bad", "The result may be weaker than expectations or the required return may rise", "Stock prices ignore expectations", "The exchange chooses a random price"], "correct": 1, "explanation": "Prices reflect expectations. A positive result can disappoint if investors expected more or discount rates change."}]},
+      "eagleeyes_links": [{"label": "Explore a security", "route": "/research"}],
+      "content_version": "2026.08.1"
+    },
+    {
+      "id": "fundamentals-and-valuation",
+      "module_id": "understand-markets",
+      "title": "Fundamentals are not valuation",
+      "estimated_minutes": 10,
+      "concept_ids": ["revenue", "margin", "cash-flow", "valuation", "portfolio-fit"],
+      "content_file": "lessons/fundamentals-and-valuation.md",
+      "source_refs": ["sec-company-filings", "investor-gov-research"],
+      "lab_ids": [],
+      "quiz": {"id": "fundamentals-and-valuation-v1", "version": "1", "questions": [{"question": "Can a strong company be a poor portfolio addition?", "options": ["No, company quality determines everything", "Yes, price, concentration, overlap, and the investor's constraints also matter", "Only if it pays a dividend", "Only during recessions"], "correct": 1, "explanation": "Company quality, valuation, and portfolio fit answer different questions."}]},
+      "eagleeyes_links": [{"label": "Review research evidence", "route": "/research"}],
+      "content_version": "2026.08.1"
+    },
+    {
+      "id": "macro-news-and-evidence",
+      "module_id": "understand-markets",
+      "title": "Macro, news, and evidence quality",
+      "estimated_minutes": 12,
+      "concept_ids": ["interest-rates", "inflation", "growth", "credit", "sentiment", "correlation"],
+      "content_file": "lessons/macro-news-and-evidence.md",
+      "source_refs": ["fred", "bls", "sec-investor-alerts"],
+      "lab_ids": [],
+      "quiz": {"id": "macro-news-and-evidence-v1", "version": "1", "questions": [{"question": "What does historical correlation establish?", "options": ["One variable caused the other", "The relationship will continue", "The variables moved together in the measured sample", "A trade will be profitable"], "correct": 2, "explanation": "Correlation describes measured co-movement. It does not prove causation or stability."}]},
+      "eagleeyes_links": [{"label": "Open the macro workshop", "route": "/research?view=macro"}, {"label": "Inspect prediction-market evidence", "route": "/research?view=prediction-markets"}],
+      "content_version": "2026.08.1"
+    }
+  ],
+  "sources": [
+    {"id": "investor-gov-saving-investing", "title": "Saving and Investing", "publisher": "SEC Investor.gov", "url": "https://www.investor.gov/introduction-investing/investing-basics/save-and-invest"},
+    {"id": "investor-gov-compound-interest", "title": "Compound Interest Calculator", "publisher": "SEC Investor.gov", "url": "https://www.investor.gov/financial-tools-calculators/calculators/compound-interest-calculator"},
+    {"id": "bls-inflation", "title": "Consumer Price Index", "publisher": "U.S. Bureau of Labor Statistics", "url": "https://www.bls.gov/cpi/"},
+    {"id": "finra-financial-foundations", "title": "Financial Foundations", "publisher": "FINRA", "url": "https://www.finra.org/investors/investing/investing-basics"},
+    {"id": "consumer-finance-emergency", "title": "Emergency savings", "publisher": "Consumer Financial Protection Bureau", "url": "https://www.consumerfinance.gov/an-essential-guide-to-building-an-emergency-fund/"},
+    {"id": "investor-gov-fraud", "title": "Avoiding Investment Fraud", "publisher": "SEC Investor.gov", "url": "https://www.investor.gov/protect-your-investments/fraud"},
+    {"id": "investor-gov-products", "title": "Investment Products", "publisher": "SEC Investor.gov", "url": "https://www.investor.gov/introduction-investing/investing-basics/investment-products"},
+    {"id": "irs-retirement-plans", "title": "Retirement Plans", "publisher": "Internal Revenue Service", "url": "https://www.irs.gov/retirement-plans"},
+    {"id": "investor-gov-etfs", "title": "Exchange-Traded Funds", "publisher": "SEC Investor.gov", "url": "https://www.investor.gov/introduction-investing/investing-basics/glossary/exchange-traded-fund-etf"},
+    {"id": "finra-risk", "title": "Know Your Risk Tolerance", "publisher": "FINRA", "url": "https://www.finra.org/investors/insights/know-your-risk-tolerance"},
+    {"id": "investor-gov-risk", "title": "Assessing Your Risk Tolerance", "publisher": "SEC Investor.gov", "url": "https://www.investor.gov/introduction-investing/investing-basics/save-and-invest/assess-your-risk-tolerance"},
+    {"id": "investor-gov-diversification", "title": "Asset Allocation and Diversification", "publisher": "SEC Investor.gov", "url": "https://www.investor.gov/introduction-investing/investing-basics/glossary/asset-allocation"},
+    {"id": "finra-funds", "title": "Funds", "publisher": "FINRA", "url": "https://www.finra.org/investors/investing/investment-products/mutual-funds"},
+    {"id": "investor-gov-fees", "title": "Fees and Expenses", "publisher": "SEC Investor.gov", "url": "https://www.investor.gov/introduction-investing/getting-started/understanding-fees"},
+    {"id": "finra-rebalancing", "title": "Rebalancing Your Investment Portfolio", "publisher": "FINRA", "url": "https://www.finra.org/investors/insights/rebalancing-your-investment-portfolio"},
+    {"id": "investor-gov-stocks", "title": "Stocks", "publisher": "SEC Investor.gov", "url": "https://www.investor.gov/introduction-investing/investing-basics/investment-products/stocks"},
+    {"id": "federal-reserve-education", "title": "Federal Reserve Education", "publisher": "Federal Reserve", "url": "https://www.federalreserveeducation.org/"},
+    {"id": "sec-company-filings", "title": "Using EDGAR to Research Investments", "publisher": "U.S. Securities and Exchange Commission", "url": "https://www.sec.gov/search-filings"},
+    {"id": "investor-gov-research", "title": "Researching Investments", "publisher": "SEC Investor.gov", "url": "https://www.investor.gov/introduction-investing/getting-started/researching-investments"},
+    {"id": "fred", "title": "Federal Reserve Economic Data", "publisher": "Federal Reserve Bank of St. Louis", "url": "https://fred.stlouisfed.org/"},
+    {"id": "bls", "title": "Economic Releases", "publisher": "U.S. Bureau of Labor Statistics", "url": "https://www.bls.gov/bls/newsrels.htm"},
+    {"id": "sec-investor-alerts", "title": "Investor Alerts and Bulletins", "publisher": "SEC Investor.gov", "url": "https://www.investor.gov/introduction-investing/general-resources/news-alerts/alerts-bulletins"}
+  ]
+}
