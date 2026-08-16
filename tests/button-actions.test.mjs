@@ -46,7 +46,7 @@ test("manual research terminal exposes a persistent actionable widget catalog", 
     assert.match(source, new RegExp(widget));
   }
   assert.match(source, /Research terminal/);
-  for (const workspace of ["Today", "Plan", "Portfolio", "Research", "Ask EagleEyes", "Advanced"]) {
+  for (const workspace of ["Today", "Portfolio", "Research", "Decisions", "Ask EagleEyes", "Plan & profile", "Learn", "Advanced"]) {
     assert.match(routes, new RegExp(`"${workspace}"`));
   }
   assert.match(source, /terminal_widgets/);
@@ -57,7 +57,7 @@ test("market workspace keeps planning secondary and route compatibility explicit
   const today = await readFile(todayPath, "utf8");
   const routes = await readFile(routesPath, "utf8");
   const catchAllRoute = await readFile(catchAllRoutePath, "utf8");
-  for (const legacy of ["/overview", "/scenarios", "/research", "/optimize", "/ai-workspace", "/research-terminal"]) {
+  for (const legacy of ["/overview", "/scenarios", "/research", "/optimize", "/ai-workspace", "/research-terminal", "/decision-lab"]) {
     assert.match(routes, new RegExp(legacy.replaceAll("/", "\\/")));
   }
   assert.match(today, /What currently matters to your portfolio/);

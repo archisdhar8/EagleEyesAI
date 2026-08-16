@@ -80,6 +80,7 @@ test("legacy routes canonicalize without losing the requested subview", async ({
     ["/overview", "/today"], ["/scenarios", "/research?view=scenarios"],
     ["/research", "/research"], ["/optimize", "/portfolio?view=analysis"],
     ["/ai-workspace", "/ask"], ["/research-terminal", "/advanced?view=terminal"],
+    ["/decision-lab", "/decisions"], ["/portfolio?view=lab", "/decisions"],
   ]) {
     await page.goto(legacy);
     await expect(page).toHaveURL(new RegExp(canonical.replace("?", "\\?")));
@@ -208,7 +209,7 @@ test("Stock Basket Builder discloses its universe, risk contribution, and benchm
 test("Decision Lab compares six choices on one paired path set", async ({ page }) => {
   await installApiMock(page);
   await signIn(page);
-  await page.goto("/portfolio?view=analysis");
+  await page.goto("/decisions");
   await page.getByRole("button", { name: "Run Decision Lab" }).click();
   await expect(page.getByText("Paired paths browser-shared-paths")).toBeVisible();
   await expect(page.getByText("Today’s dollars", { exact: false }).first()).toBeVisible();

@@ -14,8 +14,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "InvestmentDashboard — Portfolio Research Sandbox",
-  description: "Explainable scenario research, security scoring, and portfolio alternatives for long-term investors.",
+  title: "EagleEyes — Investment Decision System",
+  description: "Evidence-grounded research, portfolio analysis, and persistent investment decision support.",
 };
 
 export default function RootLayout({

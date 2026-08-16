@@ -28,7 +28,7 @@ test("AI dashboard v1 keeps exact layout task and result references", async () =
 
 test("all legacy routes resolve through the centralized route contract", async () => {
   const routes = await read("app/lib/routes.ts");
-  for (const path of ["/overview", "/home", "/scenarios", "/research", "/optimize", "/ai-workspace", "/research-terminal"]) {
+  for (const path of ["/overview", "/home", "/scenarios", "/research", "/optimize", "/ai-workspace", "/research-terminal", "/decision-lab"]) {
     assert.match(routes, new RegExp(`"${path.replaceAll("/", "\\/")}"`));
   }
   assert.match(routes, /"\/today"/);
@@ -37,7 +37,7 @@ test("all legacy routes resolve through the centralized route contract", async (
 
 test("Dashboard remains an orchestration surface after workspace extraction", async () => {
   const dashboard = await read("app/Dashboard.tsx");
-  for (const component of ["PlanPage", "PortfolioPage", "ExplorePage", "AskPage", "AdvancedPage"]) {
+  for (const component of ["PlanPage", "PortfolioPage", "ExplorePage", "DecisionsPage", "AskPage", "AdvancedPage"]) {
     assert.match(dashboard, new RegExp(`import \\{ ${component}`));
   }
   for (const oldDefinition of ["function PlanPage", "function PortfolioWorkspace", "function AIWorkspace", "function AdvancedWorkspace", "function ResearchTerminal"]) {
@@ -45,6 +45,7 @@ test("Dashboard remains an orchestration surface after workspace extraction", as
   }
   assert.match(await read("app/components/plan/PlanPage.tsx"), /PlanPage/);
   assert.match(await read("app/components/portfolio/PortfolioPage.tsx"), /PortfolioPage/);
+  assert.match(await read("app/components/decisions/DecisionsPage.tsx"), /DecisionsPage/);
   assert.match(await read("app/components/ask/AskPage.tsx"), /AskPage/);
   assert.match(await read("app/components/terminal/AdvancedPage.tsx"), /AdvancedPage/);
 });

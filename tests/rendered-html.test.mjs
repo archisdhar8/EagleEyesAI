@@ -22,14 +22,14 @@ async function render() {
   );
 }
 
-test("server-renders InvestmentDashboard", async () => {
+test("server-renders EagleEyes", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
-  assert.match(html, /<title>InvestmentDashboard/);
+  assert.match(html, /<title>EagleEyes — Investment Decision System/);
   assert.match(html, /Opening your research workspace/);
-  assert.match(html, /InvestmentDashboard — Portfolio Research Sandbox/);
+  assert.match(html, /Evidence-grounded research, portfolio analysis, and persistent investment decision support/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/);
 });

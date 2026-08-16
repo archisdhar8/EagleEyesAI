@@ -8,11 +8,12 @@ import { PortfolioPage } from "./components/portfolio/PortfolioPage";
 import { ExplorePage } from "./components/research/ExplorePage";
 import { LearnPage } from "./components/learn/LearnPage";
 import { AskPage } from "./components/ask/AskPage";
+import { DecisionsPage } from "./components/decisions/DecisionsPage";
 import { AdvancedPage, ResearchTerminal } from "./components/terminal/AdvancedPage";
 import { adaptDashboardSpecification } from "./components/ask/contracts";
 import { adaptTerminalWidgets, type TerminalLayout, type TerminalWidgetConfig, type TerminalWidgetType } from "./components/terminal/contracts";
 import { normalizePresentationLevel } from "./lib/presentation-level";
-import { pathForTab, resolveAppRoute, type AdvancedView, type ExploreView, type PortfolioView, type Tab } from "./lib/routes";
+import { navigationLabel, pathForTab, resolveAppRoute, type AdvancedView, type ExploreView, type PortfolioView, type RouteState, type Tab } from "./lib/routes";
 import {
   defaultPolicy, defaultProfile, defaultTerminalWidgets, seededScenarios, terminalCatalog,
   type Analysis, type Contract, type DashboardCatalogItem, type DashboardJob,
@@ -154,18 +155,28 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   },[apiRequest]);
 
   useEffect(() => {
-    const route = resolveAppRoute(window.location.pathname, window.location.search);
-    if (!route) return;
-    if (`${window.location.pathname}${window.location.search}` !== route.canonicalPath) window.history.replaceState({}, "", route.canonicalPath);
-    const frame=window.requestAnimationFrame(()=>{setTab(route.tab);
+    function applyRoute(route: RouteState) {
+      setTab(route.tab);
       if(route.exploreView)setExploreView(route.exploreView);
       if(route.portfolioView)setPortfolioView(route.portfolioView);
       if(route.advancedView)setAdvancedView(route.advancedView);
       setLearningModule(route.learningModule);
       setLearningLesson(route.learningLesson);
-    });
-    return()=>window.cancelAnimationFrame(frame);
+    }
+    function handleLocation() {
+      const route = resolveAppRoute(window.location.pathname, window.location.search);
+      if (!route) return;
+      if (`${window.location.pathname}${window.location.search}` !== route.canonicalPath) window.history.replaceState({}, "", route.canonicalPath);
+      applyRoute(route);
+    }
+    const frame=window.requestAnimationFrame(handleLocation);
+    window.addEventListener("popstate", handleLocation);
+    return()=>{window.cancelAnimationFrame(frame);window.removeEventListener("popstate",handleLocation);};
   },[]);
+
+  useEffect(() => {
+    document.title = `${navigationLabel(tab)} — EagleEyes`;
+  }, [tab]);
 
   useEffect(() => {
     let active = true;
@@ -742,11 +753,12 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
 
   return (
     <AppShell activeTab={tab} density={preferences.density} connected={connected} dark={dark} email={email} freshness={macro.as_of || "Awaiting refresh"} presentationLevel={preferences.presentation_level} onNavigate={navigate} onPresentationLevel={level=>void savePreferences({...preferences,presentation_level:level})} onToggleTheme={toggleTheme} onSignOut={onSignOut} onLearnConcept={navigateLearn} onDismissNotice={()=>setNotice("")} status={busy} notice={notice}
-      topAction={tab==="learn"?<button className="widget-button" onClick={()=>navigateExplore("stocks")}>Open Research →</button>:<>{tab==="advanced"&&advancedView==="terminal"?<button className="widget-button" onClick={()=>setTerminalCatalogOpen(true)}>＋ Add widget</button>:<button className="widget-button" onClick={()=>setCustomizing(!customizing)}>View settings</button>}<button className="primary" onClick={() => navigatePortfolio("analysis")}>Run analysis <span>→</span></button></>}
+      topAction={tab==="learn"?<button className="widget-button" onClick={()=>navigateExplore("stocks")}>Open Research →</button>:tab==="decisions"?<button className="primary" onClick={()=>navigatePortfolio("holdings")}>Review portfolio <span>→</span></button>:<>{tab==="advanced"&&advancedView==="terminal"?<button className="widget-button" onClick={()=>setTerminalCatalogOpen(true)}>＋ Add widget</button>:<button className="widget-button" onClick={()=>setCustomizing(!customizing)}>View settings</button>}<button className="primary" onClick={() => navigatePortfolio("analysis")}>Run analysis <span>→</span></button></>}
       drawer={customizing ? <div className="widget-drawer"><div><strong>Macro evidence</strong>{["rates","inflation","growth","labor","credit"].map(key => <label key={key}><input type="checkbox" checked={preferences.macro_widgets.includes(key)} onChange={() => toggleWidget("macro_widgets", key)} />{key}</label>)}</div><div><strong>Security evidence</strong>{["market","scores","fundamentals","news","prediction_markets"].map(key => <label key={key}><input type="checkbox" checked={preferences.research_widgets.includes(key)} onChange={() => toggleWidget("research_widgets", key)} />{key.replaceAll("_", " ")}</label>)}</div><label>Density<select value={preferences.density} onChange={event => void savePreferences({ ...preferences, density: event.target.value as Preferences["density"] })}><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select></label></div> : undefined}>
         {tab === "today" && <TodayPage loading={loading} refreshing={busy === "Refreshing market and macro data"} briefing={homeBriefing} macroFactors={macroFactors.filter(item => preferences.macro_widgets.includes(item.key))} dataStatus={dataStatus} onRefresh={refreshToday} onNavigate={navigate} onExplore={navigateExplore} onPortfolio={navigatePortfolio} onAdvanced={navigateAdvanced} />}
         {tab === "plan" && <PlanPage profile={profile} setProfile={setProfile} goals={goals} projections={goalProjections} policy={investmentPolicy} setPolicy={setInvestmentPolicy} guidance={planGuidance} onSavePolicy={()=>saveInvestmentPolicy(false)} onApprovePolicy={()=>saveInvestmentPolicy(true)} onSaveProfile={savePlanProfile} onSaveGoal={saveGoal} onDeleteGoal={deleteGoal} onProject={projectGoal} onOpenPortfolio={()=>navigatePortfolio("analysis")} />}
         {tab === "portfolio" && <PortfolioPage view={portfolioView} setView={navigatePortfolio} request={apiRequest} holdings={holdings} setHoldings={setHoldings} name={portfolioName} setName={setPortfolioName} total={currentWeightTotal} dirty={portfolioDirty} errors={portfolioErrors} saving={busy === "Saving portfolio"} onSave={savePortfolio} onImport={importCsv} profile={profile} goals={goals} setProfile={setProfile} analysis={analysis} monitoring={monitoring} guidance={planGuidance} diagnostics={portfolioDiagnostics} performance={terminalPerformance} presentationLevel={preferences.presentation_level} selected={selectedAlternative} setSelected={setSelectedAlternative} onRun={runOptimization} analysisBusy={busy === "Running scenario analysis"} narrative={narrative} onNarrative={generateNarrative} portfolioChatMessages={portfolioChatMessages} portfolioChatQuestion={portfolioChatQuestion} setPortfolioChatQuestion={setPortfolioChatQuestion} onAskPortfolio={askPortfolioChat} portfolioChatBusy={portfolioChatBusy} portfolioConversationControls={{conversations:portfolioConversations,currentId:portfolioConversationId,artifacts:portfolioChatArtifacts,onNew:()=>void newChatConversation("portfolio"),onOpen:id=>void openChatConversation("portfolio",id),onRename:id=>void renameChatConversation("portfolio",id),onDelete:id=>void deleteChatConversation("portfolio",id),onBuildBoard:()=>buildBoardFromConversation("portfolio")}} />}
+        {tab === "decisions" && <DecisionsPage request={apiRequest} holdings={holdings} profile={profile} goals={goals} onOpenPortfolio={()=>navigatePortfolio("holdings")} />}
         {tab === "explore" && <ExplorePage view={exploreView} setView={navigateExplore} request={(path,init)=>apiFetch(`${API}${path}`,init)} onManageUniverse={()=>navigatePortfolio("holdings")} scenarios={scenarios} contracts={contracts} fetchedAt={scenarioFetchedAt} regimeHistory={regimeHistory} warnings={scenarioWarnings} onRefreshMarkets={refreshMarkets} rows={sortedResearch} holdings={holdings} profile={profile} presentationLevel={preferences.presentation_level} sortKey={sortKey} setSortKey={setSortKey} onRefreshResearch={refreshResearch} widgets={preferences.research_widgets} macro={macro} macroFactors={macroFactors} watchlist={profile.watchlist} researchChatMessages={researchChatMessages} researchChatQuestion={researchChatQuestion} setResearchChatQuestion={setResearchChatQuestion} onAskResearch={askResearchChat} researchChatBusy={researchChatBusy} researchConversationControls={{conversations:researchConversations,currentId:researchConversationId,artifacts:researchChatArtifacts,onNew:()=>void newChatConversation("research"),onOpen:id=>void openChatConversation("research",id),onRename:id=>void renameChatConversation("research",id),onDelete:id=>void deleteChatConversation("research",id),onBuildBoard:()=>buildBoardFromConversation("research")}} />}
         {tab === "learn" && <LearnPage request={apiRequest} moduleSlug={learningModule} lessonId={learningLesson} onOpenLesson={navigateLearn} onOpenHub={()=>navigateLearn()} onDeepLink={navigateDeepLink} />}
         {tab === "ask" && <AskPage job={dashboardJob} views={dashboardViews} catalog={dashboardCatalog} selectedView={selectedDashboardView} prompt={dashboardPrompt} setPrompt={setDashboardPrompt} busy={dashboardBusy} presentationLevel={preferences.presentation_level} onCreate={createAIDashboard} onRevise={reviseAIDashboard} onCancel={cancelAIDashboard} onSave={saveAIDashboard} onDiscard={() => { setDashboardJob(null); setSelectedDashboardView(null); setDashboardSourceConversationId(null); }} onOpenView={openDashboardView} onRefreshView={refreshDashboardView} onDuplicateView={duplicateDashboardView} onRenameView={renameDashboardView} onDeleteView={deleteDashboardView} onMoveWidget={moveDashboardWidget} onResizeWidget={resizeDashboardWidget} onRemoveWidget={removeDashboardWidget} onAddWidget={addDashboardWidget} />}

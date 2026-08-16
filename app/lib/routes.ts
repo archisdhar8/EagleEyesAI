@@ -1,6 +1,6 @@
-export type Tab = "today" | "plan" | "portfolio" | "explore" | "learn" | "ask" | "advanced";
+export type Tab = "today" | "portfolio" | "explore" | "decisions" | "ask" | "plan" | "learn" | "advanced";
 export type ExploreView = "stocks" | "etfs" | "etf-builder" | "stock-builder" | "sectors" | "themes" | "macro" | "scenarios" | "prediction-markets" | "compare" | "watchlist";
-export type PortfolioView = "holdings" | "analysis" | "lab";
+export type PortfolioView = "holdings" | "analysis";
 export type AdvancedView = "terminal" | "diagnostics" | "validation" | "lineage" | "providers";
 
 export type RouteState = {
@@ -13,15 +13,21 @@ export type RouteState = {
   canonicalPath: string;
 };
 
-export const NAV_ITEMS: ReadonlyArray<readonly [Tab, string, string]> = [
+export const PRIMARY_NAV_ITEMS: ReadonlyArray<readonly [Tab, string, string]> = [
   ["today", "⌂", "Today"],
-  ["plan", "◌", "Plan"],
   ["portfolio", "◫", "Portfolio"],
   ["explore", "◎", "Research"],
-  ["learn", "◇", "Learn"],
+  ["decisions", "◈", "Decisions"],
   ["ask", "✦", "Ask EagleEyes"],
+];
+
+export const SECONDARY_NAV_ITEMS: ReadonlyArray<readonly [Tab, string, string]> = [
+  ["plan", "◌", "Plan & profile"],
+  ["learn", "◇", "Learn"],
   ["advanced", "▦", "Advanced"],
 ];
+
+export const NAV_ITEMS = [...PRIMARY_NAV_ITEMS, ...SECONDARY_NAV_ITEMS] as const;
 
 const ROUTES: Record<string, Omit<RouteState, "canonicalPath"> & { canonicalPath?: string }> = {
   "/": { tab: "today", canonicalPath: "/today" },
@@ -31,6 +37,8 @@ const ROUTES: Record<string, Omit<RouteState, "canonicalPath"> & { canonicalPath
   "/plan": { tab: "plan" },
   "/portfolio": { tab: "portfolio" },
   "/optimize": { tab: "portfolio", portfolioView: "analysis", canonicalPath: "/portfolio?view=analysis" },
+  "/decisions": { tab: "decisions" },
+  "/decision-lab": { tab: "decisions", canonicalPath: "/decisions" },
   "/explore": { tab: "explore", canonicalPath: "/research" },
   "/research": { tab: "explore", exploreView: "stocks" },
   "/learn": { tab: "learn" },
@@ -58,12 +66,15 @@ export function resolveAppRoute(pathname: string, search = ""): RouteState | nul
   const definition = ROUTES[pathname];
   if (!definition) return null;
   const requestedView = new URLSearchParams(search).get("view");
+  if (pathname === "/portfolio" && requestedView === "lab") {
+    return { tab: "decisions", canonicalPath: "/decisions" };
+  }
   const normalizedExploreView = requestedView === "securities" ? "stocks" : requestedView === "comparisons" ? "compare" : requestedView;
   const exploreView = definition.tab === "explore"
     ? oneOf(normalizedExploreView, ["stocks", "etfs", "etf-builder", "stock-builder", "sectors", "themes", "macro", "scenarios", "prediction-markets", "compare", "watchlist"] as const) || definition.exploreView || "stocks"
     : undefined;
   const portfolioView = definition.tab === "portfolio"
-    ? oneOf(requestedView, ["holdings", "analysis", "lab"] as const) || definition.portfolioView
+    ? oneOf(requestedView, ["holdings", "analysis"] as const) || definition.portfolioView
     : undefined;
   const advancedView = definition.tab === "advanced"
     ? oneOf(requestedView, ["terminal", "diagnostics", "validation", "lineage", "providers"] as const) || definition.advancedView
@@ -83,4 +94,12 @@ export function pathForTab(tab: Tab): string {
   if (tab === "today") return "/today";
   if (tab === "explore") return "/research";
   return `/${tab}`;
+}
+
+export function navigationLabel(tab: Tab): string {
+  return NAV_ITEMS.find(item => item[0] === tab)?.[2] || "EagleEyes";
+}
+
+export function isPrimaryTab(tab: Tab): boolean {
+  return PRIMARY_NAV_ITEMS.some(item => item[0] === tab);
 }
