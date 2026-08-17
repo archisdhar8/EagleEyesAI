@@ -29,12 +29,32 @@ def test_chat_continues_a_max_tokens_response(monkeypatch) -> None:
         return next(responses)
 
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_MAX_CONTINUATIONS", "1")
     monkeypatch.setattr("backend.chat.requests.post", fake_post)
     answer, model = ask_gemini("What changed?", [], [])
 
     assert "The first part ends here" in answer
     assert "and this completes the answer" in answer
     assert len(calls) == 2
-    assert calls[0]["generationConfig"]["maxOutputTokens"] == 2200
+    assert calls[0]["generationConfig"]["maxOutputTokens"] == 1200
+    assert calls[1]["generationConfig"]["maxOutputTokens"] == 600
     assert calls[1]["contents"][-1]["role"] == "user"
     assert model
+
+
+def test_chat_cleans_partial_answer_without_a_second_request(monkeypatch) -> None:
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs["json"])
+        return _Response("A completed evidence-backed sentence. An unfinished fragment [", "MAX_TOKENS")
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_MAX_CONTINUATIONS", "0")
+    monkeypatch.setattr("backend.chat.requests.post", fake_post)
+    answer, _ = ask_gemini("What changed?", [], [])
+
+    assert len(calls) == 1
+    assert answer.startswith("A completed evidence-backed sentence.")
+    assert "unfinished fragment" not in answer
+    assert "response was shortened" in answer.lower()

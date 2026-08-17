@@ -3,7 +3,7 @@ export const PRESENTATION_LEVELS = ["simple", "detailed", "expert"] as const;
 export type PresentationLevel = typeof PRESENTATION_LEVELS[number];
 
 export function normalizePresentationLevel(value: unknown): PresentationLevel {
-  return PRESENTATION_LEVELS.includes(value as PresentationLevel) ? value as PresentationLevel : "detailed";
+  return value === "expert" ? "expert" : "detailed";
 }
 export function presentationCopy(level: PresentationLevel) {
   if (level === "simple") return { label: "Simple", detail: "Conclusions and essential evidence" };

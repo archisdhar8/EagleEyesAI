@@ -8,7 +8,7 @@ The default experience uses plain-language evidence buckets, portfolio relevance
 
 The app does not connect to a broker, submit trades, or claim to produce a best portfolio.
 
-For a detailed description of every user-facing page, widget, calculation layer, workflow, and limitation, read the [complete user guide](docs/USER_GUIDE.md).
+For the authoritative map of every workspace, sub-tab, page design, user action, output, dependency, and product-review checkpoint, read [PRODUCT.md](PRODUCT.md). The [complete user guide](docs/USER_GUIDE.md) remains a supplementary walkthrough of the earlier core workflows.
 
 This repository is standalone: its Python environment, private backend configuration, local SQLite fallback, and optional provider caches all live inside `InvestmentDashboard`. It does not require the older parent `investment-thesis` project.
 
@@ -114,6 +114,16 @@ GitHub Actions schedules prediction markets hourly, prices/macro/news on weekday
 Daily and monthly data jobs also run `python -m backend.monitoring run`. Each run persists prediction-market calibration, covariance conditioning, regime counts, benchmark performance, turnover, allocation stability, freshness, and coverage. New model versions enter evaluation first; a database promotion gate requires an immutable promotion decision before production status is allowed.
 
 Legacy FRED cache rows are explicitly marked as not point-in-time because they contain latest-known observations. Scheduled FRED rows preserve their retrieval vintage so model validation can distinguish them.
+
+## Phase 10 trust, alerts, and personalization
+
+Financial outputs now share a five-part trust vocabulary: verified fact, deterministic model output, market-implied evidence, user belief, and AI interpretation. Missing, stale, partial, and unsupported evidence stays explicit. Historical decision reviews distinguish what was known at the decision boundary from evidence available now.
+
+Alerts are in-app only and are materialized from the existing Today attention feed. They reuse the attention `group_key`, preserve superseded history, and never create a signal from price movement alone. Alert categories and the materiality threshold are user controlled.
+
+Decision preferences combine explicit profile/policy settings with reviewable journal inferences. Journal patterns require the established minimum sample; users must accept or edit an inference before it can affect Today ordering, Research tie-breaking, or Ask context. The ranking explanation names the accepted preference and never rewrites financial scores.
+
+Authenticated operational endpoints expose provider health, recent error rates, last success, stale duration, and a latency audit. Ask remains bounded to five tools, zero automatic retries, and a 24-second overall budget.
 
 ## Verification
 

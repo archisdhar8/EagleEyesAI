@@ -22,6 +22,7 @@ from .quant import (
     portfolio_path_metrics,
 )
 from .scenarios import refresh as refresh_scenarios
+from .portfolio_eligibility import equity_analysis_holdings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -894,6 +895,10 @@ def _tax_estimate(weights: np.ndarray, current: np.ndarray, research: list[dict[
 
 
 def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> dict[str, Any]:
+    source_holdings = holdings
+    holdings, analysis_exclusions = equity_analysis_holdings(source_holdings)
+    if not holdings:
+        raise ValueError("The portfolio has no eligible stock or ETF positions to analyze")
     scenario_payload = refresh_scenarios(force=False)
     scenarios = scenario_payload["scenarios"]
     tickers = [h["ticker"].upper() for h in holdings]
@@ -1029,6 +1034,13 @@ def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> di
         "id": run_id, "created_at": datetime.now(timezone.utc).isoformat(), "model_version": "walk-forward-regime-shrinkage-v2",
         "macro": latest_macro(), "scenarios": scenarios, "scenario_warnings": scenario_payload["warnings"],
         "portfolio_value": round(portfolio_value, 2), "current_weights": {row["ticker"]: round(float(current[i]), 4) for i, row in enumerate(research) if current[i] > 0},
+        "analysis_universe": {
+            "eligible_asset_types": ["common_stock", "etf"],
+            "eligible_tickers": [holding["ticker"].upper() for holding in holdings],
+            "excluded_positions": analysis_exclusions,
+            "analyzed_market_value": round(portfolio_value, 2),
+            "source_portfolio_market_value": round(sum(_num(row.get("market_value")) for row in source_holdings), 2),
+        },
         "research": research, "alternatives": alternatives, "implementation_paths": implementation_paths,
         "model_diagnostics": model_diagnostics, "walk_forward": walk_forward,
         "benchmarks": walk_forward.get("benchmarks", []),
@@ -1036,6 +1048,7 @@ def run_analysis(holdings: list[dict[str, Any]], profile: InvestorProfile) -> di
         "warnings": [
             "Decision-support research only; no trades are submitted.",
             "Expected returns and projections are model estimates, not guarantees.",
+            *([f"Excluded non-equity positions from stock/ETF analysis: {', '.join(row['ticker'] for row in analysis_exclusions)}."] if analysis_exclusions else []),
             *(["Walk-forward validation is unavailable until more overlapping price and point-in-time regime history exists."] if walk_forward["status"] != "complete" else []),
             *([f"Full-cycle adjusted-price history is insufficient for: {', '.join(insufficient_history)}. Regime estimates use disclosed sector/broad-ETF priors and company-return adjustments are shrunk."] if insufficient_history else []),
         ],

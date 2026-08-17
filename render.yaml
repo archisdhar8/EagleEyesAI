@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: eagleeyes-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: POLYGON_API_KEY
+        sync: false
+      - key: TIINGO_API_KEY
+        sync: false
+      - key: FRED_API_KEY
+        sync: false
+      - key: SEC_USER_AGENT
+        sync: false

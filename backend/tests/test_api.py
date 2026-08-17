@@ -1,6 +1,10 @@
+import pytest
 from fastapi.testclient import TestClient
 
-from backend.main import _company_research_chat_tools, _conversation_summary, _portfolio_chat_tools, app
+from backend.main import (
+    _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
+    _cors_allowed_origins, _portfolio_chat_tools, _security_ranking_chat_tools, app,
+)
 
 
 def test_health_reports_storage_and_disables_trading() -> None:
@@ -40,6 +44,16 @@ def test_local_dev_cors_accepts_dynamic_frontend_port() -> None:
         )
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://localhost:3001"
+
+
+def test_production_cors_accepts_only_exact_configured_origins() -> None:
+    assert _cors_allowed_origins(
+        "https://eagleeyes-ai.vercel.app/, https://preview.example.com,https://eagleeyes-ai.vercel.app"
+    ) == ["https://eagleeyes-ai.vercel.app", "https://preview.example.com"]
+    with pytest.raises(RuntimeError, match="exact http"):
+        _cors_allowed_origins("*")
+    with pytest.raises(RuntimeError, match="exact http"):
+        _cors_allowed_origins("eagleeyes-ai.vercel.app")
 
 
 def test_provider_status_has_safe_sqlite_fallback() -> None:
@@ -213,7 +227,9 @@ def test_market_workspace_aliases_return_existing_evidence(monkeypatch) -> None:
     relevance = home.json()["briefing"]["portfolio_relevance"]
     assert [row["factor"] for row in relevance] == ["Higher rates", "Inflation", "Recession", "Oil shock"]
     assert all(row["relevance"] in {"low", "moderate", "high"} for row in relevance)
-    assert "allocation change is justified" in home.json()["briefing"]["summary"]
+    summary = home.json()["briefing"]["summary"]
+    assert "No material changes were detected" in summary
+    assert home.json()["briefing"]["attention_summary"]["no_material_change"] is True
     assert [row["ticker"] for row in securities.json()] == ["AAPL", "MSFT"]
     assert markets.json()["contracts"] == []
 
@@ -399,6 +415,23 @@ def test_chat_returns_grounded_reply(monkeypatch) -> None:
     assert response.json()["sources"][0]["id"] == "S1"
 
 
+def test_chat_returns_tool_fallback_instead_of_502_when_gemini_times_out(monkeypatch) -> None:
+    monkeypatch.setattr("backend.main.database.DATABASE_URL", "postgresql://test")
+    monkeypatch.setattr("backend.main.database.initialize", lambda: None)
+    monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{"id": "portfolio-1"}])
+    monkeypatch.setattr("backend.main.database.create_conversation", lambda user_id, title, portfolio_id, workspace="research": {"id": "conversation-1", "workspace": workspace})
+    monkeypatch.setattr("backend.main.database.get_conversation", lambda user_id, conversation_id: {"id": conversation_id, "title": "Existing research", "workspace": "research", "summary": "", "summary_message_count": 0})
+    monkeypatch.setattr("backend.main.database.conversation_messages", lambda user_id, conversation_id: [])
+    monkeypatch.setattr("backend.main.database.save_chat_message", lambda user_id, conversation_id, role, content, structured=None, model=None: {"id": "message-1", "role": role, "content": content, "model": model, "structured_content": structured or {}})
+    monkeypatch.setattr("backend.main.retrieve_evidence", lambda user_id, question: [{"label": "Portfolio", "url": None, "as_of": "2026-08-09", "data": {}}])
+    monkeypatch.setattr("backend.main.ask_gemini", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("timeout")))
+    with TestClient(app) as client:
+        response = client.post("/api/chat/messages", json={"question": "Explain the available stored evidence."})
+    assert response.status_code == 200
+    assert response.json()["message"]["model"] == "deterministic-timeout-fallback-v1"
+    assert "did not respond within the interactive deadline" in response.json()["message"]["content"]
+
+
 def test_portfolio_chat_runs_simulation_as_visible_tool(monkeypatch) -> None:
     monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{"id": "portfolio-1", "holdings": [{"ticker": "SPY", "weight": 1.0}]}])
     monkeypatch.setattr("backend.main.database.load_profile", lambda user_id: {"horizon_years": 10})
@@ -422,6 +455,62 @@ def test_portfolio_chat_runs_simulation_as_visible_tool(monkeypatch) -> None:
     }
     assert tools[0]["summary"]["strategies"][0]["median_wealth"] == 125000.0
     assert evidence[0]["label"] == "Portfolio Decision Lab tool result"
+
+
+def test_scenario_fast_answer_compares_paths_without_claiming_a_twenty_year_recession() -> None:
+    tools = [{
+        "tool_name": "portfolio_decision_lab", "status": "complete", "title": "Portfolio simulation",
+        "input_summary": {"paths": 1000, "horizon_years": 20, "scenario": {
+            "economic_state": "recession", "inflation_state": "accelerating",
+            "rate_state": "unconditioned", "shocks": [],
+        }},
+        "summary": {"warnings": [], "strategies": [
+            {"key": "current", "label": "Current / do nothing", "median_wealth": 7_040_314,
+             "probability_of_loss": .24, "modeled_drawdown": -.79, "robustness": "Moderate"},
+            {"key": "immediate", "label": "Immediate transition", "median_wealth": 8_109_062,
+             "probability_of_loss": .20, "modeled_drawdown": -.78, "robustness": "Moderate"},
+        ]},
+    }]
+    answer = _deterministic_chat_answer("SCENARIO", tools)
+    assert answer is not None
+    assert "Immediate transition" in answer
+    assert "$1,068,748" in answer
+    assert "does **not** assume the recession lasts 20 years" in answer
+    assert "AXP" not in answer
+
+
+def test_security_ranking_is_limited_to_saved_holdings(monkeypatch) -> None:
+    monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{"holdings": [
+        {"ticker": "AAPL", "weight": .6}, {"ticker": "MU", "weight": .3}, {"ticker": "CASH", "weight": .1},
+    ]}])
+    rows = [
+        {"ticker": "AAPL", "company": "Apple", "sector": "Technology", "industry": "Hardware",
+         "final_score": 75, "confidence": 80, "data_quality": "high", "growth_rating": 70,
+         "valuation_score": 62, "fundamental_score": 78, "industry_score": 65, "technical_score": 60,
+         "component_coverage": {"growth": True, "valuation": True, "business_quality": True, "industry_position": True, "price_behavior": True}},
+        {"ticker": "MU", "company": "Micron", "sector": "Technology", "industry": "Semiconductors",
+         "final_score": 48, "confidence": 60, "data_quality": "medium", "growth_rating": 55,
+         "valuation_score": 52, "fundamental_score": 40, "industry_score": 42, "technical_score": 45,
+         "component_coverage": {"growth": True, "valuation": True, "business_quality": True, "industry_position": True, "price_behavior": True}},
+    ]
+    monkeypatch.setattr("backend.main.security_research", lambda tickers: rows)
+    tools, evidence = _security_ranking_chat_tools("user-1", "Which holdings have the strongest and weakest research evidence?")
+    assert tools[0]["summary"]["universe"]["tickers"] == ["AAPL", "MU"]
+    assert [row["ticker"] for row in tools[0]["summary"]["ranked"]] == ["AAPL", "MU"]
+    answer = _deterministic_chat_answer("RESEARCH_RANKING", tools)
+    assert answer is not None and "AAPL" in answer and "MU" in answer
+    assert "expected return" in answer
+
+
+def test_slow_narrator_fallback_preserves_company_tool_evidence() -> None:
+    answer = _chat_narration_fallback([{
+        "tool_name": "company_research_refresh", "status": "partial", "title": "MU company evidence", "ticker": "MU",
+        "summary": {"price": 142.5, "price_as_of": "2026-08-14", "revenue_growth": .18,
+                    "net_margin": .12, "news": {"article_count": 3}, "warnings": ["Fundamentals are delayed."]},
+    }])
+    assert "MU" in answer and "$142.50" in answer and "18.0%" in answer
+    assert "did not respond within the interactive deadline" in answer
+    assert "invent" in answer
 
 
 def test_company_chat_refreshes_approved_research_and_returns_article_lineage(monkeypatch) -> None:

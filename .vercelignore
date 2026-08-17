@@ -1,0 +1,15 @@
+.venv
+.wrangler
+.pytest_cache
+backend
+content
+data
+db
+docs
+examples
+FinLearnAI
+supabase
+test-results
+tests
+worker
+*.pyc

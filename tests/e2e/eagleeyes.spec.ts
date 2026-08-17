@@ -7,11 +7,12 @@ async function signIn(page: Page) {
   await page.getByTestId("auth-password").fill("browser-test-password");
   await page.getByTestId("auth-submit").click();
   await expect(page.getByRole("heading", { name: "Today", exact: true })).toBeVisible();
-  await expect(page.getByText("What currently matters to your portfolio", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "What requires my attention today?", exact: true })).toBeVisible();
 }
 
 async function buildBoard(page: Page, prompt = "Show my portfolio return and risks") {
   await page.goto("/ask");
+  await page.getByText("Build or open a calculated research board", { exact: true }).click();
   const composer = page.getByPlaceholder("Describe the dashboard you want…");
   await composer.fill(prompt);
   await page.getByRole("button", { name: "Build view →" }).click();
@@ -35,7 +36,7 @@ test("login survives refresh and sign-out clears the local test session", async 
   });
   await page.reload();
   await expect(page.getByRole("heading", { name: "Today", exact: true })).toBeVisible();
-  await expect(page.getByText("What currently matters to your portfolio", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "What requires my attention today?", exact: true })).toBeVisible();
   await expect.poll(() => state.authGrants).toContain("refresh_token");
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByTestId("auth-form")).toBeVisible();
@@ -48,7 +49,7 @@ test("portfolio import flows to Research and analysis", async ({ page }) => {
   await page.getByLabel("Import portfolio CSV").setInputFiles({
     name: "portfolio.csv", mimeType: "text/csv", buffer: Buffer.from("symbol,weight\nAAPL,50%\nSPY,50%\n"),
   });
-  await expect(page.getByText("2 holdings validated, saved, and loaded into Research.")).toBeVisible();
+  await expect(page.locator(".save-state")).toContainText("All changes saved");
   await page.goto("/research?view=stocks");
   await expect(page.getByText("Apple Inc.")).toBeVisible();
   await page.goto("/portfolio?view=analysis");
@@ -170,7 +171,7 @@ test("partial widget failure preserves successful evidence and narration", async
 test("stale fallback and no-portfolio mode remain useful", async ({ page }) => {
   await installApiMock(page, { portfolio: false, stale: true });
   await signIn(page);
-  await expect(page.getByText("General market mode")).toBeVisible();
+  await expect(page.getByText("General research mode")).toBeVisible();
   await expect(page.getByText("Using last validated provider snapshot")).toBeVisible();
   await page.goto("/research?view=stocks");
   await expect(page.getByText("Browser fixture universe")).toBeVisible();
@@ -210,6 +211,7 @@ test("Decision Lab compares six choices on one paired path set", async ({ page }
   await installApiMock(page);
   await signIn(page);
   await page.goto("/decisions");
+  await page.getByText("Scenario comparison lab", { exact: true }).click();
   await page.getByRole("button", { name: "Run Decision Lab" }).click();
   await expect(page.getByText("Paired paths browser-shared-paths")).toBeVisible();
   await expect(page.getByText("Today’s dollars", { exact: false }).first()).toBeVisible();
@@ -217,15 +219,35 @@ test("Decision Lab compares six choices on one paired path set", async ({ page }
   await expect(page.getByText("decision-lab-block-bootstrap-v1.0.0")).toBeVisible();
 });
 
-test("presentation levels transform the same stored widget result", async ({ page }) => {
+test("EagleEyes drafts a thesis but saves beliefs only after explicit review", async ({ page }) => {
+  const state = await installApiMock(page);
+  await signIn(page);
+  await page.goto("/decisions");
+  await page.getByLabel("1. Company").fill("AAPL");
+  await page.getByText("I own it", { exact: true }).click();
+  await page.getByLabel(/3\. Why is it on your mind/).fill("I want to track services durability.");
+  await page.getByRole("button", { name: "Build an evidence-assisted thesis →" }).click();
+  await expect(page.getByRole("heading", { name: "Review what must remain true." })).toBeVisible();
+  await expect(page.getByText("Suggested by EagleEyes", { exact: true }).first()).toBeVisible();
+  const save = page.getByRole("button", { name: "Confirm and save thesis" });
+  await expect(save).toBeDisabled();
+  await page.getByLabel(/I reviewed this thesis/).check();
+  await save.click();
+  await expect(page.getByText("Thesis saved as version 1.")).toBeVisible();
+  const request = state.requests.find(item => item.path === "/theses" && item.method === "POST");
+  expect(request).toBeTruthy();
+  expect(request?.body).toMatchObject({ source_context: { relationship: "OWN", user_reason: "I want to track services durability.", confirmation_state: "USER_CONFIRMED" } });
+});
+
+test("default presentation stays detailed and Expert mode lives under More", async ({ page }) => {
   await installApiMock(page);
   await signIn(page);
   await buildBoard(page);
   await expect(page.getByText("Evidence", { exact: true }).first()).toBeVisible();
-  await page.getByRole("button", { name: "Simple" }).click();
-  await expect(page.getByText("Evidence", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("This shows how today’s holdings and weights behaved historically; it is not your actual account return.")).toBeVisible();
-  await page.getByRole("button", { name: "Expert" }).click();
+  await expect(page.getByRole("button", { name: "Simple" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Detailed" })).toHaveCount(0);
+  await page.getByLabel("Open secondary navigation").click();
+  await page.getByRole("button", { name: "Expert mode off" }).click();
   const expertMethod = page.getByText("Method, lineage, and validation").first();
   await expect(expertMethod).toBeVisible();
   await expertMethod.click();

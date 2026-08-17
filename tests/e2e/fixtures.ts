@@ -95,7 +95,7 @@ function createState(options: { portfolio?: boolean; stale?: boolean; partial?: 
   return {
     options, holdings, terminalWidgets: structuredClone(defaultWidgets), terminalLayouts: [] as TerminalLayoutFixture[],
     views: [] as Array<ReturnType<typeof viewFromJob>>, job: makeJob("job-1", options.partial), requests: [] as Array<{ method: string; path: string; body: unknown }>,
-    authGrants: [] as string[], learningProgress: [] as Array<Record<string, unknown>>,
+    authGrants: [] as string[], learningProgress: [] as Array<Record<string, unknown>>, theses: [] as Array<Record<string, unknown>>,
   };
 }
 
@@ -152,6 +152,13 @@ export async function installApiMock(page: Page, options: { portfolio?: boolean;
       research, data_status: { storage: "fixture", counts: {}, freshness: {}, providers: [] },
       regime_history: { latest: null, sample_counts: {}, total_samples: 0 }, model_monitoring: null, latest_analysis: null,
     });
+    if (path === "/decisions/workspace") return json(route, { active_theses: state.theses, recent_decisions: [], needs_thesis: [], review_dates: [], contexts: {} });
+    if (path === "/decision-journal") return json(route, { version: "decision-journal-v1", recent_decisions: [], ready_for_review: [], completed_retrospectives: [], patterns: { reviewed_decisions: 0, minimum_sample: 5, status: "INSUFFICIENT_SAMPLE", patterns: [] }, forecast_calibration: { sample_size: 0, brier_score: null, status: "INSUFFICIENT_SAMPLE", message: "No resolved forecasts.", buckets: [], methodology: "No calibration result without resolved forecasts." } });
+    if (path === "/personalization" && method === "GET") return json(route, { version: "decision-preferences-v1", explicit: {}, accepted: {}, inferred: [], dismissed: [], minimum_reviewed_decisions: 5, reviewed_decisions: 0 });
+    if (path === "/theses/drafts/AAPL" && method === "POST") return json(route, { saved: false, warning: "Unsaved draft. Review every suggestion before confirming it as your belief.", draft: { ticker: "AAPL", summary: "Durable services growth and ecosystem retention may support long-term cash generation.", base_case: "Services growth remains durable.", bull_case: "Growth accelerates with stable margins.", bear_case: "Device demand and margins weaken.", investment_horizon: "long", review_date: null, status: "DRAFT", current_version: 1, source_context: { evidence_sources: ["fixture research"] }, assumptions: [{ description: "Services growth remains durable", category: "GROWTH", importance: "HIGH", status: "UNTESTED", evidence_mapping: { source: "fixture research" } }], factors: [{ factor_type: "RISK", description: "Device replacement cycles weaken", evidence_mapping: { source: "fixture research" } }, { factor_type: "BREAKER", description: "Ecosystem retention deteriorates materially", evidence_mapping: { source: "fixture research" } }] } });
+    if (path === "/theses" && method === "POST") { const saved = { ...body, id: "thesis-1", current_version: 1, created_at: now, updated_at: now }; state.theses = [saved]; return json(route, saved, 201); }
+    if (/^\/theses\/[^/]+\/monitor$/.test(path)) return json(route, { thesis_id: "thesis-1", thesis_version: 1, ticker: "AAPL", baseline_review_at: now, evaluated_at: now, overall_status: "STABLE", requires_review: false, assumption_results: [], risk_results: [], catalyst_results: [], thesis_breaker_results: [], evidence_coverage: [], freshness: "CURRENT", evidence_quality: "HIGH", counts: { SUPPORTS: 0, WEAKENS: 0, CONTRADICTS: 0, INSUFFICIENT_EVIDENCE: 0 }, warnings: ["A monitoring baseline begins after the first review."], calculation_version: "fixture-monitor-v1" });
+    if (/^\/theses\/[^/]+\/reviews$/.test(path) && method === "GET") return json(route, []);
     if (path === "/portfolio/diagnostics") return json(route, { as_of: now, sector_exposure: [], industry_exposure: [], account_allocation: [], marginal_risk: { status: "unavailable", positions: [] }, holdings_fund_overlap: { status: "unavailable", items: [] }, known_fund_costs: { status: "unavailable", items: [], estimated_annual_dollars: null }, tax_data_completeness: { status: "partial", taxable_positions: 0, cost_basis_known: 0, acquisition_dates_known: 0, missing_information: [] }, performance_label: "Hypothetical one-year return using current holdings and weights", warnings: [] });
     if (path === "/plan/goals") return json(route, []);
     if (path === "/plan/policy") return json(route, {});

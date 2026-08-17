@@ -219,6 +219,106 @@ def initialize() -> None:
             request_json TEXT NOT NULL, result_json TEXT NOT NULL, model_version TEXT NOT NULL,
             created_at TEXT NOT NULL
         )""",
+        """CREATE TABLE IF NOT EXISTS model_portfolios (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,
+            portfolio_type TEXT NOT NULL, status TEXT NOT NULL,
+            candidate_universe_json TEXT NOT NULL, basket_json TEXT NOT NULL,
+            configuration_json TEXT NOT NULL, comparison_results_json TEXT NOT NULL,
+            backtest_results_json TEXT NOT NULL, simulation_run_id TEXT,
+            converted_portfolio_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS investment_theses (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, ticker TEXT NOT NULL,
+            summary TEXT NOT NULL, base_case TEXT NOT NULL, bull_case TEXT NOT NULL, bear_case TEXT NOT NULL,
+            investment_horizon TEXT NOT NULL, horizon_end_date TEXT, review_date TEXT, status TEXT NOT NULL,
+            source_context_json TEXT NOT NULL, current_version INTEGER NOT NULL DEFAULT 1,
+            closed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS thesis_assumptions (
+            id TEXT PRIMARY KEY, thesis_id TEXT NOT NULL, user_id TEXT NOT NULL,
+            description TEXT NOT NULL, category TEXT NOT NULL, importance TEXT NOT NULL, status TEXT NOT NULL,
+            metric TEXT, comparison_operator TEXT, target_value REAL, unit TEXT,
+            evidence_mapping_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            FOREIGN KEY(thesis_id) REFERENCES investment_theses(id) ON DELETE CASCADE
+        )""",
+        """CREATE TABLE IF NOT EXISTS thesis_factors (
+            id TEXT PRIMARY KEY, thesis_id TEXT NOT NULL, user_id TEXT NOT NULL, factor_type TEXT NOT NULL,
+            description TEXT NOT NULL, metric TEXT, comparison_operator TEXT, threshold REAL,
+            period_requirement TEXT, unit TEXT, evidence_mapping_json TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            FOREIGN KEY(thesis_id) REFERENCES investment_theses(id) ON DELETE CASCADE
+        )""",
+        """CREATE TABLE IF NOT EXISTS thesis_versions (
+            id TEXT PRIMARY KEY, thesis_id TEXT NOT NULL, user_id TEXT NOT NULL, version_number INTEGER NOT NULL,
+            snapshot_json TEXT NOT NULL, change_note TEXT, created_at TEXT NOT NULL,
+            UNIQUE(thesis_id, version_number),
+            FOREIGN KEY(thesis_id) REFERENCES investment_theses(id) ON DELETE CASCADE
+        )""",
+        """CREATE TABLE IF NOT EXISTS investment_decisions (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, ticker TEXT NOT NULL, thesis_id TEXT,
+            thesis_version INTEGER, decision_type TEXT NOT NULL, decision_date TEXT NOT NULL,
+            price_at_decision REAL, price_as_of TEXT, price_source TEXT, quantity REAL,
+            portfolio_context_json TEXT NOT NULL, user_confidence INTEGER, investment_horizon TEXT,
+            notes TEXT NOT NULL, source_context_json TEXT NOT NULL, created_at TEXT NOT NULL,
+            FOREIGN KEY(thesis_id) REFERENCES investment_theses(id) ON DELETE SET NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS evidence_snapshots (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, entity_type TEXT NOT NULL,
+            entity_key TEXT NOT NULL, baseline_type TEXT NOT NULL, baseline_ref TEXT NOT NULL,
+            as_of TEXT NOT NULL, observations_json TEXT NOT NULL,
+            methodology_version TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(user_id, entity_key, baseline_type, baseline_ref)
+        )""",
+        """CREATE TABLE IF NOT EXISTS thesis_review_events (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, thesis_id TEXT NOT NULL,
+            thesis_version INTEGER NOT NULL, ticker TEXT NOT NULL, baseline_review_at TEXT NOT NULL,
+            evaluated_at TEXT NOT NULL, reviewed_at TEXT NOT NULL, overall_status TEXT NOT NULL,
+            requires_review INTEGER NOT NULL, monitoring_result_json TEXT NOT NULL,
+            calculation_version TEXT NOT NULL, created_at TEXT NOT NULL,
+            FOREIGN KEY(thesis_id) REFERENCES investment_theses(id) ON DELETE CASCADE
+        )""",
+        """CREATE TABLE IF NOT EXISTS user_forecasts (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, event_key TEXT NOT NULL,
+            provider TEXT, external_market_id TEXT, title TEXT NOT NULL, probability REAL NOT NULL,
+            reasoning TEXT NOT NULL, market_probability_at_entry REAL, model_probability_at_entry REAL,
+            forecast_horizon TEXT, observed_at TEXT NOT NULL, created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS forecast_resolution_events (
+            id TEXT PRIMARY KEY, event_key TEXT NOT NULL, provider TEXT, external_market_id TEXT,
+            outcome REAL NOT NULL, resolution_reference TEXT, resolved_at TEXT NOT NULL, recorded_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS attention_item_states (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, attention_item_id TEXT NOT NULL,
+            state TEXT NOT NULL, snoozed_until TEXT, note TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(user_id, attention_item_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS alert_preferences (
+            user_id TEXT PRIMARY KEY, delivery_mode TEXT NOT NULL, threshold TEXT NOT NULL,
+            categories TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS alert_events (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, attention_item_id TEXT NOT NULL,
+            group_key TEXT NOT NULL, alert_type TEXT NOT NULL, materiality TEXT NOT NULL,
+            title TEXT NOT NULL, summary TEXT NOT NULL, payload TEXT NOT NULL,
+            occurred_at TEXT NOT NULL, supersedes_id TEXT, status TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(user_id, attention_item_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS decision_preferences (
+            user_id TEXT PRIMARY KEY, explicit_preferences TEXT NOT NULL,
+            accepted_preferences TEXT NOT NULL, dismissed_inferences TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS decision_context_snapshots (
+            id TEXT PRIMARY KEY, decision_id TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL, ticker TEXT NOT NULL,
+            decision_date TEXT NOT NULL, snapshot_json TEXT NOT NULL, methodology_version TEXT NOT NULL, captured_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS decision_retrospectives (
+            id TEXT PRIMARY KEY, decision_id TEXT NOT NULL, user_id TEXT NOT NULL, horizon_key TEXT NOT NULL,
+            window_start TEXT NOT NULL, window_end TEXT NOT NULL, structured_result_json TEXT NOT NULL,
+            user_notes TEXT NOT NULL, ai_summary TEXT, ai_model TEXT, summary_version TEXT,
+            reviewed_at TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(decision_id,horizon_key,window_end)
+        )""",
     ]
     with sqlite_connection() as conn:
         for statement in statements:
@@ -246,6 +346,23 @@ def initialize() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS financial_goals_user_idx ON financial_goals(user_id, priority, target_date)")
         conn.execute("CREATE INDEX IF NOT EXISTS simulation_runs_user_idx ON simulation_runs(user_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS allocation_builder_runs_user_idx ON allocation_builder_runs(user_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS model_portfolios_user_idx ON model_portfolios(user_id, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS investment_theses_user_ticker_idx ON investment_theses(user_id, ticker, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS investment_theses_review_idx ON investment_theses(user_id, status, review_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS thesis_assumptions_thesis_idx ON thesis_assumptions(thesis_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS thesis_factors_thesis_idx ON thesis_factors(thesis_id, factor_type, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS thesis_versions_thesis_idx ON thesis_versions(thesis_id, version_number)")
+        conn.execute("CREATE INDEX IF NOT EXISTS investment_decisions_user_ticker_idx ON investment_decisions(user_id, ticker, decision_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS evidence_snapshots_user_entity_idx ON evidence_snapshots(user_id, entity_key, as_of)")
+        conn.execute("CREATE INDEX IF NOT EXISTS thesis_review_events_user_thesis_idx ON thesis_review_events(user_id, thesis_id, reviewed_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS thesis_review_events_user_status_idx ON thesis_review_events(user_id, overall_status, reviewed_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS user_forecasts_user_event_idx ON user_forecasts(user_id, event_key, observed_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS forecast_resolution_event_idx ON forecast_resolution_events(event_key, resolved_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS attention_item_states_user_idx ON attention_item_states(user_id, updated_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS alert_events_user_status_idx ON alert_events(user_id, status, occurred_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS alert_events_user_group_idx ON alert_events(user_id, group_key, occurred_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS decision_context_snapshots_user_idx ON decision_context_snapshots(user_id, decision_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS decision_retrospectives_user_idx ON decision_retrospectives(user_id, reviewed_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS terminal_layouts_user_idx ON terminal_layouts(user_id, updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS learning_progress_user_idx ON learning_progress(user_id, updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS learning_quiz_user_lesson_idx ON learning_quiz_attempts(user_id, lesson_id, attempted_at)")
@@ -746,16 +863,18 @@ def scenario_history() -> list[dict[str, Any]]:
     if DATABASE_URL:
         with postgres_connection() as conn:
             rows = conn.execute(
-                """SELECT raw_scenarios, observed_at FROM public.scenario_snapshots
+                """SELECT raw_scenarios, raw_contracts, observed_at FROM public.scenario_snapshots
                 ORDER BY observed_at DESC LIMIT 800"""
             ).fetchall()
-        return [{"scenarios": row["raw_scenarios"], "fetched_at": _iso(row["observed_at"])} for row in rows]
+        return [{"scenarios": row["raw_scenarios"], "contracts": row["raw_contracts"],
+                 "fetched_at": _iso(row["observed_at"])} for row in rows]
 
     with sqlite_connection() as conn:
         rows = conn.execute(
-            "SELECT scenarios_json, fetched_at FROM scenario_snapshots ORDER BY fetched_at DESC LIMIT 800"
+            "SELECT scenarios_json, contracts_json, fetched_at FROM scenario_snapshots ORDER BY fetched_at DESC LIMIT 800"
         ).fetchall()
-    return [{"scenarios": json.loads(row["scenarios_json"]), "fetched_at": row["fetched_at"]} for row in rows]
+    return [{"scenarios": json.loads(row["scenarios_json"]), "contracts": json.loads(row["contracts_json"]),
+             "fetched_at": row["fetched_at"]} for row in rows]
 
 
 def save_analysis(run_id: str, request: dict[str, Any], result: dict[str, Any], user_id: str | None = None) -> None:
@@ -1189,6 +1308,37 @@ def latest_analysis(user_id: str | None = None) -> dict[str, Any] | None:
     return None if row is None else json.loads(row["result_json"])
 
 
+def cached_analysis(cache_key: str, user_id: str | None = None) -> dict[str, Any] | None:
+    """Return the newest completed analysis produced from the same effective inputs.
+
+    The cache key lives in the immutable input snapshot so this works with the
+    existing analysis_runs schema and does not rewrite historical runs.
+    """
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            rows = conn.execute(
+                """SELECT input_snapshot, result_snapshot FROM public.analysis_runs
+                WHERE status = 'completed' AND user_id IS NOT DISTINCT FROM %s
+                ORDER BY created_at DESC LIMIT 50""",
+                (user_id,),
+            ).fetchall()
+        for row in rows:
+            request = row["input_snapshot"] or {}
+            if request.get("analysis_cache_key") == cache_key:
+                return row["result_snapshot"]
+        return None
+
+    with sqlite_connection() as conn:
+        rows = conn.execute(
+            "SELECT request_json, result_json FROM analysis_runs ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+    for row in rows:
+        request = json.loads(row["request_json"])
+        if request.get("analysis_cache_key") == cache_key:
+            return json.loads(row["result_json"])
+    return None
+
+
 def provider_data_status() -> dict[str, Any]:
     if not DATABASE_URL:
         return {"storage": "sqlite", "counts": {}, "freshness": {}, "providers": []}
@@ -1220,11 +1370,23 @@ def provider_data_status() -> dict[str, Any]:
             metadata, error_message FROM public.provider_fetches
             ORDER BY provider, fetched_at DESC"""
         ).fetchall()
+        provider_windows = conn.execute(
+            """WITH recent AS (
+              SELECT provider,status,fetched_at,row_number() OVER (PARTITION BY provider ORDER BY fetched_at DESC) AS rn
+              FROM public.provider_fetches
+            ) SELECT provider,count(*) AS attempts,
+              count(*) FILTER (WHERE status='success') AS successes,
+              max(fetched_at) FILTER (WHERE status='success') AS last_success_at,
+              min(fetched_at) AS window_start
+            FROM recent WHERE rn<=50 GROUP BY provider"""
+        ).fetchall()
         price_coverage = conn.execute(
             """SELECT p.provider, count(*) AS bars, count(DISTINCT p.security_id) AS symbols,
             min(p.ts) AS earliest, max(p.ts) AS latest
             FROM public.price_bars p GROUP BY p.provider ORDER BY p.provider"""
         ).fetchall()
+    windows={str(row["provider"]).lower():{"attempts":int(row["attempts"] or 0),"successes":int(row["successes"] or 0),
+             "last_success_at":_iso(row["last_success_at"]),"window_start":_iso(row["window_start"])} for row in provider_windows}
     return {
         "storage": "supabase",
         "counts": {key: int(value or 0) for key, value in counts.items()},
@@ -1234,6 +1396,7 @@ def provider_data_status() -> dict[str, Any]:
                 "provider": row["provider"], "status": row["status"],
                 "fetched_at": _iso(row["fetched_at"]), "as_of": _iso(row["as_of"]),
                 "metadata": row["metadata"] or {}, "error": row["error_message"],
+                "window": windows.get(str(row["provider"]).lower(), {}),
             }
             for row in providers
         ],
@@ -1533,6 +1696,24 @@ def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
             for row in company_markets
         ],
     }
+
+
+def earnings_transcript_chunks(ticker: str, limit: int = 8) -> list[dict[str, Any]]:
+    """Return a bounded set of earnings-relevant chunks; never loads a full transcript."""
+    if not DATABASE_URL:
+        return []
+    with postgres_connection() as conn:
+        rows = conn.execute(
+            """SELECT d.title,d.source_url,d.provider,d.published_at,c.chunk_index,c.content,c.metadata
+            FROM public.documents d JOIN public.securities s ON s.id=d.security_id
+            JOIN public.document_chunks c ON c.document_id=d.id
+            WHERE s.ticker=%s AND d.document_type IN ('transcript','earnings_transcript')
+              AND (c.content ILIKE '%%guidance%%' OR c.content ILIKE '%%margin%%'
+                   OR c.content ILIKE '%%demand%%' OR c.content ILIKE '%%risk%%')
+            ORDER BY d.published_at DESC NULLS LAST,c.chunk_index LIMIT %s""",
+            (ticker.upper(), max(1, min(limit, 12))),
+        ).fetchall()
+    return [{**dict(row), "published_at": _iso(row["published_at"])} for row in rows]
 
 
 def list_security_universe(limit: int = 500, query: str | None = None) -> list[dict[str, Any]]:
@@ -2109,6 +2290,199 @@ def save_security_prediction_markets(
     return len(markets)
 
 
+def prediction_market_observations(limit: int = 200) -> list[dict[str, Any]]:
+    """Return latest normalized venue observations with bounded immutable history.
+
+    Provider refresh remains owned by the existing ingestion services. This is
+    the reusable read model used by forecasting, evidence, research, and Ask.
+    """
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM (
+                  SELECT pm.id AS internal_market_id, pm.provider,
+                  pm.external_market_id AS market_id, pm.canonical_question,
+                  pm.canonical_scenario, pm.title, pm.source_url, pm.opens_at,
+                  pm.closes_at, pm.resolution_at, pm.resolved_outcome, pm.metadata,
+                  pcs.canonical_key AS series_key,
+                  pms.probability, pms.bid, pms.ask, pms.volume,
+                  pms.open_interest, pms.order_book_depth AS liquidity,
+                  pms.confidence, pms.observed_at, pms.raw_payload,
+                  row_number() over (partition by pm.id order by pms.observed_at desc) AS position
+                  FROM public.prediction_markets pm
+                  JOIN public.prediction_market_snapshots pms ON pms.market_id=pm.id
+                  LEFT JOIN public.prediction_contract_series pcs ON pcs.id=pm.series_id
+                ) latest WHERE position=1
+                ORDER BY observed_at DESC LIMIT %s""", (limit,),
+            ).fetchall()
+            ids = [row["internal_market_id"] for row in rows]
+            history_rows = [] if not ids else conn.execute(
+                """SELECT market_id, probability, observed_at FROM public.prediction_market_snapshots
+                WHERE market_id=ANY(%s) ORDER BY market_id, observed_at DESC LIMIT %s""",
+                (ids, max(1000, limit * 30)),
+            ).fetchall()
+        histories: dict[str, list[dict[str, Any]]] = {}
+        for row in history_rows:
+            histories.setdefault(str(row["market_id"]), []).append({
+                "probability": _number(row["probability"]), "observed_at": _iso(row["observed_at"]),
+            })
+        result = []
+        for row in rows:
+            raw = dict(row)
+            metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+            payload = raw.get("raw_payload") if isinstance(raw.get("raw_payload"), dict) else {}
+            result.append({
+                **raw, "internal_market_id": str(raw["internal_market_id"]),
+                "observed_at": _iso(raw["observed_at"]), "opens_at": _iso(raw.get("opens_at")),
+                "closes_at": _iso(raw.get("closes_at")), "resolution_date": _iso(raw.get("resolution_at") or raw.get("closes_at")),
+                "probability": _number(raw.get("probability")), "bid": _number(raw.get("bid")),
+                "ask": _number(raw.get("ask")), "volume": _number(raw.get("volume")),
+                "liquidity": _number(raw.get("liquidity")), "metadata": metadata,
+                "description": metadata.get("description") or payload.get("description"),
+                "resolution_criteria": metadata.get("resolution_criteria") or payload.get("rules") or payload.get("resolutionSource"),
+                "status": metadata.get("status") or payload.get("status"),
+                "history": histories.get(str(raw["internal_market_id"]), []),
+            })
+        return result
+
+    snapshots = scenario_history()
+    latest = latest_scenario_snapshot() or {}
+    result = []
+    for contract in latest.get("contracts", [])[:limit]:
+        provider, market_id = str(contract.get("provider") or "Unknown"), str(contract.get("id") or "")
+        history = []
+        for snapshot in snapshots:
+            match = next((row for row in snapshot.get("contracts", [])
+                          if str(row.get("provider")) == provider and str(row.get("id")) == market_id), None)
+            if match and match.get("probability") is not None:
+                history.append({"probability": match["probability"], "observed_at": snapshot["fetched_at"]})
+        result.append({
+            **contract, "market_id": market_id, "observed_at": latest.get("fetched_at"),
+            "canonical_scenario": contract.get("scenario"), "metadata": {
+                "canonical_scenario": contract.get("scenario"), "indicator": contract.get("indicator")
+            }, "history": history, "resolution_date": contract.get("closes_at"),
+        })
+    return result
+
+
+def save_user_forecast(user_id: str, forecast: dict[str, Any]) -> dict[str, Any]:
+    forecast_id, now = str(uuid.uuid4()), forecast.get("observed_at") or utc_now()
+    values = (
+        forecast_id, user_id, forecast["event_key"], forecast.get("provider"), forecast.get("market_id"),
+        forecast["title"], forecast["probability"], forecast.get("reasoning", ""),
+        forecast.get("market_probability_at_entry"), forecast.get("model_probability_at_entry"),
+        forecast.get("forecast_horizon"), now, utc_now(),
+    )
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                """INSERT INTO public.user_forecasts(
+                id,user_id,event_key,provider,external_market_id,title,probability,reasoning,
+                market_probability_at_entry,model_probability_at_entry,forecast_horizon,observed_at,created_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""", values,
+            ).fetchone()
+        return {**dict(row), "id": str(row["id"]), "observed_at": _iso(row["observed_at"]), "created_at": _iso(row["created_at"])}
+    with sqlite_connection() as conn:
+        conn.execute(
+            """INSERT INTO user_forecasts(
+            id,user_id,event_key,provider,external_market_id,title,probability,reasoning,
+            market_probability_at_entry,model_probability_at_entry,forecast_horizon,observed_at,created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", values,
+        )
+    return next(row for row in list_user_forecasts(user_id) if row["id"] == forecast_id)
+
+
+def list_user_forecasts(user_id: str, event_key: str | None = None) -> list[dict[str, Any]]:
+    postgres, prefix, placeholder = bool(DATABASE_URL), "public." if DATABASE_URL else "", "%s" if DATABASE_URL else "?"
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    where, params = f"uf.user_id={placeholder}", [user_id]
+    if event_key:
+        where += f" AND uf.event_key={placeholder}"
+        params.append(event_key)
+    with connection() as conn:
+        rows = conn.execute(
+            f"""SELECT uf.*, fre.outcome AS resolved_outcome, fre.resolved_at,
+            fre.resolution_reference FROM {prefix}user_forecasts uf
+            LEFT JOIN {prefix}forecast_resolution_events fre ON fre.event_key=uf.event_key
+              AND (fre.provider IS NULL OR fre.provider=uf.provider)
+              AND (fre.external_market_id IS NULL OR fre.external_market_id=uf.external_market_id)
+            WHERE {where} ORDER BY uf.observed_at DESC""", tuple(params),
+        ).fetchall()
+    return [{**dict(row), "id": str(row["id"]), "observed_at": _iso(row["observed_at"]),
+             "created_at": _iso(row["created_at"]), "resolved_at": _iso(row["resolved_at"]),
+             "probability": _number(row["probability"]),
+             "market_probability_at_entry": _number(row["market_probability_at_entry"]),
+             "model_probability_at_entry": _number(row["model_probability_at_entry"]),
+             "resolved_outcome": _number(row["resolved_outcome"])} for row in rows]
+
+
+def save_forecast_resolution(event_key: str, outcome: float, resolved_at: str, *,
+                             provider: str | None = None, market_id: str | None = None,
+                             reference: str | None = None) -> str:
+    resolution_id = str(uuid.uuid4())
+    prefix, placeholders = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    with connection() as conn:
+        conn.execute(
+            f"""INSERT INTO {prefix}forecast_resolution_events(
+            id,event_key,provider,external_market_id,outcome,resolution_reference,resolved_at,recorded_at
+            ) VALUES ({','.join([placeholders] * 8)})""",
+            (resolution_id, event_key, provider, market_id, outcome, reference, resolved_at, utc_now()),
+        )
+    return resolution_id
+
+
+def attention_states(user_id: str) -> dict[str, dict[str, Any]]:
+    prefix, placeholder = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    with connection() as conn:
+        rows = conn.execute(
+            f"""SELECT attention_item_id,state,snoozed_until,note,updated_at
+            FROM {prefix}attention_item_states WHERE user_id={placeholder}""", (user_id,),
+        ).fetchall()
+    return {str(row["attention_item_id"]): {
+        "state": row["state"], "snoozed_until": _iso(row["snoozed_until"]),
+        "note": row["note"], "updated_at": _iso(row["updated_at"]),
+    } for row in rows}
+
+
+def save_attention_state(user_id: str, attention_item_id: str, state: str,
+                         snoozed_until: str | None = None, note: str = "") -> dict[str, Any]:
+    now, item_id = utc_now(), str(uuid.uuid4())
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                """INSERT INTO public.attention_item_states(
+                id,user_id,attention_item_id,state,snoozed_until,note,created_at,updated_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(user_id,attention_item_id) DO UPDATE SET
+                state=excluded.state,snoozed_until=excluded.snoozed_until,note=excluded.note,updated_at=excluded.updated_at
+                RETURNING attention_item_id,state,snoozed_until,note,updated_at""",
+                (item_id, user_id, attention_item_id, state, snoozed_until, note, now, now),
+            ).fetchone()
+        return {**dict(row), "snoozed_until": _iso(row["snoozed_until"]), "updated_at": _iso(row["updated_at"])}
+    with sqlite_connection() as conn:
+        conn.execute(
+            """INSERT INTO attention_item_states(
+            id,user_id,attention_item_id,state,snoozed_until,note,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(user_id,attention_item_id) DO UPDATE SET
+            state=excluded.state,snoozed_until=excluded.snoozed_until,note=excluded.note,updated_at=excluded.updated_at""",
+            (item_id, user_id, attention_item_id, state, snoozed_until, note, now, now),
+        )
+    return attention_states(user_id)[attention_item_id]
+
+
+def delete_attention_state(user_id: str, attention_item_id: str) -> None:
+    prefix, placeholder = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    with connection() as conn:
+        conn.execute(
+            f"DELETE FROM {prefix}attention_item_states WHERE user_id={placeholder} AND attention_item_id={placeholder}",
+            (user_id, attention_item_id),
+        )
+
+
 def price_history(tickers: list[str], limit_per_ticker: int = 5000) -> list[dict[str, Any]]:
     normalized = sorted({
         ticker.strip().upper() for ticker in tickers
@@ -2213,6 +2587,119 @@ def save_builder_run(user_id: str, builder_type: str, request: dict[str, Any], r
                 (run_id, user_id, builder_type, json.dumps(request, default=str), json.dumps(result, default=str), result["model_version"], created_at),
             )
     return run_id
+
+
+def _model_portfolio_row(row: Any) -> dict[str, Any]:
+    if not row:
+        return {}
+    def value(json_key: str, sqlite_key: str) -> Any:
+        raw = row.get(json_key) if isinstance(row, dict) else None
+        if raw is not None:
+            return raw
+        text = row[sqlite_key]
+        return json.loads(text) if isinstance(text, str) else text
+    return {
+        "id": str(row["id"]), "name": row["name"], "portfolio_type": row["portfolio_type"],
+        "status": row["status"],
+        "candidate_universe": value("candidate_universe", "candidate_universe_json") or {},
+        "basket": value("basket", "basket_json") or [],
+        "configuration": value("configuration", "configuration_json") or {},
+        "comparison_results": value("comparison_results", "comparison_results_json") or {},
+        "backtest_results": value("backtest_results", "backtest_results_json") or {},
+        "simulation_run_id": row.get("simulation_run_id") if isinstance(row, dict) else row["simulation_run_id"],
+        "converted_portfolio_id": row.get("converted_portfolio_id") if isinstance(row, dict) else row["converted_portfolio_id"],
+        "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"]),
+    }
+
+
+def save_model_portfolio(user_id: str, payload: dict[str, Any], model_id: str | None = None) -> dict[str, Any]:
+    model_id = model_id or str(uuid.uuid4())
+    now = utc_now()
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                """INSERT INTO public.model_portfolios(
+                id,user_id,name,portfolio_type,status,candidate_universe,basket,configuration,
+                comparison_results,backtest_results,simulation_run_id,updated_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(id) DO UPDATE SET name=excluded.name,portfolio_type=excluded.portfolio_type,
+                status=excluded.status,candidate_universe=excluded.candidate_universe,basket=excluded.basket,
+                configuration=excluded.configuration,comparison_results=excluded.comparison_results,
+                backtest_results=excluded.backtest_results,simulation_run_id=excluded.simulation_run_id,
+                updated_at=excluded.updated_at
+                WHERE model_portfolios.user_id=excluded.user_id RETURNING *""",
+                (model_id,user_id,payload["name"],payload["portfolio_type"],payload.get("status","draft"),
+                 _jsonb(payload.get("candidate_universe",{})),_jsonb(payload.get("basket",[])),
+                 _jsonb(payload.get("configuration",{})),_jsonb(payload.get("comparison_results",{})),
+                 _jsonb(payload.get("backtest_results",{})),payload.get("simulation_run_id"),now),
+            ).fetchone()
+        if not row:
+            raise KeyError(model_id)
+        return _model_portfolio_row(row)
+    with sqlite_connection() as conn:
+        existing = conn.execute("SELECT user_id,created_at,converted_portfolio_id FROM model_portfolios WHERE id=?", (model_id,)).fetchone()
+        if existing and existing["user_id"] != user_id:
+            raise KeyError(model_id)
+        created_at = existing["created_at"] if existing else now
+        converted = existing["converted_portfolio_id"] if existing else None
+        conn.execute(
+            """INSERT INTO model_portfolios(id,user_id,name,portfolio_type,status,candidate_universe_json,basket_json,
+            configuration_json,comparison_results_json,backtest_results_json,simulation_run_id,converted_portfolio_id,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+            name=excluded.name,portfolio_type=excluded.portfolio_type,status=excluded.status,
+            candidate_universe_json=excluded.candidate_universe_json,basket_json=excluded.basket_json,
+            configuration_json=excluded.configuration_json,comparison_results_json=excluded.comparison_results_json,
+            backtest_results_json=excluded.backtest_results_json,simulation_run_id=excluded.simulation_run_id,updated_at=excluded.updated_at""",
+            (model_id,user_id,payload["name"],payload["portfolio_type"],payload.get("status","draft"),
+             json.dumps(payload.get("candidate_universe",{}),default=str),json.dumps(payload.get("basket",[]),default=str),
+             json.dumps(payload.get("configuration",{}),default=str),json.dumps(payload.get("comparison_results",{}),default=str),
+             json.dumps(payload.get("backtest_results",{}),default=str),payload.get("simulation_run_id"),converted,created_at,now),
+        )
+    return get_model_portfolio(user_id, model_id)
+
+
+def list_model_portfolios(user_id: str) -> list[dict[str, Any]]:
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            rows = conn.execute("SELECT * FROM public.model_portfolios WHERE user_id=%s ORDER BY updated_at DESC", (user_id,)).fetchall()
+    else:
+        with sqlite_connection() as conn:
+            rows = conn.execute("SELECT * FROM model_portfolios WHERE user_id=? ORDER BY updated_at DESC", (user_id,)).fetchall()
+    return [_model_portfolio_row(row) for row in rows]
+
+
+def get_model_portfolio(user_id: str, model_id: str) -> dict[str, Any]:
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute("SELECT * FROM public.model_portfolios WHERE id=%s AND user_id=%s", (model_id,user_id)).fetchone()
+    else:
+        with sqlite_connection() as conn:
+            row = conn.execute("SELECT * FROM model_portfolios WHERE id=? AND user_id=?", (model_id,user_id)).fetchone()
+    if not row:
+        raise KeyError(model_id)
+    return _model_portfolio_row(row)
+
+
+def delete_model_portfolio(user_id: str, model_id: str) -> None:
+    prefix, placeholder = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    with connection() as conn:
+        cursor = conn.execute(f"DELETE FROM {prefix}model_portfolios WHERE id={placeholder} AND user_id={placeholder}", (model_id,user_id))
+        if cursor.rowcount == 0:
+            raise KeyError(model_id)
+
+
+def mark_model_portfolio_converted(user_id: str, model_id: str, portfolio_id: str | int) -> dict[str, Any]:
+    prefix, placeholder = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    with connection() as conn:
+        cursor = conn.execute(
+            f"UPDATE {prefix}model_portfolios SET status='converted',converted_portfolio_id={placeholder},updated_at={placeholder} WHERE id={placeholder} AND user_id={placeholder}",
+            (str(portfolio_id),utc_now(),model_id,user_id),
+        )
+        if cursor.rowcount == 0:
+            raise KeyError(model_id)
+    return get_model_portfolio(user_id, model_id)
 
 
 def price_coverage_by_symbol(tickers: list[str]) -> list[dict[str, Any]]:

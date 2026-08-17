@@ -1,5 +1,5 @@
 export type Tab = "today" | "portfolio" | "explore" | "decisions" | "ask" | "plan" | "learn" | "advanced";
-export type ExploreView = "stocks" | "etfs" | "etf-builder" | "stock-builder" | "sectors" | "themes" | "macro" | "scenarios" | "prediction-markets" | "compare" | "watchlist";
+export type ExploreView = "stocks" | "etfs" | "portfolio-builder" | "etf-builder" | "stock-builder" | "sectors" | "themes" | "macro" | "scenarios" | "prediction-markets" | "compare" | "watchlist";
 export type PortfolioView = "holdings" | "analysis";
 export type AdvancedView = "terminal" | "diagnostics" | "validation" | "lineage" | "providers";
 
@@ -71,7 +71,7 @@ export function resolveAppRoute(pathname: string, search = ""): RouteState | nul
   }
   const normalizedExploreView = requestedView === "securities" ? "stocks" : requestedView === "comparisons" ? "compare" : requestedView;
   const exploreView = definition.tab === "explore"
-    ? oneOf(normalizedExploreView, ["stocks", "etfs", "etf-builder", "stock-builder", "sectors", "themes", "macro", "scenarios", "prediction-markets", "compare", "watchlist"] as const) || definition.exploreView || "stocks"
+    ? oneOf(normalizedExploreView, ["stocks", "etfs", "portfolio-builder", "etf-builder", "stock-builder", "sectors", "themes", "macro", "scenarios", "prediction-markets", "compare", "watchlist"] as const) || definition.exploreView || "stocks"
     : undefined;
   const portfolioView = definition.tab === "portfolio"
     ? oneOf(requestedView, ["holdings", "analysis"] as const) || definition.portfolioView

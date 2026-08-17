@@ -326,6 +326,7 @@ def build_scenarios(
     scenarios = []
     for key in PRIORS:
         subset = [row for row in contracts if row["scenario"] == key]
+        probability_source = "COMPOSITE" if subset and macro_as_of else "MARKET_IMPLIED" if subset else "MODEL"
         scenarios.append({
             "key": key,
             "label": LABELS[key],
@@ -341,6 +342,8 @@ def build_scenarios(
             "as_of": now.isoformat(),
             "is_prior": not subset and macro_as_of is None,
             "evidence_basis": "blended" if subset and macro_as_of else "prediction_market" if subset else "macro_trend_model" if macro_as_of else "disclosed_prior",
+            "probability_source": probability_source,
+            "probability_methodology": "confidence-weighted market evidence blended with the point-in-time macro trend model" if probability_source == "COMPOSITE" else "venue market-implied probability adjusted toward the disclosed prior" if probability_source == "MARKET_IMPLIED" else "point-in-time macro trend model" if macro_as_of else "disclosed baseline prior; not current market evidence",
             "macro_as_of": macro_as_of,
             "probability_model": "independent_conditions_v1",
         })
@@ -361,7 +364,7 @@ def build_condition_dimensions(scenarios: list[dict[str, Any]]) -> list[dict[str
             "indicators":sorted({item for source in sources for item in (by_key.get(source) or {}).get("indicators",[])}),
             "sources":sorted({item for source in sources for item in (by_key.get(source) or {}).get("sources",[])}),
             "as_of":now,"is_prior":all((by_key.get(source) or {}).get("is_prior",True) for source in sources),
-            "evidence_basis":"dimension_compiler","probability_model":"composable_conditions_v2",
+            "evidence_basis":"dimension_compiler","probability_source":"COMPOSITE","probability_methodology":"deterministic normalization within this condition dimension","probability_model":"composable_conditions_v2",
             "source_signals":sources,
         } for key,label,value,sources in values]
     recession=float((by_key.get("recession_cuts") or {}).get("probability",.18))

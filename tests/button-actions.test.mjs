@@ -36,6 +36,18 @@ test("critical portfolio and analysis actions remain wired", async () => {
   assert.match(source, /ingest_tickers/);
 });
 
+test("portfolio analysis persists, auto-runs after save, and refreshes from objective sliders", async () => {
+  const dashboard = await readFile(dashboardPath, "utf8");
+  const workspaces = await readFile(workspacesPath, "utf8");
+  assert.match(dashboard, /\/analyses\/latest/);
+  assert.match(dashboard, /executeAnalysis\(saved\.holdings, saved\.name, profile, "portfolio_saved"\)/);
+  assert.match(dashboard, /executeAnalysis\(data\.portfolio\.holdings, data\.portfolio\.name, profile, "portfolio_saved"\)/);
+  assert.match(dashboard, /analysisRefreshTimer/);
+  assert.match(dashboard, /"objectives_changed"/);
+  assert.match(workspaces, /onObjectiveProfileChange/);
+  assert.match(workspaces, /Risk-Controlled, Balanced, and Goal-Tilted/);
+});
+
 test("manual research terminal exposes a persistent actionable widget catalog", async () => {
   const source = await dashboardSurface();
   const routes = await readFile(routesPath, "utf8");
@@ -60,7 +72,7 @@ test("market workspace keeps planning secondary and route compatibility explicit
   for (const legacy of ["/overview", "/scenarios", "/research", "/optimize", "/ai-workspace", "/research-terminal", "/decision-lab"]) {
     assert.match(routes, new RegExp(legacy.replaceAll("/", "\\/")));
   }
-  assert.match(today, /What currently matters to your portfolio/);
+  assert.match(today, /What requires my attention today\?/);
   assert.match(source, /Hypothetical one-year return using current holdings and weights/);
   assert.match(source, /Customize the research around what the portfolio is for/);
   for (const path of ["Current / do nothing", "Contributions only", "Gradual transition", "Immediate transition"]) {
@@ -89,7 +101,7 @@ test("planning, guidance, and flexible portfolio import are visible and actionab
 test("default research presentation avoids false precision", async () => {
   const source = await dashboardSurface();
   const today = await readFile(todayPath, "utf8");
-  assert.match(today, /What currently matters to your portfolio/);
+  assert.match(today, /What requires my attention today\?/);
   assert.match(source, /Independent evidence dimensions/);
   assert.match(source, /not forced into one 100% distribution/);
   assert.match(source, /Stock research library/);

@@ -50,6 +50,7 @@ def _optimize(
     objective: str,
     costs: np.ndarray | None = None,
     group_limits: list[tuple[list[int], float, str]] | None = None,
+    research_signal: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[str]]:
     clean = returns.dropna()
     n = clean.shape[1]
@@ -61,6 +62,7 @@ def _optimize(
     covariance = clean.cov().to_numpy() * 12
     covariance = .75 * covariance + .25 * np.diag(np.diag(covariance))
     cost = costs if costs is not None else np.zeros(n)
+    signal = research_signal if research_signal is not None and len(research_signal) == n else np.zeros(n)
     def loss(weights: np.ndarray) -> float:
         ret = float(mean @ weights)
         variance = float(weights @ covariance @ weights)
@@ -68,7 +70,9 @@ def _optimize(
         if objective in {"lower_downside", "diversification"}:
             return variance * 6 + concentration * .8 - ret * .15 + float(cost @ weights)
         if objective in {"growth", "quality_growth"}:
-            return -ret + variance * 2 + concentration * .2 + float(cost @ weights)
+            return -ret * .55 - float(signal @ weights) * .07 + variance * 2 + concentration * .2 + float(cost @ weights)
+        if objective in {"value", "income", "macro_resilience", "custom"}:
+            return -ret * .25 - float(signal @ weights) * .08 + variance * 2.8 + concentration * .35 + float(cost @ weights)
         if objective in {"lowest_cost"}:
             return float(cost @ weights) * 10 + variance * 2 + concentration * .2
         return -ret * .45 + variance * 3.5 + concentration * .45 + float(cost @ weights) * 2
@@ -196,7 +200,35 @@ def optimize_stocks(request: StockBasketRequest) -> dict[str, Any]:
         for value in values:
             indices = [index for index, ticker in enumerate(eligible) if str(research[ticker].get(field) or "Unknown") == value]
             group_limits.append((indices, limit, f"{field}:{value}"))
-    weights, conflicts = _optimize(panel, request.max_security_weight, request.objective, group_limits=group_limits)
+    def signal(row: dict[str, Any]) -> float:
+        confidence = float(row.get("confidence") or 0) / 100
+        sector = str(row.get("sector") or "")
+        components = {
+            "quality": float(row.get("fundamental_score") or 0) / 100,
+            "fundamentals": float(row.get("fundamental_score") or 0) / 100,
+            "growth": float(row.get("growth_rating") or 0) / 100,
+            "value": float(row.get("valuation_score") or 0) / 100,
+            "valuation": float(row.get("valuation_score") or 0) / 100,
+            "price_behavior": float(row.get("technical_score") or 0) / 100,
+            "income": .72 if sector in {"Utilities", "Energy", "Real Estate", "Fixed Income"} else .45,
+            "macro_resilience": .72 if sector in {"Utilities", "Healthcare", "Consumer Staples", "Fixed Income"} else .45,
+        }
+        if request.objective == "quality_growth":
+            raw = .5 * components["quality"] + .5 * components["growth"]
+        elif request.objective == "value":
+            raw = components["value"]
+        elif request.objective == "income":
+            raw = components["income"]
+        elif request.objective == "macro_resilience":
+            raw = components["macro_resilience"]
+        elif request.objective == "custom":
+            total = sum(max(0, float(value)) for value in request.factor_weights.values()) or 1
+            raw = sum(max(0, float(weight)) * components.get(key, 0) for key, weight in request.factor_weights.items()) / total
+        else:
+            raw = 0
+        return raw * confidence
+    research_signal = np.asarray([signal(research[ticker]) for ticker in eligible], dtype=float)
+    weights, conflicts = _optimize(panel, request.max_security_weight, request.objective, group_limits=group_limits, research_signal=research_signal)
     covariance = panel.dropna().cov().to_numpy() * 12 if not panel.empty else np.empty((0, 0))
     portfolio_variance = float(weights @ covariance @ weights) if len(weights) else 0
     allocations = []
@@ -225,6 +257,7 @@ def optimize_stocks(request: StockBasketRequest) -> dict[str, Any]:
         ],
         "constraints": {"status": "infeasible" if conflicts else "satisfied", "diagnostics": conflicts},
         "lineage": [{"provider": "+".join(sorted(set(providers.values()))), "dataset": "monthly adjusted prices", "symbols": [*eligible, request.benchmark.upper()]}, {"provider": "EagleEyes research store", "dataset": "deterministic security research", "symbols": eligible}],
-        "assumptions": ["Expected return comes from historical monthly adjusted returns, not the language model.", "Covariance uses common history and diagonal shrinkage.", "Directional trade labels are not generated."],
+        "signal_method": {"objective": request.objective, "factor_weights": request.factor_weights if request.objective == "custom" else {}, "confidence_adjusted": True},
+        "assumptions": ["Expected return comes from historical monthly adjusted returns, not the language model.", "Quality, growth, value, income, macro-resilience, and custom tilts use deterministic stored research evidence adjusted by coverage confidence.", "Income and macro-resilience use disclosed sector evidence where issuer-level measures are unavailable.", "Covariance uses common history and diagonal shrinkage.", "Directional trade labels are not generated."],
         "warnings": [item["reason"] for item in exclusions],
     }

@@ -23,6 +23,16 @@ test("secondary tools remain discoverable without entering primary navigation", 
   assert.match(routes, /"plan", "◌", "Plan & profile"/);
 });
 
+test("normal detail is the default and the only global presentation override is Expert mode", async () => {
+  const shell = await read("app/components/shell/AppShell.tsx");
+  const presentation = await read("app/lib/presentation-level.ts");
+  assert.match(shell, /Expert mode/);
+  assert.match(shell, /presentationLevel==="expert"\?"detailed":"expert"/);
+  assert.doesNotMatch(shell, /PRESENTATION_LEVELS\.map/);
+  assert.doesNotMatch(shell, /aria-label="Presentation level"/);
+  assert.match(presentation, /value === "expert" \? "expert" : "detailed"/);
+});
+
 test("Decision Lab has one canonical workspace and preserves its old deep links", async () => {
   const routes = await read("app/lib/routes.ts");
   const decisions = await read("app/components/decisions/DecisionsPage.tsx");

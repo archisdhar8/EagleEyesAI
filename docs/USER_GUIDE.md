@@ -1,5 +1,7 @@
 # EagleEyes AI — Complete App Description and User Guide
 
+> This guide documents the earlier core experience. For the current seven-workspace hierarchy—including Learn, Decision Lab, ETF and stock builders, persistent conversations, complete sub-tab maps, and page-design review criteria—use the authoritative [Product Review](../PRODUCT.md).
+
 ## 1. What EagleEyes is
 
 EagleEyes is a private, market-first investment research workspace. It brings portfolio information, stock research, macroeconomic evidence, historical market states, prediction markets, scenario analysis, transparent portfolio modeling, and AI-generated research boards into one application.
@@ -19,18 +21,30 @@ EagleEyes is research and decision-support software. It does not connect to a br
 
 ## 2. Product structure
 
-The application has six primary workspaces:
+The application has five primary workspaces centered on the investment-decision lifecycle:
 
 | Workspace | Purpose |
 |---|---|
-| **Home** | A concise, portfolio-linked market briefing and prioritized attention items. |
-| **Plan** | Goals, investor profile, projections, investment policy, research preferences, and planning guidance. |
+| **Today** | A concise, portfolio-linked list of what deserves attention now. |
 | **Portfolio** | Holdings, imports, allocation, portfolio status, and transparent change options. |
-| **Explore** | Searchable stock research, market-environment research, scenarios, prediction markets, comparisons, and watchlists. |
+| **Research** | Searchable company and ETF research, macro evidence, scenarios, prediction markets, comparisons, and watchlists. |
+| **Decisions** | Saved theses, monitoring, explicit WATCH/BUY/ADD/HOLD/REDUCE/SELL/AVOID decisions, and retrospective history. |
 | **Ask EagleEyes** | Natural-language questions that produce evidence-backed research boards. |
-| **Advanced** | A manual research terminal plus model diagnostics, validation, and data lineage. |
 
-The app defaults to a **Detailed** presentation. A persistent Simple/Detailed/Expert control changes how much explanation and technical evidence is visible without changing the underlying calculations.
+Plan, Learn, Advanced tools, and Expert mode remain available under **More**.
+
+The app defaults to its normal detailed presentation. If you need model diagnostics and deeper methodology, open **More** and turn on **Expert mode**. The former global Simple/Detailed/Expert switch was removed because it duplicated local evidence controls and made the product harder to understand. Expert mode changes presentation only; it never changes the underlying calculations.
+
+### How Decisions and theses work
+
+A thesis is the reasoning EagleEyes should remember and monitor—not an essay the user must write from scratch. To create one:
+
+1. Enter a ticker, choose whether you own, are considering, are watching, or avoid it, and optionally add one sentence about why it is on your mind.
+2. EagleEyes builds an unsaved draft from verified research using the existing evidence pipeline.
+3. Review the proposed core thesis, assumptions, catalysts, risks, and thesis breakers. Edit or remove suggestions and add your own beliefs.
+4. Explicitly confirm the reviewed thesis before saving it. Suggestions are never silently treated as the user's belief.
+
+Saving creates persistent decision memory and later edits create a new version. It does not place a trade or automatically record a BUY/SELL decision. A saved WATCH thesis—or choosing to do nothing—is valid. Detailed thresholds, base/bull/bear cases, and monitoring rules remain available in the collapsed advanced editor when needed.
 
 ## 3. Data, calculations, and AI boundaries
 
@@ -460,6 +474,14 @@ Provider data is cached and timestamped. A failed refresh preserves the latest v
 4. Open Plan to add goals, constraints, and an investment policy if desired.
 5. Open Explore → Stock Research and refresh evidence.
 6. Review Explore → Market Environment and data freshness.
+
+### Attention, alerts, and learned preferences
+
+1. Open Today for the ranked decision-attention feed. A quiet state means no material evidence change was detected.
+2. Expand In-app alert center to review active grouped alerts and select categories or a critical-only threshold. EagleEyes does not send email or push alerts.
+3. Open Decisions → Decision Journal to review completed decisions. Pattern inferences appear only after the disclosed minimum sample.
+4. Accept, edit and accept, or dismiss each inference. Accepted preferences are shown wherever they affect ordering and remain separate from financial evidence.
+5. Expand Evidence details on Research, Today, Portfolio, Decisions, Earnings, and Ask outputs to inspect source, effective date, method, coverage, and missing-data state.
 
 ### Researching a stock
 

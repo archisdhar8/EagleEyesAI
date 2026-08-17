@@ -7,6 +7,7 @@ from collections import OrderedDict
 from typing import Any
 
 from .models import Holding, PortfolioPayload
+from .portfolio_eligibility import equity_analysis_holdings
 
 
 FIELD_ALIASES = {
@@ -192,6 +193,12 @@ def parse_portfolio_csv(csv_text: str, name: str = "Imported portfolio") -> dict
 
     validated = [Holding.model_validate(row).model_dump(mode="json") for row in holdings]
     PortfolioPayload(name=name, holdings=[Holding.model_validate(row) for row in validated])
+    _, analysis_exclusions = equity_analysis_holdings(validated)
+    if analysis_exclusions:
+        labels = ", ".join(f"{row['ticker']} ({row['reason'].replace('_', ' ')})" for row in analysis_exclusions)
+        warnings.append(
+            f"Kept {len(analysis_exclusions)} non-equity position(s) for portfolio-value reconciliation but excluded them from stock/ETF analysis: {labels}."
+        )
     return {
         "holdings": validated,
         "warnings": warnings,
@@ -200,4 +207,5 @@ def parse_portfolio_csv(csv_text: str, name: str = "Imported portfolio") -> dict
         "source_rows": len(parsed_rows) + len(review_rows),
         "review_rows": review_rows,
         "excluded_market_value": round(excluded_market_value, 2),
+        "analysis_exclusions": analysis_exclusions,
     }

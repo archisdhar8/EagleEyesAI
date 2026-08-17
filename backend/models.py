@@ -8,6 +8,100 @@ from pydantic import BaseModel, Field, model_validator
 
 AccountType = Literal["taxable", "traditional_ira", "roth_ira", "401k", "other"]
 Preset = Literal["growth", "balanced", "preservation", "income"]
+DecisionType = Literal["WATCH", "BUY", "ADD", "HOLD", "REDUCE", "SELL", "AVOID"]
+ThesisStatus = Literal["DRAFT", "ACTIVE", "UNDER_REVIEW", "CLOSED", "ARCHIVED"]
+ThesisHorizon = Literal["short", "medium", "long", "custom"]
+AssumptionCategory = Literal[
+    "GROWTH", "PROFITABILITY", "MARGIN", "VALUATION", "BALANCE_SHEET",
+    "COMPETITIVE_POSITION", "CAPITAL_ALLOCATION", "DEMAND", "MACRO",
+    "MANAGEMENT", "REGULATORY", "PORTFOLIO_FIT", "CUSTOM",
+]
+AssumptionImportance = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+AssumptionStatus = Literal["UNTESTED", "SUPPORTED", "WEAKENING", "BROKEN", "NOT_MONITORABLE"]
+ComparisonOperator = Literal[">", ">=", "<", "<=", "=", "!="]
+ThesisFactorType = Literal["CATALYST", "RISK", "BREAKER"]
+
+
+class ThesisAssumptionPayload(BaseModel):
+    id: str | None = None
+    description: str = Field(min_length=2, max_length=1000)
+    category: AssumptionCategory = "CUSTOM"
+    importance: AssumptionImportance = "MEDIUM"
+    status: AssumptionStatus = "UNTESTED"
+    metric: str | None = Field(default=None, max_length=120)
+    operator: ComparisonOperator | None = None
+    target_value: float | None = None
+    unit: str | None = Field(default=None, max_length=40)
+    evidence_mapping: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_monitorable_assumption(self) -> "ThesisAssumptionPayload":
+        structured = [self.metric, self.operator, self.target_value]
+        if any(value is not None for value in structured) and not all(value is not None for value in structured):
+            raise ValueError("Monitorable assumptions require metric, operator, and target_value together")
+        return self
+
+
+class ThesisFactorPayload(BaseModel):
+    id: str | None = None
+    factor_type: ThesisFactorType
+    description: str = Field(min_length=2, max_length=1000)
+    metric: str | None = Field(default=None, max_length=120)
+    operator: ComparisonOperator | None = None
+    threshold: float | None = None
+    period_requirement: str | None = Field(default=None, max_length=120)
+    unit: str | None = Field(default=None, max_length=40)
+    evidence_mapping: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_monitorable_factor(self) -> "ThesisFactorPayload":
+        structured = [self.metric, self.operator, self.threshold]
+        if any(value is not None for value in structured) and not all(value is not None for value in structured):
+            raise ValueError("Monitorable factors require metric, operator, and threshold together")
+        return self
+
+
+class InvestmentThesisPayload(BaseModel):
+    ticker: str = Field(min_length=1, max_length=10, pattern=r"^[A-Za-z][A-Za-z0-9.-]{0,9}$")
+    summary: str = Field(min_length=2, max_length=2000)
+    base_case: str = Field(default="", max_length=4000)
+    bull_case: str = Field(default="", max_length=4000)
+    bear_case: str = Field(default="", max_length=4000)
+    investment_horizon: ThesisHorizon = "long"
+    horizon_end_date: date | None = None
+    review_date: date | None = None
+    status: ThesisStatus = "DRAFT"
+    source_context: dict[str, Any] = Field(default_factory=dict)
+    change_note: str | None = Field(default=None, max_length=500)
+    assumptions: list[ThesisAssumptionPayload] = Field(default_factory=list, max_length=50)
+    factors: list[ThesisFactorPayload] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def normalize_ticker(self) -> "InvestmentThesisPayload":
+        self.ticker = self.ticker.upper().strip()
+        return self
+
+
+class InvestmentDecisionPayload(BaseModel):
+    ticker: str = Field(min_length=1, max_length=10, pattern=r"^[A-Za-z][A-Za-z0-9.-]{0,9}$")
+    thesis_id: str | None = None
+    decision_type: DecisionType
+    decision_date: datetime | None = None
+    quantity: float | None = Field(default=None, ge=0)
+    portfolio_context: dict[str, Any] = Field(default_factory=dict)
+    user_confidence: int | None = Field(default=None, ge=1, le=5)
+    investment_horizon: ThesisHorizon | None = None
+    notes: str = Field(default="", max_length=4000)
+    source_context: dict[str, Any] = Field(default_factory=dict)
+    expected_outcome: str = Field(default="", max_length=4000)
+    review_horizon_days: int | None = Field(default=None, ge=30, le=3650)
+    comparison_benchmark: str = Field(default="SPY", min_length=1, max_length=10, pattern=r"^[A-Za-z][A-Za-z0-9.-]{0,9}$")
+
+    @model_validator(mode="after")
+    def normalize_decision_ticker(self) -> "InvestmentDecisionPayload":
+        self.ticker = self.ticker.upper().strip()
+        self.comparison_benchmark = self.comparison_benchmark.upper().strip()
+        return self
 
 
 class Holding(BaseModel):
@@ -334,6 +428,48 @@ class StockBasketRequest(BaseModel):
     excluded_tickers: list[str] = Field(default_factory=list)
     tax_rate: float = Field(default=.20, ge=0, le=.60)
     turnover_limit: float = Field(default=1, ge=0, le=1)
+
+
+class ModelPortfolioCompareRequest(BaseModel):
+    portfolio_type: Literal["stocks", "etfs", "mixed"] = "mixed"
+    candidate_tickers: list[str] = Field(min_length=2, max_length=100)
+    benchmark: str = Field(default="SPY", min_length=1, max_length=10)
+    factor_weights: dict[str, float] = Field(default_factory=dict)
+    max_security_weight: float = Field(default=.25, ge=.01, le=1)
+    max_expense_ratio: float = Field(default=.01, ge=0, le=.10)
+    minimum_history_years: float = Field(default=3, ge=0, le=30)
+
+    @model_validator(mode="after")
+    def normalize_candidates(self) -> "ModelPortfolioCompareRequest":
+        self.candidate_tickers = list(dict.fromkeys(
+            ticker.strip().upper() for ticker in self.candidate_tickers if ticker.strip()
+        ))
+        self.benchmark = self.benchmark.strip().upper()
+        return self
+
+
+class ModelPortfolioBacktestRequest(BaseModel):
+    alternatives: dict[str, dict[str, float]] = Field(min_length=1, max_length=12)
+    benchmark: str = Field(default="SPY", min_length=1, max_length=10)
+
+
+class ModelPortfolioPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    portfolio_type: Literal["stocks", "etfs", "mixed"] = "mixed"
+    status: Literal["draft", "saved", "converted"] = "draft"
+    candidate_universe: dict[str, Any] = Field(default_factory=dict)
+    basket: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    configuration: dict[str, Any] = Field(default_factory=dict)
+    comparison_results: dict[str, Any] = Field(default_factory=dict)
+    backtest_results: dict[str, Any] = Field(default_factory=dict)
+    simulation_run_id: str | None = None
+
+
+class ModelPortfolioConversionRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    alternative_key: str = Field(default="balanced", min_length=1, max_length=80)
+    initial_value: float = Field(default=10_000, gt=0)
+    account_type: AccountType = "taxable"
 
 
 class ETFAllocationResult(BaseModel):

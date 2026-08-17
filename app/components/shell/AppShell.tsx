@@ -2,7 +2,7 @@
 
 import type { ReactNode } from "react";
 import { isPrimaryTab, navigationLabel, PRIMARY_NAV_ITEMS, SECONDARY_NAV_ITEMS, type Tab } from "../../lib/routes";
-import { PRESENTATION_LEVELS, presentationCopy, type PresentationLevel } from "../../lib/presentation-level";
+import type { PresentationLevel } from "../../lib/presentation-level";
 import { ConceptGlossary } from "../learn/ConceptGlossary";
 
 export function AppShell({
@@ -48,9 +48,6 @@ export function AppShell({
         <div><span className="eyebrow">EagleEyes / {isPrimaryTab(activeTab) ? "Workspace" : "More"}</span><h1>{navigationLabel(activeTab)}</h1></div>
         <div className="top-actions">
           {topAction}
-          <div className="view-level" aria-label="Presentation level">
-            {PRESENTATION_LEVELS.map(level => <button key={level} title={presentationCopy(level).detail} className={presentationLevel === level ? "active" : ""} onClick={() => onPresentationLevel(level)}>{presentationCopy(level).label}</button>)}
-          </div>
           <div className="freshness"><span>Data lineage</span><strong>{freshness}</strong></div>
           <details className="secondary-menu">
             <summary aria-label="Open secondary navigation">More <span aria-hidden>⌄</span></summary>
@@ -59,6 +56,7 @@ export function AppShell({
                 {SECONDARY_NAV_ITEMS.map(([key, icon, label]) => <button key={key} className={activeTab === key ? "active" : ""} onClick={() => onNavigate(key)}><span aria-hidden>{icon}</span><b>{label}</b></button>)}
               </nav>
               <div className="secondary-menu-actions">
+                <button className={presentationLevel==="expert"?"active":""} aria-pressed={presentationLevel==="expert"} onClick={()=>onPresentationLevel(presentationLevel==="expert"?"detailed":"expert")}>▦ Expert mode {presentationLevel==="expert"?"on":"off"}</button>
                 <button onClick={onToggleTheme}>{dark ? "☀ Light mode" : "◐ Dark mode"}</button>
                 <button onClick={onSignOut}>↪ Sign out</button>
               </div>

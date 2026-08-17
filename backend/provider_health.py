@@ -34,11 +34,21 @@ def _entry(
     else:
         state = "awaiting_data"
     metadata = dict((latest or {}).get("metadata") or {})
+    window=dict((latest or {}).get("window") or {})
+    attempts=int(window.get("attempts") or 0);successes=int(window.get("successes") or 0)
+    last_success=window.get("last_success_at")
+    stale_hours=None
+    if last_success:
+        try: stale_hours=round((datetime.now(timezone.utc)-datetime.fromisoformat(str(last_success).replace("Z","+00:00"))).total_seconds()/3600,1)
+        except ValueError: pass
     return {
         "key": key, "label": label, "status": state, "configured": configured,
         "last_attempt_at": (latest or {}).get("fetched_at"),
         "effective_through": (latest or {}).get("as_of"),
-        "error": (latest or {}).get("error"), "datasets": datasets,
+        "failure_reason": "Provider request failed; the last validated snapshot remains in use." if (latest or {}).get("error") else None,
+        "last_success_at": last_success, "stale_duration_hours": stale_hours,
+        "recent_attempts": attempts, "recent_error_rate": round((attempts-successes)/attempts,3) if attempts else None,
+        "datasets": datasets,
         "coverage": coverage or {}, "fallbacks": fallbacks,
         # Provider metadata is deliberately not returned wholesale because it may
         # contain request details. Only the rate-limit allowlist above is public.
