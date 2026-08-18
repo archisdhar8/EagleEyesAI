@@ -5,10 +5,10 @@ import test from "node:test";
 const root=new URL("../",import.meta.url);
 const read=path=>fs.readFileSync(new URL(path,root),"utf8");
 
-test("five primary decision-lifecycle destinations remain the only primary navigation",()=>{
+test("six primary destinations include the forward-looking market climate",()=>{
   const routes=read("app/lib/routes.ts");
   const block=routes.match(/PRIMARY_NAV_ITEMS[\s\S]*?SECONDARY_NAV_ITEMS/)?.[0]||"";
-  for(const label of ["Today","Portfolio","Research","Decisions","Ask EagleEyes"])assert.match(block,new RegExp(label));
+  for(const label of ["Today","Portfolio","Research","Market Climate","Decisions","Ask EagleEyes"])assert.match(block,new RegExp(label));
   for(const label of ["Plan & profile","Learn","Advanced"])assert.doesNotMatch(block,new RegExp(label));
 });
 

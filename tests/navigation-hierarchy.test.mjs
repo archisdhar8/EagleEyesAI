@@ -5,10 +5,10 @@ import test from "node:test";
 const root = new URL("../", import.meta.url);
 const read = async path => readFile(new URL(path, root), "utf8");
 
-test("the investment decision lifecycle owns the five primary destinations", async () => {
+test("the investment decision lifecycle and market climate own the six primary destinations", async () => {
   const routes = await read("app/lib/routes.ts");
   const primary = routes.slice(routes.indexOf("PRIMARY_NAV_ITEMS"), routes.indexOf("SECONDARY_NAV_ITEMS"));
-  const expected = ["Today", "Portfolio", "Research", "Decisions", "Ask EagleEyes"];
+  const expected = ["Today", "Portfolio", "Research", "Market Climate", "Decisions", "Ask EagleEyes"];
   assert.deepEqual(expected.map(label => primary.indexOf(`\"${label}\"`) >= 0), expected.map(() => true));
   assert.deepEqual(expected.map(label => primary.indexOf(`\"${label}\"`)), [...expected].map(label => primary.indexOf(`\"${label}\"`)).sort((a, b) => a - b));
   for (const secondary of ["Plan & profile", "Learn", "Advanced"]) assert.equal(primary.includes(`\"${secondary}\"`), false);
@@ -44,7 +44,7 @@ test("Decision Lab has one canonical workspace and preserves its old deep links"
   assert.match(portfolio, /simulation_run"\)return "\/decisions"/);
 });
 
-test("responsive primary navigation stays aligned to the same five destinations", async () => {
+test("responsive primary navigation stays aligned to the same six destinations", async () => {
   const css = await read("app/globals.css");
-  assert.match(css, /sidebar nav\{grid-template-columns:repeat\(5,1fr\)!important\}/);
+  assert.match(css, /sidebar nav\{grid-template-columns:repeat\(6,1fr\)!important\}/);
 });

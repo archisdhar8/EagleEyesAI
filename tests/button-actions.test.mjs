@@ -152,17 +152,17 @@ test("progressive planning, combined macro analysis, and saved-board deletion st
   assert.match(source, /deleteDashboardView/);
 });
 
-test("research and portfolio chats expose durable conversation controls", async () => {
+test("Ask EagleEyes exposes durable conversation controls as the single chat surface", async () => {
   const source = await dashboardSurface();
   for (const action of [
     "newChatConversation", "openChatConversation", "renameChatConversation",
     "deleteChatConversation", "buildBoardFromConversation",
   ]) assert.match(source, new RegExp(`function ${action}\\(`));
-  for (const copy of ["Research conversations", "Portfolio conversations", "Linked evidence", "＋ New"]) {
+  for (const copy of ["Research conversations", "Linked evidence", "＋ New", "Questions live in one place"]) {
     assert.match(source, new RegExp(copy));
   }
   assert.match(source, /eagleeyes-research-conversation/);
-  assert.match(source, /eagleeyes-portfolio-conversation/);
+  assert.match(source, /MarketClimatePage/);
 });
 
 test("chat history remains beside the conversation on desktop", async () => {

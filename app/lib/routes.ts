@@ -1,4 +1,4 @@
-export type Tab = "today" | "portfolio" | "explore" | "decisions" | "ask" | "plan" | "learn" | "advanced";
+export type Tab = "today" | "portfolio" | "explore" | "climate" | "decisions" | "ask" | "plan" | "learn" | "advanced";
 export type ExploreView = "stocks" | "etfs" | "portfolio-builder" | "etf-builder" | "stock-builder" | "sectors" | "themes" | "macro" | "scenarios" | "prediction-markets" | "compare" | "watchlist";
 export type PortfolioView = "holdings" | "analysis";
 export type AdvancedView = "terminal" | "diagnostics" | "validation" | "lineage" | "providers";
@@ -17,6 +17,7 @@ export const PRIMARY_NAV_ITEMS: ReadonlyArray<readonly [Tab, string, string]> = 
   ["today", "⌂", "Today"],
   ["portfolio", "◫", "Portfolio"],
   ["explore", "◎", "Research"],
+  ["climate", "◉", "Market Climate"],
   ["decisions", "◈", "Decisions"],
   ["ask", "✦", "Ask EagleEyes"],
 ];
@@ -41,6 +42,8 @@ const ROUTES: Record<string, Omit<RouteState, "canonicalPath"> & { canonicalPath
   "/decision-lab": { tab: "decisions", canonicalPath: "/decisions" },
   "/explore": { tab: "explore", canonicalPath: "/research" },
   "/research": { tab: "explore", exploreView: "stocks" },
+  "/market-climate": { tab: "climate" },
+  "/macro": { tab: "climate", canonicalPath: "/market-climate" },
   "/learn": { tab: "learn" },
   "/scenarios": { tab: "explore", exploreView: "scenarios", canonicalPath: "/research?view=scenarios" },
   "/ask": { tab: "ask" },
@@ -93,6 +96,7 @@ export function resolveAppRoute(pathname: string, search = ""): RouteState | nul
 export function pathForTab(tab: Tab): string {
   if (tab === "today") return "/today";
   if (tab === "explore") return "/research";
+  if (tab === "climate") return "/market-climate";
   return `/${tab}`;
 }
 

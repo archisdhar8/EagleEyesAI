@@ -14,7 +14,6 @@ const EMPTY: InvestmentThesis = {
 type DecisionPersonalization={version:string;explicit:Record<string,unknown>;accepted:Record<string,{label?:string;basis?:string;sample_size?:number}>;inferred:Array<{key:string;label:string;basis:string;sample_size:number;value:string}>;dismissed:string[];minimum_reviewed_decisions:number;reviewed_decisions:number};
 type SecurityResearch={ticker:string;company?:string;sector?:string;industry?:string;evidence_bucket?:string;bucket_explanation?:string;portfolio_fit?:string;what_would_change_the_view?:string;thesis_risks?:string[];catalysts?:Array<{title:string;source_url?:string|null}>;market_statistics?:Record<string,number|null|string>;fundamental_statistics?:Record<string,number|null|string>;freshness?:{status?:string;price_as_of?:string|null;fundamentals_as_of?:string|null;coverage?:string};strengths?:Array<{label:string;evidence:number}>;weaknesses?:Array<{label:string;evidence:number}>};
 type SecurityIntelligence={research:SecurityResearch|null;earnings:Record<string,unknown>|null;markets:Array<Record<string,unknown>>;warnings:string[]};
-type DecisionChatMessage={role:"user"|"assistant";content:string};
 
 async function readJson<T>(response: Response): Promise<T> {
   const body = await response.json().catch(() => ({}));
@@ -86,10 +85,6 @@ export function DecisionsPage({
   const [intelligence,setIntelligence]=useState<SecurityIntelligence>({research:null,earnings:null,markets:[],warnings:[]});
   const [intelligenceLoading,setIntelligenceLoading]=useState(false);
   const [caseTab,setCaseTab]=useState<"base"|"bull"|"bear">("base");
-  const [decisionChat,setDecisionChat]=useState<DecisionChatMessage[]>([]);
-  const [decisionQuestion,setDecisionQuestion]=useState("");
-  const [decisionChatBusy,setDecisionChatBusy]=useState(false);
-  const [decisionConversationId,setDecisionConversationId]=useState<string|null>(null);
 
   const load = useCallback(async () => {
     setLoading(true); setError("");
@@ -260,8 +255,7 @@ export function DecisionsPage({
     BREAKER: form.factors.map((item, index) => ({ item, index })).filter(({ item }) => item.factor_type === "BREAKER"),
   };
 
-  const chooseSecurity=(ticker:string)=>{const normalized=ticker.trim().toUpperCase();if(!/^[A-Z][A-Z0-9.-]{0,9}$/.test(normalized)){setError("Enter a valid stock or ETF ticker.");return;}setError("");setSelectedTicker(normalized);setSecuritySearch("");setDecisionChat([]);setDecisionConversationId(null);window.history.replaceState({},"",`/decisions?ticker=${encodeURIComponent(normalized)}`);};
-  const askDecision=async(event:FormEvent)=>{event.preventDefault();const question=decisionQuestion.trim();if(!question||decisionChatBusy||!selectedTicker)return;setDecisionQuestion("");setDecisionChat(items=>[...items,{role:"user",content:question}]);setDecisionChatBusy(true);try{const result=await readJson<{conversation_id?:string;message?:{content?:string}}>(await request("/chat/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question,conversation_id:decisionConversationId,workspace:"research",page_context:{route:`/decisions?ticker=${selectedTicker}`,workspace:"research",entity_type:"security",ticker:selectedTicker,thesis_id:selectedId,enabled_context:["evidence","thesis","portfolio"]}})}));setDecisionConversationId(result.conversation_id||null);setDecisionChat(items=>[...items,{role:"assistant",content:result.message?.content||"No grounded explanation was returned."}]);}catch(reason){setDecisionChat(items=>[...items,{role:"assistant",content:reason instanceof Error?reason.message:"The security discussion is temporarily unavailable."}]);}finally{setDecisionChatBusy(false);}};
+  const chooseSecurity=(ticker:string)=>{const normalized=ticker.trim().toUpperCase();if(!/^[A-Z][A-Z0-9.-]{0,9}$/.test(normalized)){setError("Enter a valid stock or ETF ticker.");return;}setError("");setSelectedTicker(normalized);setSecuritySearch("");window.history.replaceState({},"",`/decisions?ticker=${encodeURIComponent(normalized)}`);};
   const research=intelligence.research;
   const statistics=research?.market_statistics||{};
   const fundamentals=research?.fundamental_statistics||{};
@@ -304,7 +298,7 @@ export function DecisionsPage({
 
           <form className="panel decision-capture" onSubmit={recordDecision}><header><div><span>Decision under review</span><h3>What are you considering for {selectedTicker}?</h3></div><small>Recording is optional and creates an immutable journal entry.</small></header><div className="decision-capture-actions">{(["WATCH","BUY","ADD","HOLD","REDUCE","SELL","AVOID"] as DecisionType[]).map(value=><button type="button" key={value} className={decisionType===value?"active":""} onClick={()=>setDecisionType(value)}>{value}</button>)}</div><div className="decision-capture-fields"><label>Expected outcome<textarea value={expectedOutcome} onChange={event=>setExpectedOutcome(event.target.value)} placeholder="What do you expect by the review date?"/></label><label>Reasoning now<textarea value={decisionNotes} onChange={event=>setDecisionNotes(event.target.value)} placeholder="Why this action—or no action—now?"/></label></div><footer><small>Append-only journal · Price unavailable remains disclosed when no observation exists.</small><button className="primary" disabled={saving}>{saving?"Recording…":`Record ${decisionType}`}</button></footer></form>
 
-          <section className="panel contextual-decision-chat"><header><div><span>Ask about this report</span><h3>Discuss {selectedTicker} with the evidence in view</h3></div><small>Uses stored evidence, saved thesis, and portfolio context</small></header><div className="decision-chat-thread">{decisionChat.length?decisionChat.map((message,index)=><article className={message.role} key={`${message.role}-${index}`}><span>{message.role==="user"?"You":"EagleEyes"}</span><p>{message.content}</p></article>):<div className="chat-prompts">{[`What would make the bear case more likely?`,`How do prediction markets affect this thesis?`,`What evidence is missing before I decide?`].map(question=><button key={question} onClick={()=>setDecisionQuestion(question)}>{question}</button>)}</div>}</div><form onSubmit={askDecision}><textarea value={decisionQuestion} onChange={event=>setDecisionQuestion(event.target.value)} placeholder={`Ask a question about ${selectedTicker}…`}/><button className="primary" disabled={decisionChatBusy||!decisionQuestion.trim()}>{decisionChatBusy?"Reviewing evidence…":"Ask EagleEyes"}</button></form></section>
+          <section className="panel unified-assistant-callout"><div><span>Questions live in one place</span><h3>Discuss {selectedTicker} in Ask EagleEyes.</h3><p>The main assistant receives the ticker, saved thesis, portfolio context, earnings, and prediction-market evidence through its routing layer.</p></div><a className="primary" href={`/ask?ticker=${encodeURIComponent(selectedTicker)}&prompt=${encodeURIComponent(`Review my ${selectedTicker} decision report. What evidence most strengthens or weakens the thesis?`)}`}>Ask about {selectedTicker} →</a></section>
           {!!intelligence.warnings.length&&<div className="validation-list">{intelligence.warnings.map(item=><span key={item}>{item}</span>)}</div>}
         </>}
       </div>
