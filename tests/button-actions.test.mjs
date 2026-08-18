@@ -22,6 +22,15 @@ test("every rendered button has an action", async () => {
   assert.deepEqual(inert, []);
 });
 
+test("stock research search starts ready instead of blocking on an empty universe scan", async () => {
+  const research = await readFile(researchPath, "utf8");
+  assert.match(research, /useState\(view!=="stocks"\|\|Boolean\(deepLinkedTicker\)\)/);
+  assert.match(research, /if\(view==="stocks"&&!deepLinkedTicker\)\{setLoading\(false\);setError\(""\);/);
+  assert.doesNotMatch(research, /deepLinkedTicker\?`\/research\/search\?q=.*:`\/research\/search\?`/);
+  assert.match(research, /Create a thesis/);
+  assert.match(research, /security-stat-workbench/);
+});
+
 test("critical portfolio and analysis actions remain wired", async () => {
   const source = await dashboardSurface();
   for (const action of [
