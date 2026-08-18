@@ -31,6 +31,7 @@ _INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("THESIS", ("my thesis", "thesis breaker", "thesis status", "assumption status", "weakened a thesis")),
     ("SCENARIO", ("simulate", "what if", "stress test", "higher-for-longer", "oil shock", "recession scenario", "rate scenario")),
     ("RESEARCH_RANKING", ("strongest and weakest research", "strongest research evidence", "weakest research evidence", "rank my holdings", "rank the holdings", "best and worst research evidence")),
+    ("PORTFOLIO_ANALYSIS", ("balanced alternative", "risk-controlled alternative", "goal-tilted alternative", "rebalance", "rebalancing", "optimizer", "target weight", "allocation change")),
     ("PORTFOLIO_RISK", ("portfolio concentrated", "portfolio concentration", "hidden exposure", "same macro risk", "shared macro", "risk contribution", "fragile")),
     ("COMPARISON", ("compare ", " versus ", " vs ", "stronger business", "which is better")),
     ("FORECAST", ("prediction market", "market pricing", "probability", "odds", "forecast", "fed cut", "export restriction")),
@@ -69,6 +70,7 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
         "THESIS": ("thesis_monitor", "evidence_changes"),
         "SCENARIO": ("portfolio_scenario",),
         "RESEARCH_RANKING": ("security_ranking",),
+        "PORTFOLIO_ANALYSIS": ("portfolio_analysis",),
         "PORTFOLIO_RISK": ("portfolio_intelligence", "forecasting"),
         "COMPARISON": ("company_comparison", "portfolio_intelligence"),
         "FORECAST": ("forecasting", "thesis_monitor"),
@@ -86,7 +88,7 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
     if intent in {"CHANGE", "THESIS", "EARNINGS", "COMPARISON", "COMPANY_RESEARCH"} and not tickers:
         tools = ["stored_evidence"]
     if "portfolio" not in enabled:
-        tools = [tool for tool in tools if tool not in {"portfolio_intelligence", "portfolio_scenario"}]
+        tools = [tool for tool in tools if tool not in {"portfolio_analysis", "portfolio_intelligence", "portfolio_scenario"}]
     if "thesis" not in enabled:
         tools = [tool for tool in tools if tool != "thesis_monitor"]
     if "evidence" not in enabled:
@@ -117,7 +119,7 @@ def actions_for(plan: AskPlan, page_context: dict[str, Any] | None = None) -> li
             {"label": f"Open {ticker} research", "href": f"/research?view=stocks&ticker={ticker}", "kind": "research"},
             {"label": "Review thesis or record decision", "href": f"/decisions?ticker={ticker}", "kind": "decision"},
         ])
-    if plan.intent in {"SCENARIO", "PORTFOLIO_RISK", "ADD_RESEARCH", "COMPARISON"}:
+    if plan.intent in {"SCENARIO", "PORTFOLIO_ANALYSIS", "PORTFOLIO_RISK", "ADD_RESEARCH", "COMPARISON"}:
         actions.append({"label": "Open portfolio intelligence", "href": "/portfolio?view=analysis", "kind": "portfolio"})
     if plan.intent == "RETROSPECTIVE":
         actions.append({"label": "Open decision journal", "href": "/decisions?view=journal", "kind": "journal"})

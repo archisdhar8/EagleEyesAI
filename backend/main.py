@@ -2368,9 +2368,29 @@ def _portfolio_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, A
     if any(term in lowered for term in ("rebalance", "alternative", "optimizer", "allocation", "concentration", "risk")):
         analysis = database.latest_analysis(user_id)
         if analysis:
+            alternatives = list(analysis.get("alternatives") or [])
+            requested_name = next(
+                (name for name in ("Risk-Controlled", "Balanced", "Goal-Tilted") if name.lower() in lowered),
+                "Balanced",
+            )
+            selected = next((item for item in alternatives if item.get("name") == requested_name), None)
             tool_results.append({
                 "tool_name": "latest_portfolio_analysis", "status": "complete",
                 "title": "Latest portfolio analysis", "run_id": analysis.get("id"),
+                "summary": {"selected_alternative": selected, "created_at": analysis.get("created_at")},
+            })
+            tool_evidence.append({
+                "label": "Latest saved portfolio analysis",
+                "as_of": analysis.get("created_at"),
+                "url": None,
+                "claim_type": "MODEL_OUTPUT",
+                "data": {
+                    "current_portfolio": analysis.get("current_portfolio"),
+                    "selected_alternative": selected,
+                    "implementation_paths": analysis.get("implementation_paths"),
+                    "warnings": analysis.get("warnings"),
+                    "model_diagnostics": analysis.get("model_diagnostics"),
+                },
             })
     if any(term in lowered for term in ("stock", "holding", "research", "evidence", "replacement", "strongest", "weakest")):
         tool_results.append({"tool_name": "security_research", "status": "complete", "title": "Stored security research"})
@@ -2421,6 +2441,37 @@ def _security_ranking_chat_tools(user_id: str, question: str) -> tuple[list[dict
 
 def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]]) -> str | None:
     """Answer exact quantitative requests without paying an LLM latency or truncation penalty."""
+    if intent == "PORTFOLIO_ANALYSIS":
+        result = next((item for item in tool_results if item.get("tool_name") == "latest_portfolio_analysis"
+                       and item.get("status") == "complete"), None)
+        alternative = (result or {}).get("summary", {}).get("selected_alternative") or {}
+        allocations = sorted(
+            list(alternative.get("allocations") or []),
+            key=lambda item: abs(float(item.get("delta") or 0)),
+            reverse=True,
+        )
+        changed = [item for item in allocations if abs(float(item.get("delta") or 0)) >= 0.002]
+        if not alternative or not changed:
+            return None
+        moves = []
+        for item in changed[:8]:
+            delta = float(item.get("delta") or 0)
+            direction = "increase" if delta > 0 else "reduce"
+            reason = str(item.get("reason") or "The target reflects the saved model inputs and constraints.")
+            moves.append(
+                f"- **{item.get('ticker')}**: {direction} from **{float(item.get('current_weight') or 0):.1%}** "
+                f"to **{float(item.get('target_weight') or 0):.1%}**. {reason} [S1]"
+            )
+        turnover = float(alternative.get("turnover") or 0)
+        tradeoff = str(alternative.get("tradeoff") or "The allocation balances the saved model objectives and constraints.")
+        return (
+            f"The **{alternative.get('name', 'selected')}** alternative rebalances these holdings because it is a constrained model portfolio, "
+            "not a copy of the current allocation. It weighs modeled return and covariance risk against turnover, taxes, diversification, "
+            f"and your saved priorities. Its estimated one-way turnover is **{turnover:.1%}** [S1].\n\n"
+            + "\n".join(moves)
+            + f"\n\n**Tradeoff:** {tradeoff} [S1]\n\n"
+            "**What to verify:** review the saved run’s data dates, constraint conflicts, tax assumptions, and each target range before treating the modeled weights as actionable."
+        )
     if intent == "SCENARIO":
         result = next((item for item in tool_results if item.get("tool_name") == "portfolio_decision_lab"
                        and item.get("status") == "complete"), None)
@@ -2695,6 +2746,8 @@ def _execute_ask_tool(tool: str, user_id: str, question: str) -> tuple[list[dict
         wanted = "earnings_intelligence" if tool == "earnings_intelligence" else "portfolio_intelligence"
         return [item for item in tools if item.get("tool_name") == wanted], grounded
     if tool == "portfolio_scenario":
+        return _portfolio_chat_tools(user_id, routed_question)
+    if tool == "portfolio_analysis":
         return _portfolio_chat_tools(user_id, routed_question)
     if tool == "decision_journal":
         return _decision_journal_chat_tools(user_id, routed_question)

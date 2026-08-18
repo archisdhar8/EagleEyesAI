@@ -72,6 +72,41 @@ def test_provider_health_never_requires_live_network_for_status() -> None:
     assert {row["key"] for row in payload["providers"]} == {"supabase", "fred", "prices", "market_snapshots", "events", "kalshi", "polymarket", "sec", "gemini"}
 
 
+def test_balanced_rebalance_answer_uses_latest_saved_allocations(monkeypatch) -> None:
+    analysis = {
+        "id": "analysis-1",
+        "created_at": "2026-08-17T18:00:00+00:00",
+        "current_portfolio": {"holdings": [{"ticker": "AAPL"}, {"ticker": "SPY"}]},
+        "alternatives": [{
+            "name": "Balanced",
+            "turnover": 0.15,
+            "tradeoff": "Balances modeled return, risk, taxes, and diversification.",
+            "allocations": [
+                {"ticker": "AAPL", "current_weight": 0.60, "target_weight": 0.45, "delta": -0.15,
+                 "reason": "Reduce concentration in a single company."},
+                {"ticker": "SPY", "current_weight": 0.40, "target_weight": 0.55, "delta": 0.15,
+                 "reason": "Increase broad-market diversification."},
+            ],
+        }],
+        "implementation_paths": [],
+        "warnings": [],
+        "model_diagnostics": {},
+    }
+    monkeypatch.setattr("backend.main.database.latest_analysis", lambda user_id: analysis)
+
+    tools, evidence = _portfolio_chat_tools(
+        "user-1", "Why does the Balanced alternative rebalance these holdings?"
+    )
+    answer = _deterministic_chat_answer("PORTFOLIO_ANALYSIS", tools)
+
+    assert tools[0]["tool_name"] == "latest_portfolio_analysis"
+    assert tools[0]["summary"]["selected_alternative"]["name"] == "Balanced"
+    assert evidence[0]["data"]["selected_alternative"]["name"] == "Balanced"
+    assert answer is not None
+    assert "AAPL" in answer and "60.0%" in answer and "45.0%" in answer
+    assert "SPY" in answer and "15.0%" in answer
+
+
 def test_research_coverage_returns_explicit_missing_history_in_sqlite_mode() -> None:
     with TestClient(app) as client:
         response = client.get("/api/research/coverage?tickers=SPY")

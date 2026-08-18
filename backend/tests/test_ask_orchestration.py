@@ -46,6 +46,13 @@ def test_scenario_and_research_ranking_use_minimal_exact_tools():
     assert ranking.tools == ("security_ranking",)
 
 
+def test_balanced_rebalance_question_uses_saved_portfolio_analysis():
+    plan = build_plan("Why does the Balanced alternative rebalance these holdings?", "portfolio")
+    assert plan.intent == "PORTFOLIO_ANALYSIS"
+    assert plan.tools == ("portfolio_analysis",)
+    assert "stored_evidence" not in plan.tools
+
+
 def test_explicit_execution_states_and_deep_link_actions():
     assert execution_state("complete") == "SUCCESS"
     assert execution_state("partial") == "PARTIAL"
