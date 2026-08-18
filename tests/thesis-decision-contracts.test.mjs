@@ -30,10 +30,12 @@ test("decisions workspace makes assisted drafts editable and explicitly unsaved"
 test("decision reports auto-build complete scenarios and use compact editable rows", () => {
   assert.match(decisions, /autoDraftedTickers/);
   assert.match(decisions, /Three distinct paths/);
-  assert.match(decisions, /Each case explains a different outcome, why it could happen/);
+  assert.match(decisions, /Each case is a short memo explaining a different outcome/);
   assert.match(decisions, /Better than current path/);
   assert.match(decisions, /Worse than current path/);
   assert.match(decisions, /Current path persists/);
+  assert.match(decisions, /scenarioParagraphs/);
+  assert.match(decisions, /scenario-paragraphs/);
   assert.match(guided, /guided-factor-list/);
   assert.match(guided, /guided-edit-row/);
 });

@@ -491,20 +491,26 @@ def evidence_draft(ticker: str, research: dict[str, Any] | None) -> dict[str, An
     bull_inputs = catalyst_labels[:3] or strengths[:3]
     bear_inputs = risk_labels[:3] or weaknesses[:3]
     base_case = (
-        f"Why this is the base case: {company} continues on roughly its current operating path because the evidence already in the system persists rather than materially improving or deteriorating. "
-        + (f"That requires {'; '.join(base_inputs)}. " if base_inputs else "The operating path is not supported by enough stored trend data yet. ")
-        + (f"This case becomes less likely if {bear_inputs[0]}." if bear_inputs else "Add a measurable downside condition to define when this case stops being the most plausible one.")
+        f"{company} continues on roughly its current operating path because the evidence already in the system persists rather than materially improving or deteriorating. This is the middle path between an upside acceleration and a deterioration in the business evidence."
+        + "\n\n"
+        + (f"Why it could happen: {'; '.join(base_inputs)}. These conditions would support continuity in the present operating trajectory." if base_inputs else "Why it could happen: the operating path is not supported by enough stored trend data yet, so this case requires additional evidence before it can be treated as the central scenario.")
+        + "\n\n"
+        + (f"What would change the view: this case becomes less likely if {bear_inputs[0]}." if bear_inputs else "What would change the view: add a measurable downside condition to define when this case stops being the most plausible one.")
     )
     bull_case = (
-        f"Why the bull case could happen: {company} performs better than the current path because a specific upside driver strengthens the business evidence beyond the base case. "
-        + (f"The upside drivers stored today are {'; '.join(bull_inputs)}. " if bull_inputs else "No verified upside driver is stored yet, so the bull case is not supported beyond the base case. ")
-        + "This case should require observable improvement in those drivers, not merely a higher share price."
+        f"{company} performs better than the current operating path because one or more upside drivers strengthen the business evidence beyond what the base case assumes. This is not simply a higher share-price scenario; it requires better underlying evidence."
+        + "\n\n"
+        + (f"Why it could happen: the stored upside drivers are {'; '.join(bull_inputs)}. The bull case becomes more credible only if those drivers produce observable improvement beyond the current trajectory." if bull_inputs else "Why it could happen: no verified upside driver is stored yet, so the bull case is not currently supported beyond the base case.")
+        + "\n\n"
+        + "What would confirm it: the named drivers strengthen while the base-case assumptions remain intact. If the catalysts do not improve the operating evidence, the bull case should not be inferred from market momentum alone."
     )
     bear_conditions = [*bear_inputs, *([change_view] if change_view and change_view not in bear_inputs else [])][:4]
     bear_case = (
-        f"Why the bear case could happen: {company} performs worse than the current path because a downside risk weakens or contradicts the operating evidence supporting the base case. "
-        + (f"The downside drivers stored today are {'; '.join(bear_conditions)}. " if bear_conditions else "No company-specific downside driver is stored yet; limited coverage is itself an uncertainty. ")
-        + (f"The thesis should be reconsidered if {change_view}." if change_view else "Add a measurable thesis breaker so this case can be distinguished from ordinary volatility.")
+        f"{company} performs worse than the current operating path because a downside risk weakens or contradicts the evidence supporting the base case. This scenario concerns deterioration in the business thesis, not ordinary share-price volatility by itself."
+        + "\n\n"
+        + (f"Why it could happen: the stored downside drivers are {'; '.join(bear_conditions)}. These risks matter when they begin to damage the assumptions that support the current trajectory." if bear_conditions else "Why it could happen: no company-specific downside driver is stored yet; limited coverage is itself an important uncertainty.")
+        + "\n\n"
+        + (f"What would confirm it: the thesis should be reconsidered if {change_view}." if change_view else "What would confirm it: add a measurable thesis breaker so this scenario can be distinguished from temporary volatility or an incomplete data set.")
     )
     draft = {
             "ticker": ticker, "summary": f"{company} may merit consideration if the stored business evidence persists; confirm the assumptions before saving.",

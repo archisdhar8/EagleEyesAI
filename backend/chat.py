@@ -200,6 +200,7 @@ def draft_thesis_prose(evidence: dict[str, Any], starter: dict[str, str]) -> tup
     }
     prompt = f"""Create an editable investment-thesis prose draft from only the verified evidence below.
 Return strict JSON with exactly four string keys: summary, base_case, bull_case, bear_case.
+Write each case as a distinct short memo of 2–3 substantive paragraphs separated by blank lines. Each case must explain the outcome, why it could happen, the evidence or drivers that would confirm it, and what would weaken or disprove it. Do not return one-line cases or merely rename the same explanation three times.
 Do not recommend buying or selling. Do not introduce any number, date, price, forecast, probability, threshold, or financial claim not explicitly present in the evidence.
 Make missing information explicit instead of treating it as neutral. Distinguish a company-quality view from portfolio fit.
 The user must review and explicitly save this draft; it is not a decision.
