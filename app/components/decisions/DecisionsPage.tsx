@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DecisionLab } from "../portfolio/DecisionLab";
 import type { Goal, Holding, Profile } from "../workspaces";
 import type { DecisionJournalWorkspace, DecisionRetrospective, DecisionType, DecisionsWorkspace, InvestmentThesis, ThesisAssumption, ThesisFactor, ThesisMonitorResult, MonitoringEvidence } from "./contracts";
@@ -85,6 +85,7 @@ export function DecisionsPage({
   const [intelligence,setIntelligence]=useState<SecurityIntelligence>({research:null,earnings:null,markets:[],warnings:[]});
   const [intelligenceLoading,setIntelligenceLoading]=useState(false);
   const [caseTab,setCaseTab]=useState<"base"|"bull"|"bear">("base");
+  const autoDraftedTickers=useRef(new Set<string>());
 
   const load = useCallback(async () => {
     setLoading(true); setError("");
@@ -191,6 +192,14 @@ export function DecisionsPage({
     finally { setDrafting(false); }
   };
 
+  useEffect(()=>{
+    if(!selectedTicker||intelligenceLoading||selectedId||form.summary||drafting||autoDraftedTickers.current.has(selectedTicker))return;
+    autoDraftedTickers.current.add(selectedTicker);
+    void draft();
+  // The selected ticker is drafted once; draft intentionally reads the latest setup state.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[selectedTicker,intelligenceLoading,selectedId,form.summary,drafting]);
+
   const save = async (event: FormEvent) => {
     event.preventDefault();
     if (!form.ticker.trim() || !form.summary.trim()) { setError("Ticker and thesis summary are required."); return; }
@@ -260,6 +269,12 @@ export function DecisionsPage({
   const statistics=research?.market_statistics||{};
   const fundamentals=research?.fundamental_statistics||{};
   const scenarioText=caseTab==="bull"?form.bull_case:caseTab==="bear"?form.bear_case:form.base_case;
+  const scenarioHeading=caseTab==="bull"?"What would need to go right":caseTab==="bear"?"What could break the thesis":`${research?.company||selectedTicker} base case`;
+  const scenarioEvidence=caseTab==="bull"
+    ? (factors.CATALYST.length?factors.CATALYST.map(({item})=>item.description):research?.catalysts?.map(item=>item.title)||[])
+    : caseTab==="bear"
+      ? ([...factors.RISK,...factors.BREAKER].length?[...factors.RISK,...factors.BREAKER].map(({item})=>item.description):research?.thesis_risks||[])
+      : form.assumptions.map(item=>item.description);
   const relationshipLabel:Record<ThesisRelationship,string>={OWN:"I own it",CONSIDER:"I’m considering it",WATCH:"I’m watching it",AVOID:"I’m avoiding it"};
 
   return <section className="workspace decisions-workspace">
@@ -292,7 +307,7 @@ export function DecisionsPage({
 
           <section className="panel forward-signals"><header><div><span>Forward-looking indicators</span><h3>Earnings events and prediction markets</h3></div><small>{intelligence.markets.length} linked market{intelligence.markets.length===1?"":"s"}</small></header>{intelligence.markets.length?<div>{intelligence.markets.slice(0,6).map((market,index)=>{const probability=(market.probability as Record<string,unknown>|undefined)?.probability;return <article key={String(market.market_id||index)}><strong>{String(market.title||"Linked prediction market")}</strong><span>{typeof probability==="number"?`${(probability*100).toFixed(0)}% market-implied probability`:"Probability unavailable"}</span><small>{String(market.provider||"Stored provider")} · market-implied, not an EagleEyes forecast</small></article>})}</div>:<p>No stored Polymarket, Kalshi, or other prediction market is reliably linked to {selectedTicker}. This remains missing evidence.</p>}</section>
 
-          <section className="panel scenario-report"><header><div><span>One-page thesis report</span><h3>Bull, base, and bear cases</h3></div>{!form.summary&&<button className="primary" disabled={drafting} onClick={()=>void draft()}>{drafting?"Building from stored evidence…":"Build evidence-assisted report"}</button>}</header><div className="scenario-tabs" role="tablist">{(["bear","base","bull"] as const).map(value=><button role="tab" aria-selected={caseTab===value} className={caseTab===value?"active":""} onClick={()=>setCaseTab(value)} key={value}>{value[0].toUpperCase()+value.slice(1)} case</button>)}</div><article className={`scenario-copy ${caseTab}`}><span>{caseTab} case</span><h4>{form.summary||`No reviewed ${selectedTicker} thesis has been saved.`}</h4><p>{scenarioText||"Build an evidence-assisted draft, then review and edit it before treating it as your belief."}</p><div><section><strong>Potential catalysts</strong>{factors.CATALYST.length?factors.CATALYST.slice(0,4).map(({item})=><small key={item.id||item.description}>{item.description}</small>):research?.catalysts?.slice(0,4).map(item=><small key={item.title}>{item.title}</small>)||<small>No supported catalyst stored.</small>}</section><section><strong>Risks and breakers</strong>{[...factors.RISK,...factors.BREAKER].length?[...factors.RISK,...factors.BREAKER].slice(0,4).map(({item})=><small key={item.id||item.description}>{item.description}</small>):research?.thesis_risks?.slice(0,4).map(item=><small key={item}>{item}</small>)||<small>No structured risk stored.</small>}</section></div></article>
+          <section className="panel scenario-report"><header><div><span>One-page thesis report</span><h3>Evidence-built scenarios</h3><small>Bull, base, and bear cases are populated automatically from stored research, then remain editable.</small></div>{drafting&&<span className="scenario-building">Refreshing stored evidence…</span>}</header><div className="scenario-tabs" role="tablist">{(["bear","base","bull"] as const).map(value=><button role="tab" aria-selected={caseTab===value} className={caseTab===value?"active":""} onClick={()=>setCaseTab(value)} key={value}><strong>{value[0].toUpperCase()+value.slice(1)}</strong><small>{(value==="bull"?form.bull_case:value==="bear"?form.bear_case:form.base_case)?"Ready":"Building"}</small></button>)}</div><article className={`scenario-copy ${caseTab}`}><span>{caseTab} case</span><h4>{scenarioHeading}</h4><p>{scenarioText||"The evidence-built case is loading. You can still add or edit your own view below."}</p><section className="scenario-evidence"><strong>{caseTab==="bull"?"Upside evidence":caseTab==="bear"?"Risks and invalidation":"Conditions that must remain true"}</strong>{scenarioEvidence.length?scenarioEvidence.slice(0,4).map((item,index)=><small key={`${item}-${index}`}>{item}</small>):<small>No company-specific evidence is stored for this case yet.</small>}</section></article>
             <details className="report-editor"><summary>{form.summary?"Edit thesis and monitoring rules":"Create and review a thesis"}</summary><form onSubmit={save}><GuidedThesisEditor form={form} setForm={setForm} selected={Boolean(selectedId)} drafting={drafting} saving={saving} stage={guidedStage} setStage={setGuidedStage} relationship={relationship} setRelationship={setRelationship} personalReason={personalReason} setPersonalReason={setPersonalReason} reviewConfirmed={reviewConfirmed} setReviewConfirmed={setReviewConfirmed} onDraft={draft}/></form></details>
           </section>
 

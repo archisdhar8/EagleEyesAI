@@ -459,6 +459,11 @@ def evidence_draft(ticker: str, research: dict[str, Any] | None) -> dict[str, An
     catalysts = [item for item in (row.get("catalysts") or []) if item]
     freshness = row.get("freshness") or {}
     missing = (row.get("field_coverage") or {}).get("missing") or []
+    strengths = [str(item.get("label") if isinstance(item, dict) else item) for item in (row.get("strengths") or []) if item]
+    weaknesses = [str(item.get("label") if isinstance(item, dict) else item) for item in (row.get("weaknesses") or []) if item]
+    catalyst_labels = [str(item.get("title") if isinstance(item, dict) else item) for item in catalysts]
+    risk_labels = [str(item).replace("_", " ") for item in risks]
+    change_view = str(row.get("what_would_change_the_view") or "").strip()
     assumptions = []
     trend = row.get("fundamental_trend") or {}
     if trend.get("revenue_growth") is not None:
@@ -479,14 +484,30 @@ def evidence_draft(ticker: str, research: dict[str, Any] | None) -> dict[str, An
         for item in catalysts[:5]
     ]
     factors.append({
-        "factor_type": "BREAKER", "description": "The core operating evidence deteriorates enough that the original base case no longer holds.",
+        "factor_type": "BREAKER", "description": change_view or "The core operating evidence deteriorates enough that the original base case no longer holds.",
         "evidence_mapping": {"source": "user-defined draft; monitoring threshold not yet specified"},
     })
+    base_inputs = [item["description"] for item in assumptions[:3]] or strengths[:3]
+    bull_inputs = catalyst_labels[:3] or strengths[:3]
+    bear_inputs = risk_labels[:3] or weaknesses[:3]
+    base_case = (
+        f"The base case is that {company}'s currently stored operating evidence remains intact. "
+        + (f"The main conditions are: {'; '.join(base_inputs)}." if base_inputs else "No supported operating trend is stored yet, so this case requires additional evidence.")
+    )
+    bull_case = (
+        f"The bull case requires stronger evidence than the base case. "
+        + (f"The stored upside conditions are: {'; '.join(bull_inputs)}." if bull_inputs else "No verified upside catalyst is stored yet; add one before relying on this case.")
+    )
+    bear_conditions = [*bear_inputs, *([change_view] if change_view and change_view not in bear_inputs else [])][:4]
+    bear_case = (
+        f"The bear case is that evidence weakens or contradicts the current view. "
+        + (f"The conditions to monitor are: {'; '.join(bear_conditions)}." if bear_conditions else "No company-specific downside condition is stored yet; limited coverage is itself an uncertainty.")
+    )
     draft = {
             "ticker": ticker, "summary": f"{company} may merit consideration if the stored business evidence persists; confirm the assumptions before saving.",
-            "base_case": "Base-case expectations require investor input. Stored evidence has been attached where available.",
-            "bull_case": "Not specified—add the evidence and conditions that would produce upside.",
-            "bear_case": "Not specified—add the evidence and conditions that would produce downside.",
+            "base_case": base_case,
+            "bull_case": bull_case,
+            "bear_case": bear_case,
             "investment_horizon": "long", "review_date": None, "status": "DRAFT", "assumptions": assumptions, "factors": factors,
             "source_context": {"draft_method": "verified_evidence_starter", "price_as_of": freshness.get("price_as_of"), "fundamentals_as_of": freshness.get("fundamentals_as_of"), "missing_fields": missing},
     }

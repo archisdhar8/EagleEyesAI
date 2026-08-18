@@ -157,6 +157,25 @@ def test_evidence_draft_falls_back_without_saving_or_fabricating_missing_data(mo
     assert "AI synthesis was unavailable" in result["warning"]
 
 
+def test_evidence_draft_populates_all_cases_from_stored_evidence(monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    result = theses.evidence_draft("AMD", {
+        "ticker": "AMD", "company": "Advanced Micro Devices", "freshness": {},
+        "field_coverage": {"missing": []},
+        "fundamental_trend": {"revenue_growth": 0.12, "net_margin": 0.08},
+        "strengths": [{"label": "Revenue growth"}],
+        "weaknesses": [{"label": "Margin pressure"}],
+        "catalysts": [{"title": "Data-center demand", "source_url": None}],
+        "thesis_risks": ["competitive_pressure"],
+        "what_would_change_the_view": "Sustained market-share losses",
+    })
+    draft = result["draft"]
+    assert "Revenue growth remains supportive" in draft["base_case"]
+    assert "Data-center demand" in draft["bull_case"]
+    assert "competitive pressure" in draft["bear_case"]
+    assert "Sustained market-share losses" in draft["bear_case"]
+
+
 def test_ai_prose_draft_is_restricted_to_typed_editable_fields(monkeypatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(chat, "_gemini_request", lambda *args, **kwargs: {

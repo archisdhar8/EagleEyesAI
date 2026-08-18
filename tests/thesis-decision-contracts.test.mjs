@@ -27,6 +27,14 @@ test("decisions workspace makes assisted drafts editable and explicitly unsaved"
   assert.match(decisions, /Price unavailable/);
 });
 
+test("decision reports auto-build complete scenarios and use compact editable rows", () => {
+  assert.match(decisions, /autoDraftedTickers/);
+  assert.match(decisions, /Evidence-built scenarios/);
+  assert.match(decisions, /Bull, base, and bear cases are populated automatically/);
+  assert.match(guided, /guided-factor-list/);
+  assert.match(guided, /guided-edit-row/);
+});
+
 test("research and portfolio bridge into persistent decision context", () => {
   assert.match(research, /Decision memory/);
   assert.match(research, /Research evidence is not automatically a decision/);
