@@ -30,7 +30,7 @@ _INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("CHANGE", ("what changed", "since last review", "different since", "new evidence", "material change")),
     ("THESIS", ("my thesis", "thesis breaker", "thesis status", "assumption status", "weakened a thesis")),
     ("SCENARIO", ("simulate", "what if", "stress test", "higher-for-longer", "oil shock", "recession scenario", "rate scenario")),
-    ("RESEARCH_RANKING", ("strongest and weakest research", "strongest research evidence", "weakest research evidence", "rank my holdings", "rank the holdings", "best and worst research evidence")),
+    ("RESEARCH_RANKING", ("strongest and weakest research", "strongest research evidence", "weakest research evidence", "rank my holdings", "rank the holdings", "best and worst research evidence", "worst stock holding", "worst holding", "weakest stock holding", "weakest holding")),
     ("PORTFOLIO_ANALYSIS", ("balanced alternative", "risk-controlled alternative", "goal-tilted alternative", "rebalance", "rebalancing", "optimizer", "target weight", "allocation change", "improve diversification", "without silently changing my constraints")),
     ("PORTFOLIO_RISK", ("biggest risks", "saved portfolio risk", "portfolio risks", "portfolio concentrated", "portfolio concentration", "hidden exposure", "same macro risk", "shared macro", "risk contribution", "fragile")),
     ("COMPARISON", ("compare ", " versus ", " vs ", "stronger business", "which is better")),

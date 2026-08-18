@@ -46,6 +46,13 @@ def test_scenario_and_research_ranking_use_minimal_exact_tools():
     assert ranking.tools == ("security_ranking",)
 
 
+def test_worst_stock_holding_uses_saved_holdings_research_ranking():
+    plan = build_plan("what is my worst stock holding", "portfolio")
+    assert plan.intent == "RESEARCH_RANKING"
+    assert plan.tools == ("security_ranking",)
+    assert "stored_evidence" not in plan.tools
+
+
 def test_balanced_rebalance_question_uses_saved_portfolio_analysis():
     plan = build_plan("Why does the Balanced alternative rebalance these holdings?", "portfolio")
     assert plan.intent == "PORTFOLIO_ANALYSIS"

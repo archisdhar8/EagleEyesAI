@@ -2429,7 +2429,10 @@ def _security_ranking_chat_tools(user_id: str, question: str) -> tuple[list[dict
         result = {"tool_name": "security_ranking", "status": "unavailable", "title": "Holdings research ranking",
                   "summary": {"message": "Save supported security holdings before ranking their research evidence."}}
         return [result], []
-    rows = security_research(tickers)
+    # A comparative ranking needs a recent trading year, not the broader default
+    # history. Keeping this bounded matters for large saved portfolios on the
+    # interactive Render request budget.
+    rows = security_research(tickers, price_limit=260)
     payload = research_search_payload(
         rows, holdings=tickers, requested=tickers, limit=min(100, len(tickers)),
     )
@@ -2445,9 +2448,14 @@ def _security_ranking_chat_tools(user_id: str, question: str) -> tuple[list[dict
     covered = {str(item.get("ticker", "")).upper() for item in ranked}
     missing = [ticker for ticker in tickers if ticker not in covered]
     status = "partial" if missing or not ranked else "complete"
+    lowered = " ".join(question.lower().split())
+    asks_strongest = any(term in lowered for term in ("strongest", "best"))
+    asks_weakest = any(term in lowered for term in ("weakest", "worst"))
+    focus = "both" if asks_strongest and asks_weakest else "weakest" if asks_weakest else "strongest" if asks_strongest else "both"
     summary = {
         "universe": {"type": "saved portfolio holdings", "count": len(tickers), "tickers": tickers},
         "ranked": ranked, "missing": missing,
+        "focus": focus,
         "method": payload.get("method"),
         "note": "The stored composite orders eligible evidence; qualitative buckets are the user-facing conclusion.",
     }
@@ -2589,11 +2597,24 @@ def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]]) 
         )
     if intent == "RESEARCH_RANKING":
         result = next((item for item in tool_results if item.get("tool_name") == "security_ranking"), None)
-        ranked = list((result or {}).get("summary", {}).get("ranked") or [])
+        summary = (result or {}).get("summary", {})
+        ranked = list(summary.get("ranked") or [])
         if not ranked:
             return None
         strongest, weakest = ranked[0], ranked[-1]
-        missing = list((result or {}).get("summary", {}).get("missing") or [])
+        missing = list(summary.get("missing") or [])
+        if summary.get("focus") == "weakest":
+            weaknesses = ", ".join(item["label"] for item in weakest.get("weaknesses", [])) or "insufficient component coverage"
+            missing_components = ", ".join(weakest.get("missing_components") or [])
+            return (
+                f"Based on the stored comparative research for **{len(ranked)} holdings in your active saved portfolio**, "
+                f"**{weakest['ticker']}** is currently the weakest evidence-ranked holding "
+                f"(**{weakest['evidence_bucket']}**) [S1]. Its weakest covered areas are **{weaknesses}** [S1]."
+                + (f" The missing evidence components are **{missing_components}** [S1]." if missing_components else "")
+                + "\n\nThis means it has the weakest stored evidence profile in this portfolio. It does **not** mean it will have the worst future return, that it is your largest portfolio risk, or that you should sell it."
+                + (f"\n\nNo comparable stored result was available for: {', '.join(missing)}." if missing else "")
+                + "\n\n**What to verify:** review its evidence freshness, missing components, valuation method, position size, tax impact, and role in the portfolio before making a decision."
+            )
         middle = ranked[1:-1]
         middle_text = ", ".join(f"**{row['ticker']}** ({row['evidence_bucket']})" for row in middle[:6])
         return (

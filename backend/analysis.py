@@ -309,10 +309,10 @@ def macro_factor_dashboard() -> dict[str, Any]:
     }
 
 
-def security_research(tickers: list[str]) -> list[dict[str, Any]]:
+def security_research(tickers: list[str], price_limit: int = 756) -> list[dict[str, Any]]:
     rankings = load_rankings()
     indexed = rankings.set_index(rankings["ticker"].astype(str).str.upper()) if not rankings.empty else pd.DataFrame()
-    stored = database.security_data(tickers) if database.DATABASE_URL else {
+    stored = database.security_data(tickers, price_limit=price_limit) if database.DATABASE_URL else {
         "securities": [], "fundamentals": [], "prices": [], "news": [], "company_markets": []
     }
     stored_securities = {row["ticker"]: row for row in stored["securities"]}

@@ -582,13 +582,43 @@ def test_security_ranking_is_limited_to_saved_holdings(monkeypatch) -> None:
          "valuation_score": 52, "fundamental_score": 40, "industry_score": 42, "technical_score": 45,
          "component_coverage": {"growth": True, "valuation": True, "business_quality": True, "industry_position": True, "price_behavior": True}},
     ]
-    monkeypatch.setattr("backend.main.security_research", lambda tickers: rows)
+    requested: list[tuple[list[str], int]] = []
+    monkeypatch.setattr(
+        "backend.main.security_research",
+        lambda tickers, price_limit=756: requested.append((list(tickers), price_limit)) or rows,
+    )
     tools, evidence = _security_ranking_chat_tools("user-1", "Which holdings have the strongest and weakest research evidence?")
+    assert requested == [(["AAPL", "MU"], 260)]
     assert tools[0]["summary"]["universe"]["tickers"] == ["AAPL", "MU"]
     assert [row["ticker"] for row in tools[0]["summary"]["ranked"]] == ["AAPL", "MU"]
     answer = _deterministic_chat_answer("RESEARCH_RANKING", tools)
     assert answer is not None and "AAPL" in answer and "MU" in answer
     assert "expected return" in answer
+
+
+def test_worst_holding_answer_focuses_on_weakest_evidence_not_a_sell_call(monkeypatch) -> None:
+    monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{"holdings": [
+        {"ticker": "AAPL", "weight": .6}, {"ticker": "MU", "weight": .4},
+    ]}])
+    rows = [
+        {"ticker": "AAPL", "company": "Apple", "final_score": 75, "confidence": 80, "data_quality": "high",
+         "growth_rating": 70, "valuation_score": 62, "fundamental_score": 78, "industry_score": 65,
+         "technical_score": 60, "component_coverage": {"growth": True, "valuation": True,
+         "business_quality": True, "industry_position": True, "price_behavior": True}},
+        {"ticker": "MU", "company": "Micron", "final_score": 35, "confidence": 40, "data_quality": "low",
+         "growth_rating": 45, "valuation_score": 40, "fundamental_score": 35, "industry_score": 38,
+         "technical_score": 42, "component_coverage": {"growth": True, "valuation": True,
+         "business_quality": True, "industry_position": False, "price_behavior": False}},
+    ]
+    monkeypatch.setattr("backend.main.security_research", lambda tickers, price_limit=756: rows)
+    tools, _ = _security_ranking_chat_tools("user-1", "what is my worst stock holding")
+    assert tools[0]["summary"]["focus"] == "weakest"
+    answer = _deterministic_chat_answer("RESEARCH_RANKING", tools)
+    assert answer is not None
+    assert "**MU**" in answer
+    assert "weakest evidence-ranked" in answer
+    assert "does **not** mean it will have the worst future return" in answer
+    assert "sell" in answer
 
 
 def test_slow_narrator_fallback_preserves_company_tool_evidence() -> None:
