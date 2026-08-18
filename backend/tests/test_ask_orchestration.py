@@ -60,6 +60,22 @@ def test_balanced_rebalance_question_uses_saved_portfolio_analysis():
     assert "stored_evidence" not in plan.tools
 
 
+def test_benchmark_outlook_and_portfolio_wide_thesis_questions_use_saved_context():
+    benchmark = build_plan("Which stocks will outperform SPY and underperform SPY?", "portfolio")
+    assert benchmark.intent == "BENCHMARK_OUTLOOK"
+    assert benchmark.tools == ("benchmark_outlook",)
+    theses = build_plan("Which of my saved theses need review?", "research")
+    assert theses.intent == "THESIS"
+    assert theses.tools == ("thesis_monitor", "evidence_changes")
+    assert "stored_evidence" not in theses.tools
+
+
+def test_move_out_ten_stocks_routes_to_portfolio_rebalance_analysis():
+    plan = build_plan("Rebalance the portfolio by identifying the 10 stocks to move out", "portfolio")
+    assert plan.intent == "PORTFOLIO_ANALYSIS"
+    assert plan.tools == ("portfolio_analysis",)
+
+
 def test_every_portfolio_starter_prompt_uses_a_bounded_specialized_tool():
     cases = {
         "What are the biggest risks in my saved portfolio?": ("PORTFOLIO_RISK", ("portfolio_risk",)),

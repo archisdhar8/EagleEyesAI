@@ -2210,7 +2210,27 @@ def _thesis_monitor_chat_tools(user_id: str, question: str) -> tuple[list[dict[s
     if not thesis_possessive and not any(phrase in lowered for phrase in ("my thesis", "thesis breaker", "theses weakened", "thesis weakened", "thesis status", "assumption status")):
         return [], []
     tools, grounded = [], []
-    for ticker in _resolve_chat_tickers(question):
+    resolved_tickers = _resolve_chat_tickers(question)
+    if not resolved_tickers:
+        active = [item for item in theses.list_theses(user_id) if item.get("status") in theses.OPEN_STATUSES]
+        summaries = thesis_monitor.latest_summaries(user_id, [str(item["id"]) for item in active])
+        rows = [{
+            "ticker": item.get("ticker"), "thesis_id": str(item.get("id")), "status": item.get("status"),
+            "summary": item.get("summary"), "review_date": item.get("review_date"),
+            "monitor": summaries.get(str(item.get("id"))) or {
+                "overall_status": "NOT_EVALUATED", "requires_review": False, "counts": {},
+            },
+        } for item in active[:30]]
+        result = {
+            "tool_name": "portfolio_thesis_context", "status": "complete" if rows else "unavailable",
+            "title": "Saved investment theses", "summary": {"count": len(rows), "theses": rows},
+        }
+        evidence_row = {
+            "label": "Saved thesis and monitoring context", "as_of": datetime.now(timezone.utc).isoformat(),
+            "url": None, "data": result["summary"], "claim_type": "USER_BELIEF",
+        }
+        return [result], [evidence_row] if rows else []
+    for ticker in resolved_tickers:
         item = theses.active_thesis(user_id, ticker)
         if item is None:
             tools.append({"tool_name": "thesis_monitor", "status": "complete", "title": f"{ticker} thesis monitor", "ticker": ticker,
@@ -2331,6 +2351,7 @@ def _portfolio_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, A
     tool_evidence: list[dict[str, Any]] = []
     portfolios = database.list_portfolios(user_id)
     active_portfolio = portfolios[0] if portfolios else None
+    analysis: dict[str, Any] | None = None
     simulation_requested = any(term in lowered for term in (
         "simulate", "simulation", "what if", "stress test", "market falls", "market fell",
         "drawdown scenario", "recession scenario", "oil shock", "credit shock",
@@ -2412,7 +2433,70 @@ def _portfolio_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, A
                     "model_diagnostics": analysis.get("model_diagnostics"),
                 },
             })
-    if any(term in lowered for term in ("stock", "holding", "research", "evidence", "replacement", "strongest", "weakest")):
+    exit_review_requested = any(term in lowered for term in (
+        "move out", "remove", "exit", "sell", "trim", "reduce", "replace",
+    ))
+    if exit_review_requested and active_portfolio and active_portfolio.get("holdings"):
+        holdings = list(active_portfolio.get("holdings") or [])
+        tickers = list(dict.fromkeys(
+            str(item.get("ticker") or "").upper() for item in holdings
+            if item.get("ticker") and str(item.get("ticker") or "").upper() != "CASH"
+        ))
+        rows = security_research(tickers, price_limit=260)
+        payload = research_search_payload(rows, holdings=tickers, requested=tickers, limit=min(100, len(tickers)))
+        contexts = theses.decision_contexts(user_id, tickers)
+        weights = {str(item.get("ticker") or "").upper(): float(item.get("weight") or 0) for item in holdings}
+        if sum(weights.values()) <= 0:
+            values = {str(item.get("ticker") or "").upper(): float(item.get("market_value") or 0) for item in holdings}
+            total_value = sum(values.values())
+            weights = {ticker: value / total_value for ticker, value in values.items()} if total_value > 0 else weights
+        selected = next((item for item in list((analysis or {}).get("alternatives") or []) if item.get("name") == "Balanced"), None)
+        allocation_map = {str(item.get("ticker") or "").upper(): item for item in list((selected or {}).get("allocations") or [])}
+        candidates = []
+        for row in payload.get("results", []):
+            ticker = str(row.get("ticker") or "").upper()
+            allocation = allocation_map.get(ticker) or {}
+            context = contexts.get(ticker) or {}
+            candidates.append({
+                "ticker": ticker, "company": row.get("company"), "weight": weights.get(ticker, 0),
+                "evidence_bucket": row.get("evidence_bucket"), "relative_rank": row.get("relative_rank"),
+                "weaknesses": row.get("weaknesses") or [],
+                "missing_components": (row.get("field_coverage") or {}).get("missing") or [],
+                "freshness": (row.get("freshness") or {}).get("status"),
+                "research_confidence": (row.get("freshness") or {}).get("coverage"),
+                "expected_return": row.get("expected_return"),
+                "risk_flags": row.get("risk_flags") or [],
+                "prediction_market_count": len(row.get("prediction_markets") or []),
+                "fundamentals_as_of": row.get("fundamentals_as_of"),
+                "thesis_status": context.get("thesis_status"), "has_open_thesis": context.get("has_open_thesis", False),
+                "latest_decision": context.get("latest_decision"), "latest_decision_date": context.get("latest_decision_date"),
+                "current_weight": allocation.get("current_weight"), "target_weight": allocation.get("target_weight"),
+                "model_delta": allocation.get("delta"), "model_reason": allocation.get("reason"),
+            })
+        candidates.sort(key=lambda item: (
+            0 if item.get("model_delta") is not None and float(item.get("model_delta") or 0) < 0 else 1,
+            float(item.get("model_delta") or 0),
+            -int(item.get("relative_rank") or 0),
+        ))
+        requested_count_match = re.search(r"\b(\d{1,2})\b", lowered)
+        requested_count = min(20, max(1, int(requested_count_match.group(1)))) if requested_count_match else 10
+        review = candidates[:requested_count]
+        summary = {
+            "portfolio_id": active_portfolio.get("id"), "portfolio_name": active_portfolio.get("name"),
+            "holding_count": len(tickers), "requested_count": requested_count, "candidates": review,
+            "basis": "Balanced-model reductions first when a current saved analysis exists, then weakest comparative stored evidence.",
+            "has_saved_balanced_analysis": selected is not None,
+            "limitations": "This is a rebalance review list, not an automatic liquidation instruction. Taxes, lots, account location, diversification benefit, and user constraints can override the ordering.",
+        }
+        tool_results.append({
+            "tool_name": "portfolio_rebalance_review", "status": "complete" if review else "unavailable",
+            "title": "Portfolio rebalance review", "summary": summary,
+        })
+        tool_evidence.append({
+            "label": "Saved portfolio rebalance review", "as_of": active_portfolio.get("updated_at"),
+            "url": None, "data": summary, "claim_type": "MODEL_OUTPUT",
+        })
+    elif any(term in lowered for term in ("stock", "holding", "research", "evidence", "replacement", "strongest", "weakest")):
         tool_results.append({"tool_name": "security_research", "status": "complete", "title": "Stored security research"})
     return tool_results, tool_evidence
 
@@ -2465,6 +2549,53 @@ def _security_ranking_chat_tools(user_id: str, question: str) -> tuple[list[dict
         "url": None, "data": summary, "claim_type": "MODEL_OUTPUT",
     }
     return [tool], [evidence_row]
+
+
+def _benchmark_outlook_chat_tools(user_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Compare saved holdings with SPY using the existing bounded research model."""
+    portfolios = database.list_portfolios(user_id)
+    holdings = list((portfolios[0] if portfolios else {}).get("holdings") or [])
+    tickers = list(dict.fromkeys(
+        str(item.get("ticker") or "").upper() for item in holdings
+        if item.get("ticker") and str(item.get("ticker") or "").upper() not in {"CASH", "SPY"}
+    ))
+    if not tickers:
+        result = {"tool_name": "benchmark_outlook", "status": "unavailable", "title": "Holdings versus SPY",
+                  "summary": {"message": "Save at least one stock holding before comparing it with SPY."}}
+        return [result], []
+    rows = security_research([*tickers, "SPY"], price_limit=260)
+    indexed = {str(row.get("ticker") or "").upper(): row for row in rows}
+    benchmark = indexed.get("SPY") or {}
+    benchmark_return = float(benchmark.get("expected_return") or 0)
+    contexts = theses.decision_contexts(user_id, tickers)
+    comparisons = []
+    for ticker in tickers:
+        row = indexed.get(ticker)
+        if not row:
+            continue
+        modeled_return = float(row.get("expected_return") or 0)
+        context = contexts.get(ticker) or {}
+        comparisons.append({
+            "ticker": ticker, "company": row.get("company"), "modeled_return": modeled_return,
+            "spy_modeled_return": benchmark_return, "modeled_excess_return": modeled_return - benchmark_return,
+            "confidence": row.get("confidence"), "data_quality": row.get("data_quality"),
+            "fundamentals_as_of": row.get("fundamentals_as_of"), "price_as_of": row.get("price_as_of"),
+            "risk_flags": row.get("risk_flags") or [], "prediction_market_count": len(row.get("prediction_markets") or []),
+            "thesis_status": context.get("thesis_status"), "latest_decision": context.get("latest_decision"),
+        })
+    comparisons.sort(key=lambda item: float(item["modeled_excess_return"]), reverse=True)
+    summary = {
+        "benchmark": "SPY", "benchmark_modeled_return": benchmark_return,
+        "outperform_candidates": comparisons[:10], "underperform_candidates": list(reversed(comparisons[-10:])),
+        "holding_count": len(tickers), "model_version": "stored-research-relative-outlook-v1",
+        "method": "Existing stored expected-return estimate compared with the same model's SPY estimate; ranking is conditional and not a return guarantee.",
+        "limitations": "The estimate is sensitive to valuation, fundamentals, recent price behavior, data coverage, and model assumptions. It is not a price target or promise of benchmark outperformance.",
+    }
+    result = {"tool_name": "benchmark_outlook", "status": "complete" if comparisons else "unavailable",
+              "title": "Holdings versus SPY", "summary": summary}
+    evidence = {"label": "Modeled saved-holdings outlook versus SPY", "as_of": datetime.now(timezone.utc).isoformat(),
+                "url": None, "data": summary, "claim_type": "MODEL_OUTPUT"}
+    return [result], [evidence]
 
 
 def _portfolio_risk_chat_tools(user_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -2533,6 +2664,39 @@ def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]]) 
             "**What to verify:** open Portfolio analysis for correlation clusters, sector exposure, ETF overlap, tax constraints, and marginal covariance risk before acting."
         )
     if intent == "PORTFOLIO_ANALYSIS":
+        review_result = next((item for item in tool_results if item.get("tool_name") == "portfolio_rebalance_review"
+                              and item.get("status") == "complete"), None)
+        review_summary = (review_result or {}).get("summary") or {}
+        candidates = list(review_summary.get("candidates") or [])
+        if candidates:
+            lines = []
+            for index, item in enumerate(candidates, 1):
+                weaknesses = ", ".join(value.get("label", "") for value in item.get("weaknesses", []) if value.get("label")) or "limited comparative support"
+                model_delta = item.get("model_delta")
+                target = item.get("target_weight")
+                allocation = (
+                    f" The saved Balanced model reduces it by **{abs(float(model_delta)):.1%}**"
+                    + (f" to **{float(target):.1%}**" if target is not None else "") + "."
+                ) if model_delta is not None and float(model_delta) < 0 else ""
+                decision = f" Latest saved decision: **{item['latest_decision']}**." if item.get("latest_decision") else " No saved decision is recorded."
+                thesis = f" Thesis: **{item['thesis_status']}**." if item.get("has_open_thesis") else " No active thesis is saved."
+                lines.append(
+                    f"{index}. **{item['ticker']}** — **{float(item.get('weight') or 0):.1%}** of the portfolio; "
+                    f"{item.get('evidence_bucket') or 'unclassified evidence'}. Weakest areas: {weaknesses}.{allocation}{thesis}{decision}"
+                )
+            basis = review_summary.get("basis")
+            return (
+                f"I would place these **{len(candidates)} holdings into the first exit-or-replacement review**, rather than automatically liquidating them. "
+                f"The ordering uses {basis} [S1]\n\n"
+                "### First holdings to review\n"
+                + "\n".join(lines)
+                + "\n\n### How I would make the rebalance decision\n"
+                "A holding should move out only when the weak research case is confirmed by its saved thesis, the intended portfolio role can be replaced, and the tax/account consequences are acceptable. "
+                "A limited-evidence label is a reason to investigate—not proof that the company is bad. Conversely, an existing thesis should not protect a holding if its assumptions are contradicted or the position no longer improves portfolio construction.\n\n"
+                "Use the saved Balanced target where one exists; otherwise treat the name as a research queue item and compare a replacement against SPY, sector exposure, covariance risk, and turnover before assigning a target weight. "
+                f"{review_summary.get('limitations')}\n\n"
+                "**What to verify:** review tax lots, account type, thesis assumptions, earnings freshness, prediction-market relevance, replacement overlap, and the latest analysis constraints before recording any SELL or REDUCE decision."
+            )
         result = next((item for item in tool_results if item.get("tool_name") == "latest_portfolio_analysis"
                        and item.get("status") == "complete"), None)
         alternative = (result or {}).get("summary", {}).get("selected_alternative") or {}
@@ -2627,6 +2791,113 @@ def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]]) 
             + (f"\n\nNo comparable stored result was available for: {', '.join(missing)}." if missing else "")
             + "\n\n**What to verify:** check each holding’s freshness, missing components, valuation method, and portfolio fit before drawing a decision conclusion."
         )
+    if intent == "BENCHMARK_OUTLOOK":
+        result = next((item for item in tool_results if item.get("tool_name") == "benchmark_outlook"
+                       and item.get("status") == "complete"), None)
+        summary = (result or {}).get("summary") or {}
+        outperform = list(summary.get("outperform_candidates") or [])
+        underperform = list(summary.get("underperform_candidates") or [])
+        if not outperform and not underperform:
+            return None
+        def outlook_lines(rows: list[dict[str, Any]]) -> str:
+            return "\n".join(
+                f"- **{item['ticker']}**: modeled excess return **{float(item.get('modeled_excess_return') or 0):+.1%}** versus SPY; "
+                f"{str(item.get('data_quality') or 'unknown')} data, {float(item.get('confidence') or 0):.0f}/100 coverage"
+                + (f", thesis **{item['thesis_status']}**" if item.get("thesis_status") else ", no active thesis")
+                + (f", latest decision **{item['latest_decision']}**" if item.get("latest_decision") else "")
+                for item in rows[:5]
+            )
+        return (
+            "No system can know in advance which stocks **will** beat SPY. EagleEyes can identify which saved holdings currently have the strongest and weakest **modeled relative outlook** under the same stored research model [S1].\n\n"
+            "### Stronger modeled outlook versus SPY\n" + outlook_lines(outperform) +
+            "\n\n### Weaker modeled outlook versus SPY\n" + outlook_lines(underperform) +
+            f"\n\nSPY's own modeled return in this comparison is **{float(summary.get('benchmark_modeled_return') or 0):.1%}**. "
+            f"{summary.get('method')} The ranking should be used as a research and thesis-review queue, not as a promise or a standalone trade signal.\n\n"
+            f"**Uncertainty:** {summary.get('limitations')} Prediction-market probabilities and earnings evidence can alter scenario weights or thesis confidence, but they do not turn this into a guaranteed forecast.\n\n"
+            "**What to verify:** refresh fundamentals and earnings, inspect valuation inputs and price dates, review the saved thesis and decision history, then test whether each proposed change improves the whole portfolio after taxes and turnover."
+        )
+    if intent == "THESIS":
+        result = next((item for item in tool_results if item.get("tool_name") == "portfolio_thesis_context"), None)
+        rows = list((result or {}).get("summary", {}).get("theses") or [])
+        if rows:
+            rows.sort(key=lambda item: (
+                0 if (item.get("monitor") or {}).get("requires_review") else 1,
+                str((item.get("monitor") or {}).get("overall_status") or ""),
+                str(item.get("ticker") or ""),
+            ))
+            lines = "\n".join(
+                f"- **{item.get('ticker')}** — thesis **{item.get('status')}**; monitor **{(item.get('monitor') or {}).get('overall_status', 'NOT_EVALUATED')}**"
+                + ("; **review required**" if (item.get("monitor") or {}).get("requires_review") else "")
+                + (f"; next review {item.get('review_date')}" if item.get("review_date") else "; no review date")
+                for item in rows[:20]
+            )
+            return (
+                f"You have **{len(rows)} active or draft saved theses**. I can use these in company research, earnings interpretation, portfolio-fit analysis, and rebalance reviews [S1].\n\n"
+                "### Thesis review queue\n" + lines +
+                "\n\nA saved thesis is treated as your belief and decision context, not as verified market fact. Monitor results can show where stored evidence supports, weakens, contradicts, or cannot evaluate an assumption; they do not silently rewrite the thesis.\n\n"
+                "**What to verify:** open any thesis marked for review, inspect the assumption-level evidence, and explicitly save or record a decision if your view changes."
+            )
+    if intent == "EARNINGS":
+        results = [item for item in tool_results if item.get("tool_name") == "earnings_intelligence"]
+        if results:
+            sections = []
+            for result in results:
+                summary = result.get("summary") or {}
+                ticker = result.get("ticker") or "Company"
+                comparisons = summary.get("actual_vs_expectations") or {}
+                comparison_lines = []
+                for metric, values in list(comparisons.items())[:6]:
+                    if not isinstance(values, dict):
+                        continue
+                    surprise = values.get("surprise_percent")
+                    comparison_lines.append(
+                        f"- **{str(metric).replace('_', ' ').title()}**: actual {values.get('actual') if values.get('actual') is not None else 'unavailable'}; "
+                        f"consensus {values.get('consensus') if values.get('consensus') is not None else 'unavailable'}"
+                        + (f"; surprise **{float(surprise):+.1%}**" if surprise is not None else "; no validated surprise")
+                    )
+                impact = summary.get("thesis_impact") or {}
+                sections.append(
+                    f"### {ticker} earnings\nPeriod: **{summary.get('period') or 'latest stored period'}**; reported {summary.get('reported_at') or 'date unavailable'} [S1].\n"
+                    + ("\n".join(comparison_lines) if comparison_lines else "- Provider-supplied consensus comparisons are unavailable; no beat or miss was inferred.")
+                    + f"\n- Thesis impact: **{impact.get('overall_status') or 'not evaluated'}**."
+                    + (f"\n- Warnings: {'; '.join(summary.get('warnings') or [])}" if summary.get("warnings") else "")
+                )
+            return (
+                "\n\n".join(sections)
+                + "\n\nEarnings facts, management guidance, consensus comparisons, and thesis interpretation are kept separate. Missing consensus is not treated as an in-line result, and an earnings beat alone does not determine portfolio fit.\n\n"
+                "**What to verify:** inspect the reported period, provider source, guidance changes, estimate-revision window, and the specific saved thesis assumptions affected."
+            )
+    if intent == "FORECAST":
+        result = next((item for item in tool_results if item.get("tool_name") == "prediction_market_intelligence"), None)
+        summary = (result or {}).get("summary") or {}
+        markets = list(summary.get("markets") or [])
+        if markets:
+            lines = "\n".join(
+                f"- **{item.get('title')}**: **{float(item.get('probability') or 0):.1%}** market-implied probability as of {item.get('as_of') or 'unknown'}"
+                + (f"; affects {', '.join(item.get('affected_holdings') or [])}" if item.get("affected_holdings") else "")
+                for item in markets
+            )
+            return (
+                f"I found **{len(markets)} relevant stored prediction-market expectations**. These are market-implied probabilities, not EagleEyes forecasts and not verified future outcomes [S1].\n\n"
+                "### Current market-implied expectations\n" + lines +
+                "\n\nUse these probabilities to adjust scenario weights and identify exposed holdings or theses. They should not override company quality, valuation, portfolio constraints, or a saved decision process. Market quality and liquidity also matter; a stale or thin market deserves less weight.\n\n"
+                "**What to verify:** open the market source, check its resolution rules and freshness, compare it with your saved probability, and inspect the linked holdings and thesis assumptions."
+            )
+    if intent == "RETROSPECTIVE":
+        decisions = [item.get("summary") or {} for item in tool_results if item.get("tool_name") == "decision_context_snapshot"]
+        decisions = [item for item in decisions if item.get("ticker")]
+        if decisions:
+            lines = "\n".join(
+                f"- **{item.get('ticker')}** — **{item.get('decision_type')}** on {item.get('decision_date') or 'an unknown date'}"
+                + (f": {item.get('notes')}" if item.get("notes") else "")
+                for item in decisions
+            )
+            return (
+                f"I can access your saved, owner-scoped decision history. The most relevant **{len(decisions)} decisions** are [S1]:\n\n"
+                + lines
+                + "\n\nThese records preserve what you decided and when. A retrospective should compare the original information and assumptions with later evidence, while keeping outcome quality separate from decision-process quality.\n\n"
+                "**What to verify:** open the Decision Journal to review the immutable context snapshot, later evidence, forecast calibration, and any recorded follow-up review."
+            )
     return None
 
 
@@ -2684,7 +2955,13 @@ def _forecasting_chat_tools(user_id: str, question: str) -> tuple[list[dict[str,
         "tool_name": "prediction_market_intelligence", "status": "complete" if markets else "unavailable",
         "title": "Relevant market-implied expectations", "ticker": ticker,
         "summary": {"market_count": len(markets), "disagreement_count": len(payload.get("disagreements", [])),
-                    "as_of": payload.get("as_of")},
+                    "as_of": payload.get("as_of"), "markets": [{
+                        "provider": item.get("provider"), "title": item.get("title"),
+                        "probability": (item.get("probability") or {}).get("probability"),
+                        "as_of": (item.get("probability") or {}).get("as_of"),
+                        "quality": item.get("quality"), "affected_holdings": item.get("affected_holdings") or [],
+                        "affected_theses": item.get("affected_theses") or [],
+                    } for item in markets[:8]]},
     }]
     evidence_rows = [{
         "label": f"{item['provider']} market: {item['title']}",
@@ -2754,7 +3031,11 @@ def _phase7_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, Any]
                 ticker, bundle.get("fundamentals", []), thesis=thesis, monitor=monitors[0] if monitors else None,
                 transcript_chunks=database.earnings_transcript_chunks(ticker))
             tools.append({"tool_name": "earnings_intelligence", "status": payload.get("status", "UNAVAILABLE").lower(), "title": f"{ticker} earnings changes", "ticker": ticker,
-                          "summary": {"period": payload.get("period"), "coverage": payload.get("coverage"), "thesis_impact": payload.get("thesis_impact")}})
+                          "summary": {"period": payload.get("period"), "reported_at": payload.get("reported_at"),
+                                      "actual_vs_expectations": payload.get("actual_vs_expectations"), "changes": payload.get("changes"),
+                                      "guidance_changes": payload.get("guidance_changes"), "estimate_revisions": payload.get("estimate_revisions"),
+                                      "coverage": payload.get("coverage"), "thesis_impact": payload.get("thesis_impact"),
+                                      "warnings": payload.get("warnings") or []}})
             grounded.append({"label": f"{ticker} structured earnings intelligence", "as_of": payload.get("reported_at"), "url": (payload.get("source") or {}).get("url"), "data": payload})
     if any(term in lowered for term in ("portfolio concentrated", "portfolio concentration", "hidden exposure", "same macro risk", "shared macro", "weakening fundamentals", "portfolio reports")):
         payload = _portfolio_intelligence_payload(user_id).get("intelligence", {})
@@ -2769,7 +3050,7 @@ def _decision_journal_chat_tools(user_id: str, question: str) -> tuple[list[dict
     if not any(term in lowered for term in (
         "why did i", "originally buy", "original decision", "assumptions were wrong", "mistakes repeat",
         "decision pattern", "forecast calibration", "forecast accuracy", "thesis breaker", "good reasoning",
-        "bad outcome", "decision journal", "retrospective",
+        "bad outcome", "decision journal", "retrospective", "my decisions", "saved decisions", "decision history",
     )):
         return [], []
     tools: list[dict[str, Any]] = []; grounded: list[dict[str, Any]] = []
@@ -2789,7 +3070,9 @@ def _decision_journal_chat_tools(user_id: str, question: str) -> tuple[list[dict
             snapshot = decision_journal.get_snapshot(user_id, decision["id"])["snapshot"]
         except KeyError:
             continue
-        tools.append({"tool_name": "decision_context_snapshot", "status": "complete", "title": f"Original {decision['ticker']} {decision['decision_type']} context", "ticker": decision["ticker"], "decision_id": decision["id"]})
+        tools.append({"tool_name": "decision_context_snapshot", "status": "complete", "title": f"Original {decision['ticker']} {decision['decision_type']} context", "ticker": decision["ticker"], "decision_id": decision["id"],
+                      "summary": {"ticker": decision.get("ticker"), "decision_type": decision.get("decision_type"),
+                                  "decision_date": decision.get("decision_date"), "notes": decision.get("notes")}})
         grounded.append({"label": f"Immutable {decision['ticker']} decision context", "as_of": decision["decision_date"], "url": None, "data": snapshot})
         if any(term in lowered for term in ("retrospective", "assumptions were wrong", "thesis breaker", "good reasoning", "bad outcome")):
             try:
@@ -2861,6 +3144,8 @@ def _execute_ask_tool(tool: str, user_id: str, question: str) -> tuple[list[dict
         return _comparison_chat_tools(user_id, routed_question)
     if tool == "security_ranking":
         return _security_ranking_chat_tools(user_id, routed_question)
+    if tool == "benchmark_outlook":
+        return _benchmark_outlook_chat_tools(user_id)
     return [{"tool_name": tool, "status": "unavailable", "title": tool.replace("_", " ").title()}], []
 
 
@@ -2992,9 +3277,9 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
     claim_types = {
         "prediction_market_intelligence": "MARKET_IMPLIED", "user_market_probability_comparison": "USER_BELIEF",
         "portfolio_decision_lab": "MODEL_OUTPUT", "portfolio_intelligence": "MODEL_OUTPUT", "portfolio_risk": "MODEL_OUTPUT",
-        "security_ranking": "MODEL_OUTPUT",
+        "security_ranking": "MODEL_OUTPUT", "portfolio_rebalance_review": "MODEL_OUTPUT", "benchmark_outlook": "MODEL_OUTPUT",
         "company_research_refresh": "VERIFIED_FACT", "earnings_intelligence": "VERIFIED_FACT",
-        "evidence_changes": "VERIFIED_FACT", "thesis_monitor": "MODEL_OUTPUT",
+        "evidence_changes": "VERIFIED_FACT", "thesis_monitor": "MODEL_OUTPUT", "portfolio_thesis_context": "USER_BELIEF",
     }
     for item in evidence:
         label = str(item.get("label", "")).lower()

@@ -36,7 +36,7 @@ def test_chat_continues_a_max_tokens_response(monkeypatch) -> None:
     assert "The first part ends here" in answer
     assert "and this completes the answer" in answer
     assert len(calls) == 2
-    assert calls[0]["generationConfig"]["maxOutputTokens"] == 1200
+    assert calls[0]["generationConfig"]["maxOutputTokens"] == 1600
     assert calls[1]["generationConfig"]["maxOutputTokens"] == 600
     assert calls[1]["contents"][-1]["role"] == "user"
     assert model

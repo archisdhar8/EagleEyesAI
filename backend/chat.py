@@ -156,7 +156,7 @@ Evidence: {json.dumps(indexed, default=str)}
 Question: {question}
 
 Lead with a direct answer. Use only the evidence needed for this exact question; ignore unrelated optimizer, thesis, macro, or portfolio facts.
-Then explain what matters, implications, uncertainty, and one useful next step. Stay under 350 words and four short paragraphs.
+Then explain what matters, portfolio or thesis implications, uncertainty, and concrete next steps. When the question asks for a ranking or rebalance, provide the requested names in a readable numbered list and explain each one. Aim for 300–600 words when the evidence supports that depth; use concise headings and do not pad missing evidence.
 End with one short 'What to verify' sentence. Finish sentences before adding more detail.
 Do not add a sources list; the application manages source metadata separately."""
     contents: list[dict[str, Any]] = [{"role": "user", "parts": [{"text": prompt}]}]
@@ -165,7 +165,7 @@ Do not add a sources list; the application manages source metadata separately.""
     # Gemini can return useful partial text with MAX_TOKENS. Continue it instead
     # of silently presenting the partial response as a finished answer.
     max_continuations = max(0, min(1, int(os.getenv("GEMINI_MAX_CONTINUATIONS", "0"))))
-    first_budget = max(600, min(1800, int(os.getenv("GEMINI_CHAT_MAX_OUTPUT_TOKENS", "1200"))))
+    first_budget = max(800, min(2200, int(os.getenv("GEMINI_CHAT_MAX_OUTPUT_TOKENS", "1600"))))
     for attempt in range(1 + max_continuations):
         payload = _gemini_request(api_key, model, contents, first_budget if attempt == 0 else 600)
         text, finish_reason = _candidate(payload)

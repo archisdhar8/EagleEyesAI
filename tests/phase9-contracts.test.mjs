@@ -22,8 +22,9 @@ test("page context is visible, controllable, and sent to the typed chat contract
   assert.match(backend, /class ChatPageContext/);
 });
 
-test("tool execution and grounded navigation are visible", () => {
-  assert.match(shared, /ask-execution-plan/);
+test("internal execution stays hidden while grounded navigation remains visible", () => {
+  assert.doesNotMatch(shared, /className="ask-execution-plan"/);
+  assert.doesNotMatch(shared, /className="ask-grounded-tool"/);
   assert.match(shared, /Continue in EagleEyes/);
   assert.match(backend, /execution_state/);
   assert.match(backend, /analysis_context/);

@@ -2,7 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.main import (
-    _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
+    _benchmark_outlook_chat_tools, _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
     _cors_allowed_origins, _portfolio_chat_tools, _portfolio_risk_chat_tools, _security_ranking_chat_tools, app,
 )
 
@@ -105,6 +105,66 @@ def test_balanced_rebalance_answer_uses_latest_saved_allocations(monkeypatch) ->
     assert answer is not None
     assert "AAPL" in answer and "60.0%" in answer and "45.0%" in answer
     assert "SPY" in answer and "15.0%" in answer
+
+
+def test_move_out_ten_stocks_returns_long_rebalance_review_with_saved_context(monkeypatch) -> None:
+    holdings = [{"ticker": f"S{index}", "weight": .05} for index in range(12)]
+    monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{
+        "id": "portfolio-1", "name": "Main", "updated_at": "2026-08-17", "holdings": holdings,
+    }])
+    monkeypatch.setattr("backend.main.database.latest_analysis", lambda user_id, portfolio_id=None: None)
+    monkeypatch.setattr("backend.main.security_research", lambda tickers, price_limit=756: [])
+    monkeypatch.setattr("backend.main.research_search_payload", lambda rows, **kwargs: {"results": [{
+        "ticker": f"S{index}", "company": f"Stock {index}", "relative_rank": index + 1,
+        "evidence_bucket": "Limited evidence" if index >= 8 else "Mixed evidence",
+        "weaknesses": [{"label": "Valuation"}], "field_coverage": {"missing": ["Industry position"]},
+        "freshness": {"status": "current", "coverage": "medium"}, "expected_return": .04,
+        "risk_flags": [], "prediction_markets": [], "fundamentals_as_of": "2026-06-30",
+    } for index in range(12)]})
+    monkeypatch.setattr("backend.main.theses.decision_contexts", lambda user_id, tickers: {
+        ticker: {"has_open_thesis": ticker == "S11", "thesis_status": "ACTIVE" if ticker == "S11" else None,
+                 "latest_decision": "WATCH" if ticker == "S10" else None, "latest_decision_date": "2026-08-01"}
+        for ticker in tickers
+    })
+
+    tools, evidence = _portfolio_chat_tools(
+        "user-1", "Rebalance the portfolio by identifying the 10 stocks to move out"
+    )
+    review = next(item for item in tools if item["tool_name"] == "portfolio_rebalance_review")
+    assert len(review["summary"]["candidates"]) == 10
+    assert review["summary"]["candidates"][0]["ticker"] == "S11"
+    assert evidence[-1]["claim_type"] == "MODEL_OUTPUT"
+    answer = _deterministic_chat_answer("PORTFOLIO_ANALYSIS", tools)
+    assert answer is not None
+    assert "10 holdings" in answer
+    assert "S11" in answer and "S2" in answer
+    assert "exit-or-replacement review" in answer
+    assert "tax" in answer.lower() and "thesis" in answer.lower()
+
+
+def test_benchmark_outlook_compares_saved_holdings_with_spy_without_promising_returns(monkeypatch) -> None:
+    monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{"holdings": [
+        {"ticker": "AAPL", "weight": .6}, {"ticker": "MU", "weight": .4},
+    ]}])
+    rows = [
+        {"ticker": "AAPL", "company": "Apple", "expected_return": .12, "confidence": 80, "data_quality": "high",
+         "fundamentals_as_of": "2026-06-30", "price_as_of": "2026-08-14", "risk_flags": [], "prediction_markets": []},
+        {"ticker": "MU", "company": "Micron", "expected_return": .03, "confidence": 55, "data_quality": "medium",
+         "fundamentals_as_of": "2026-06-30", "price_as_of": "2026-08-14", "risk_flags": [], "prediction_markets": []},
+        {"ticker": "SPY", "company": "SPDR S&P 500 ETF", "expected_return": .07, "confidence": 85, "data_quality": "high"},
+    ]
+    monkeypatch.setattr("backend.main.security_research", lambda tickers, price_limit=756: rows)
+    monkeypatch.setattr("backend.main.theses.decision_contexts", lambda user_id, tickers: {ticker: {} for ticker in tickers})
+    tools, _ = _benchmark_outlook_chat_tools("user-1")
+    summary = tools[0]["summary"]
+    assert summary["outperform_candidates"][0]["ticker"] == "AAPL"
+    assert summary["underperform_candidates"][0]["ticker"] == "MU"
+    answer = _deterministic_chat_answer("BENCHMARK_OUTLOOK", tools)
+    assert answer is not None
+    assert "No system can know" in answer
+    assert "AAPL" in answer and "+5.0%" in answer
+    assert "MU" in answer and "-4.0%" in answer
+    assert "guaranteed forecast" in answer
 
 
 def test_saved_portfolio_risk_answer_never_needs_provider_calls(monkeypatch) -> None:

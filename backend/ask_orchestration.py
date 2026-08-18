@@ -25,13 +25,14 @@ class AskPlan:
 
 
 _INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("RETROSPECTIVE", ("why did i", "original decision", "decision journal", "retrospective", "mistakes repeat", "forecast calibration")),
+    ("RETROSPECTIVE", ("why did i", "original decision", "decision journal", "retrospective", "mistakes repeat", "forecast calibration", "my decisions", "saved decisions", "decision history")),
     ("EARNINGS", ("earnings", "guidance", "estimate revision", "reported quarter", "beat estimates", "missed estimates")),
     ("CHANGE", ("what changed", "since last review", "different since", "new evidence", "material change")),
-    ("THESIS", ("my thesis", "thesis breaker", "thesis status", "assumption status", "weakened a thesis")),
+    ("THESIS", ("my thesis", "my theses", "saved thesis", "saved theses", "thesis breaker", "thesis status", "assumption status", "weakened a thesis")),
     ("SCENARIO", ("simulate", "what if", "stress test", "higher-for-longer", "oil shock", "recession scenario", "rate scenario")),
     ("RESEARCH_RANKING", ("strongest and weakest research", "strongest research evidence", "weakest research evidence", "rank my holdings", "rank the holdings", "best and worst research evidence", "worst stock holding", "worst holding", "weakest stock holding", "weakest holding")),
-    ("PORTFOLIO_ANALYSIS", ("balanced alternative", "risk-controlled alternative", "goal-tilted alternative", "rebalance", "rebalancing", "optimizer", "target weight", "allocation change", "improve diversification", "without silently changing my constraints")),
+    ("BENCHMARK_OUTLOOK", ("outperform spy", "underperform spy", "beat spy", "lag spy", "relative to spy", "versus spy", "vs spy")),
+    ("PORTFOLIO_ANALYSIS", ("balanced alternative", "risk-controlled alternative", "goal-tilted alternative", "rebalance", "rebalancing", "optimizer", "target weight", "allocation change", "improve diversification", "without silently changing my constraints", "move out", "exit candidates", "stocks to remove", "holdings to remove")),
     ("PORTFOLIO_RISK", ("biggest risks", "saved portfolio risk", "portfolio risks", "portfolio concentrated", "portfolio concentration", "hidden exposure", "same macro risk", "shared macro", "risk contribution", "fragile")),
     ("COMPARISON", ("compare ", " versus ", " vs ", "stronger business", "which is better")),
     ("FORECAST", ("prediction market", "market pricing", "probability", "odds", "forecast", "fed cut", "export restriction")),
@@ -70,6 +71,7 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
         "THESIS": ("thesis_monitor", "evidence_changes"),
         "SCENARIO": ("portfolio_scenario",),
         "RESEARCH_RANKING": ("security_ranking",),
+        "BENCHMARK_OUTLOOK": ("benchmark_outlook",),
         "PORTFOLIO_ANALYSIS": ("portfolio_analysis",),
         "PORTFOLIO_RISK": ("portfolio_risk",),
         "COMPARISON": ("company_comparison", "portfolio_intelligence"),
@@ -85,7 +87,7 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
         "which holding", "holdings affected", "portfolio exposure", "risk contribution",
     )):
         tools.append("portfolio_intelligence")
-    if intent in {"CHANGE", "THESIS", "EARNINGS", "COMPARISON", "COMPANY_RESEARCH"} and not tickers:
+    if intent in {"CHANGE", "EARNINGS", "COMPARISON", "COMPANY_RESEARCH"} and not tickers:
         tools = ["stored_evidence"]
     if "portfolio" not in enabled:
         tools = [tool for tool in tools if tool not in {"portfolio_analysis", "portfolio_intelligence", "portfolio_scenario"}]
@@ -119,8 +121,10 @@ def actions_for(plan: AskPlan, page_context: dict[str, Any] | None = None) -> li
             {"label": f"Open {ticker} research", "href": f"/research?view=stocks&ticker={ticker}", "kind": "research"},
             {"label": "Review thesis or record decision", "href": f"/decisions?ticker={ticker}", "kind": "decision"},
         ])
-    if plan.intent in {"SCENARIO", "PORTFOLIO_ANALYSIS", "PORTFOLIO_RISK", "ADD_RESEARCH", "COMPARISON"}:
+    if plan.intent in {"SCENARIO", "PORTFOLIO_ANALYSIS", "PORTFOLIO_RISK", "BENCHMARK_OUTLOOK", "ADD_RESEARCH", "COMPARISON"}:
         actions.append({"label": "Open portfolio intelligence", "href": "/portfolio?view=analysis", "kind": "portfolio"})
+    if plan.intent == "THESIS" and not ticker:
+        actions.append({"label": "Review saved theses", "href": "/decisions", "kind": "decision"})
     if plan.intent == "RETROSPECTIVE":
         actions.append({"label": "Open decision journal", "href": "/decisions?view=journal", "kind": "journal"})
     return actions[:3]
