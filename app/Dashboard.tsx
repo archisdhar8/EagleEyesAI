@@ -26,6 +26,7 @@ import {
 
 const API = (process.env.NEXT_PUBLIC_API_URL || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000/api" : "/api")).replace(/\/$/, "");
 const DASHBOARD_TERMINAL_STATES = new Set(["COMPLETE", "PARTIAL_SUCCESS", "FAILED", "CANCELLED", "EXPIRED"]);
+type SavedPortfolio = { id: string | number; name: string; holdings: Holding[]; updated_at?: string | null };
 export default function Dashboard({ accessToken, email, onSignOut }: { accessToken: string; email: string; onSignOut: () => void }) {
   const [tab, setTab] = useState<Tab>("today");
   const [exploreView, setExploreView] = useState<ExploreView>("stocks");
@@ -41,6 +42,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [portfolioId, setPortfolioId] = useState<string | number | null>(null);
+  const [portfolios, setPortfolios] = useState<SavedPortfolio[]>([]);
   const [portfolioName, setPortfolioName] = useState("Primary portfolio");
   const [holdings, setHoldings] = useState<Holding[]>([]);
   const [savedPortfolioSnapshot, setSavedPortfolioSnapshot] = useState(() => portfolioSignature("Primary portfolio", []));
@@ -183,16 +185,24 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   useEffect(() => {
     let active = true;
     async function loadOverview() {
+      let portfolioLibraryLoaded=false;
       try {
+        const libraryResponse=await apiFetch(`${API}/portfolios`);
+        const libraryRows:SavedPortfolio[]=libraryResponse.ok?await libraryResponse.json():[];
+        const rememberedId=window.localStorage.getItem(`eagleeyes-active-portfolio-${email}`);
+        const librarySelection=libraryRows.find(item=>String(item.id)===rememberedId)||libraryRows[0];
+        if(active&&libraryResponse.ok){portfolioLibraryLoaded=true;setConnected(true);setPortfolios(libraryRows);if(librarySelection)showPortfolio(librarySelection);}
         const response = await apiFetch(`${API}/home/briefing`);
         if (!response.ok) throw new Error("Local API unavailable");
         const data = await response.json();
         if (!active) return;
         setConnected(true);
-        if (data.portfolio) {
-          setPortfolioId(data.portfolio.id); setPortfolioName(data.portfolio.name); setHoldings(data.portfolio.holdings);
-          setSavedPortfolioSnapshot(portfolioSignature(data.portfolio.name, data.portfolio.holdings));
-          setPersistedTickers(data.portfolio.holdings.map((row: Holding) => row.ticker.trim().toUpperCase()));
+        const savedPortfolios:SavedPortfolio[]=libraryRows.length?libraryRows:Array.isArray(data.portfolios)?data.portfolios:(data.portfolio?[data.portfolio]:[]);
+        const selectedPortfolio=savedPortfolios.find(item=>String(item.id)===rememberedId)||savedPortfolios[0];
+        setPortfolios(savedPortfolios);
+        if (selectedPortfolio) {
+          showPortfolio(selectedPortfolio);
+          if(String(data.portfolio?.id)!==String(selectedPortfolio.id))void apiFetch(`${API}/portfolios/${selectedPortfolio.id}/activate`,{method:"POST"});
         } else {
           setPortfolioId(null); setPortfolioName("Primary portfolio"); setHoldings([]);
           setSavedPortfolioSnapshot(portfolioSignature("Primary portfolio", []));
@@ -202,25 +212,29 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
         const loadedTerminalWidgets = loadedPreferences.terminal_widgets?.length ? adaptTerminalWidgets(loadedPreferences.terminal_widgets) : defaultTerminalWidgets;
         setProfile({ ...defaultProfile, ...data.profile, suitability_profile:{...defaultProfile.suitability_profile,...(data.profile?.suitability_profile||{})} }); setHomeBriefing(data.briefing||null); setMacro(data.macro); setMacroFactors(data.macro_factors?.factors || []); setPreferences(current => ({ ...current, ...loadedPreferences, presentation_level:normalizePresentationLevel(loadedPreferences.presentation_level), terminal_widgets: loadedTerminalWidgets })); setScenarios(data.scenarios.condition_dimensions||data.scenarios.scenarios); setContracts(data.scenarios.contracts || []); setScenarioFetchedAt(data.scenarios.fetched_at || null); setScenarioWarnings(data.scenarios.warnings); setResearch(data.research); setDataStatus(data.data_status); setRegimeHistory(data.regime_history || { latest: null, sample_counts: {}, total_samples: 0 });
         setMonitoring(data.model_monitoring || null);
-        const diagnosticsResponse=await apiFetch(`${API}/portfolio/diagnostics`);if(active&&diagnosticsResponse.ok)setPortfolioDiagnostics(await diagnosticsResponse.json());
-        if (data.latest_analysis?.alternatives?.length) setAnalysis(data.latest_analysis);
+        const selectedId=selectedPortfolio?.id;
+        const diagnosticsResponse=await apiFetch(`${API}/portfolio/diagnostics${selectedId?`?portfolio_id=${encodeURIComponent(String(selectedId))}`:""}`);if(active&&diagnosticsResponse.ok)setPortfolioDiagnostics(await diagnosticsResponse.json());
+        const analysisResponse=selectedId?await apiFetch(`${API}/analyses/latest?portfolio_id=${encodeURIComponent(String(selectedId))}`):null;
+        const selectedAnalysis=analysisResponse?.ok?(await analysisResponse.json()).analysis:null;
+        if(active)setAnalysis(selectedAnalysis?.alternatives?.length?selectedAnalysis:null);
       } catch {
-        if (active) setConnected(false);
+        if (active) setConnected(portfolioLibraryLoaded);
       } finally { if (active) setLoading(false); }
     }
     void loadOverview();
     return () => { active = false; };
-  }, [apiFetch]);
+  }, [apiFetch,email]);
 
   useEffect(() => {
+    if(!portfolioId){setAnalysis(null);return;}
     let active = true;
-    apiFetch(`${API}/analyses/latest`).then(async response => {
+    apiFetch(`${API}/analyses/latest?portfolio_id=${encodeURIComponent(String(portfolioId))}`).then(async response => {
       if (!response.ok) return;
       const payload = await response.json();
-      if (active && payload.analysis?.alternatives?.length) setAnalysis(payload.analysis);
+      if (active) setAnalysis(payload.analysis?.alternatives?.length?payload.analysis:null);
     }).catch(() => undefined);
     return () => { active = false; };
-  }, [apiFetch]);
+  }, [apiFetch,portfolioId]);
 
   useEffect(() => () => {
     if (analysisRefreshTimer.current !== null) window.clearTimeout(analysisRefreshTimer.current);
@@ -316,6 +330,39 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     return refreshProvider ? data : { research: data, markets_found: 0, warnings: [] };
   }
 
+  function showPortfolio(portfolio:SavedPortfolio){
+    setPortfolioId(portfolio.id);setPortfolioName(portfolio.name);setHoldings(portfolio.holdings);
+    setSavedPortfolioSnapshot(portfolioSignature(portfolio.name,portfolio.holdings));
+    setPersistedTickers(portfolio.holdings.map(row=>row.ticker.trim().toUpperCase()));
+    setAnalysis(null);setNarrative("");
+    window.localStorage.setItem(`eagleeyes-active-portfolio-${email}`,String(portfolio.id));
+  }
+
+  async function selectPortfolio(nextId:string){
+    if(String(portfolioId)===nextId)return;
+    if(portfolioDirty&&!window.confirm("Switch portfolios and discard unsaved changes?"))return;
+    const selected=portfolios.find(item=>String(item.id)===nextId);if(!selected)return;
+    showPortfolio(selected);setNotice(`Opened ${selected.name} with ${selected.holdings.length} saved holdings.`);
+    try{
+      await apiFetch(`${API}/portfolios/${selected.id}/activate`,{method:"POST"});
+      const [diagnosticsResponse,analysisResponse]=await Promise.all([
+        apiFetch(`${API}/portfolio/diagnostics?portfolio_id=${encodeURIComponent(String(selected.id))}`),
+        apiFetch(`${API}/analyses/latest?portfolio_id=${encodeURIComponent(String(selected.id))}`),
+      ]);
+      if(diagnosticsResponse.ok)setPortfolioDiagnostics(await diagnosticsResponse.json());
+      if(analysisResponse.ok){const payload=await analysisResponse.json();setAnalysis(payload.analysis?.alternatives?.length?payload.analysis:null);}
+      void loadResearch(selected.holdings);
+    }catch{setNotice(`${selected.name} is open. Some linked analysis is still loading.`);}
+  }
+
+  function newPortfolio(){
+    if(portfolioDirty&&!window.confirm("Start a new portfolio and discard unsaved changes?"))return;
+    setPortfolioId(null);setPortfolioName(`Portfolio ${portfolios.length+1}`);setHoldings([]);setPersistedTickers([]);
+    setSavedPortfolioSnapshot(portfolioSignature(`Portfolio ${portfolios.length+1}`,[]));setAnalysis(null);setPortfolioDiagnostics(null);setNarrative("");
+    window.localStorage.removeItem(`eagleeyes-active-portfolio-${email}`);
+    setNotice("New portfolio started. Add holdings or import a file, then save it to your portfolio library.");
+  }
+
   async function savePortfolio() {
     setBusy("Saving portfolio"); setNotice("");
     try {
@@ -327,6 +374,8 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       if (!response.ok) throw new Error(await apiError(response, "Unable to save portfolio"));
       const saved = await response.json();
       setPortfolioId(saved.id); setHoldings(saved.holdings); setConnected(true);
+      setPortfolios(current=>[saved,...current.filter(item=>String(item.id)!==String(saved.id))]);
+      window.localStorage.setItem(`eagleeyes-active-portfolio-${email}`,String(saved.id));
       setSavedPortfolioSnapshot(portfolioSignature(saved.name, saved.holdings));
       setPersistedTickers(saved.holdings.map((row: Holding) => row.ticker.trim().toUpperCase()));
       try {
@@ -336,7 +385,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       } catch {
         setNotice("Portfolio saved, but company-market evidence could not be refreshed. Existing research remains available.");
       }
-      await executeAnalysis(saved.holdings, saved.name, profile, "portfolio_saved");
+      await executeAnalysis(saved.holdings, saved.name, profile, "portfolio_saved", saved.id);
     } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to save portfolio."); }
     finally { setBusy(""); }
   }
@@ -349,6 +398,8 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       const response = await apiFetch(`${API}/portfolios/import`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: file.name.replace(/\.(csv|tsv|txt)$/i, ""), csv_text: await file.text() }) });
       const data = await response.json(); if (!response.ok) throw new Error(formatApiDetail(data.detail) || "CSV validation failed");
       setPortfolioId(data.portfolio.id); setPortfolioName(data.portfolio.name); setHoldings(data.portfolio.holdings); setConnected(true);
+      setPortfolios(current=>[data.portfolio,...current.filter(item=>String(item.id)!==String(data.portfolio.id))]);
+      window.localStorage.setItem(`eagleeyes-active-portfolio-${email}`,String(data.portfolio.id));
       setSavedPortfolioSnapshot(portfolioSignature(data.portfolio.name, data.portfolio.holdings));
       setPersistedTickers(data.portfolio.holdings.map((row: Holding) => row.ticker.trim().toUpperCase()));
       const warningCopy=data.warnings?.length?` ${data.warnings.join(" ")}`:"";
@@ -363,7 +414,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
         } catch {
           setNotice(`${data.validated_rows} holdings imported and saved. Research refresh is temporarily unavailable; the portfolio itself is ready.${warningCopy}`);
         }
-        await executeAnalysis(data.portfolio.holdings, data.portfolio.name, profile, "portfolio_saved");
+        await executeAnalysis(data.portfolio.holdings, data.portfolio.name, profile, "portfolio_saved", data.portfolio.id);
       })();
     } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to import CSV."); }
     finally { setBusy(""); input.value = ""; }
@@ -409,6 +460,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     nextName: string = portfolioName,
     nextProfile: Profile = profile,
     reason: "manual" | "portfolio_saved" | "objectives_changed" = "manual",
+    nextPortfolioId: string | number | null = portfolioId,
   ) {
     setBusy("Running scenario analysis"); setNotice(""); setNarrative("");
     try {
@@ -416,7 +468,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       if (errors.length) throw new Error(`Portfolio needs attention: ${errors[0]}`);
       const analysisProfile={...nextProfile,research_preferences:investmentPolicy.research_preferences};
       await apiFetch(`${API}/profile`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(analysisProfile) });
-      const response = await apiFetch(`${API}/analyses`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ portfolio: { name: nextName, holdings: nextHoldings.map(cleanHolding) }, profile:analysisProfile }) });
+      const response = await apiFetch(`${API}/analyses`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ portfolio_id:nextPortfolioId, portfolio: { name: nextName, holdings: nextHoldings.map(cleanHolding) }, profile:analysisProfile }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.detail || "Analysis failed");
       setAnalysis(data); setResearch(data.research); setMacro(data.macro); setSelectedAlternative(1); setConnected(true); setNotice("Three alternatives are ready. Review the tradeoffs—not just the headline return.");
       if (data.cache_status === "hit") setNotice(`Three alternatives restored from the ${data.market_session || "latest"} market-session cache.`);
@@ -858,7 +910,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       drawer={customizing ? <div className="widget-drawer"><div><strong>Macro evidence</strong>{["rates","inflation","growth","labor","credit"].map(key => <label key={key}><input type="checkbox" checked={preferences.macro_widgets.includes(key)} onChange={() => toggleWidget("macro_widgets", key)} />{key}</label>)}</div><div><strong>Security evidence</strong>{["market","scores","fundamentals","news","prediction_markets"].map(key => <label key={key}><input type="checkbox" checked={preferences.research_widgets.includes(key)} onChange={() => toggleWidget("research_widgets", key)} />{key.replaceAll("_", " ")}</label>)}</div><label>Density<select value={preferences.density} onChange={event => void savePreferences({ ...preferences, density: event.target.value as Preferences["density"] })}><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select></label></div> : undefined}>
         {tab === "today" && <TodayPage loading={loading} refreshing={busy === "Refreshing market and macro data"} briefing={homeBriefing} macroFactors={macroFactors.filter(item => preferences.macro_widgets.includes(item.key))} dataStatus={dataStatus} onRefresh={refreshToday} onNavigate={navigate} onExplore={navigateExplore} onPortfolio={navigatePortfolio} onAdvanced={navigateAdvanced} request={apiRequest} />}
         {tab === "plan" && <PlanPage profile={profile} setProfile={setProfile} goals={goals} projections={goalProjections} policy={investmentPolicy} setPolicy={setInvestmentPolicy} guidance={planGuidance} onSavePolicy={()=>saveInvestmentPolicy(false)} onApprovePolicy={()=>saveInvestmentPolicy(true)} onSaveProfile={savePlanProfile} onSaveGoal={saveGoal} onDeleteGoal={deleteGoal} onProject={projectGoal} onOpenPortfolio={()=>navigatePortfolio("analysis")} />}
-        {tab === "portfolio" && <PortfolioPage view={portfolioView} setView={navigatePortfolio} request={apiRequest} holdings={holdings} setHoldings={setHoldings} name={portfolioName} setName={setPortfolioName} total={currentWeightTotal} dirty={portfolioDirty} errors={portfolioErrors} saving={busy === "Saving portfolio"} onSave={savePortfolio} onImport={importCsv} profile={profile} goals={goals} setProfile={setProfile} onObjectiveProfileChange={updateObjectiveProfile} analysis={analysis} monitoring={monitoring} guidance={planGuidance} diagnostics={portfolioDiagnostics} performance={terminalPerformance} presentationLevel={preferences.presentation_level} selected={selectedAlternative} setSelected={setSelectedAlternative} onRun={runOptimization} analysisBusy={busy === "Running scenario analysis"} narrative={narrative} onNarrative={generateNarrative} portfolioChatMessages={portfolioChatMessages} portfolioChatQuestion={portfolioChatQuestion} setPortfolioChatQuestion={setPortfolioChatQuestion} onAskPortfolio={askPortfolioChat} portfolioChatBusy={portfolioChatBusy} portfolioConversationControls={{conversations:portfolioConversations,currentId:portfolioConversationId,artifacts:portfolioChatArtifacts,onNew:()=>void newChatConversation("portfolio"),onOpen:id=>void openChatConversation("portfolio",id),onRename:id=>void renameChatConversation("portfolio",id),onDelete:id=>void deleteChatConversation("portfolio",id),onBuildBoard:()=>buildBoardFromConversation("portfolio")}} />}
+        {tab === "portfolio" && <PortfolioPage view={portfolioView} setView={navigatePortfolio} request={apiRequest} portfolioId={portfolioId} portfolios={portfolios} onSelectPortfolio={id=>void selectPortfolio(id)} onNewPortfolio={newPortfolio} holdings={holdings} setHoldings={setHoldings} name={portfolioName} setName={setPortfolioName} total={currentWeightTotal} dirty={portfolioDirty} errors={portfolioErrors} saving={busy === "Saving portfolio"} onSave={savePortfolio} onImport={importCsv} profile={profile} goals={goals} setProfile={setProfile} onObjectiveProfileChange={updateObjectiveProfile} analysis={analysis} monitoring={monitoring} guidance={planGuidance} diagnostics={portfolioDiagnostics} performance={terminalPerformance} presentationLevel={preferences.presentation_level} selected={selectedAlternative} setSelected={setSelectedAlternative} onRun={runOptimization} analysisBusy={busy === "Running scenario analysis"} narrative={narrative} onNarrative={generateNarrative} portfolioChatMessages={portfolioChatMessages} portfolioChatQuestion={portfolioChatQuestion} setPortfolioChatQuestion={setPortfolioChatQuestion} onAskPortfolio={askPortfolioChat} portfolioChatBusy={portfolioChatBusy} portfolioConversationControls={{conversations:portfolioConversations,currentId:portfolioConversationId,artifacts:portfolioChatArtifacts,onNew:()=>void newChatConversation("portfolio"),onOpen:id=>void openChatConversation("portfolio",id),onRename:id=>void renameChatConversation("portfolio",id),onDelete:id=>void deleteChatConversation("portfolio",id),onBuildBoard:()=>buildBoardFromConversation("portfolio")}} />}
         {tab === "decisions" && <DecisionsPage request={apiRequest} holdings={holdings} profile={profile} goals={goals} onOpenPortfolio={()=>navigatePortfolio("holdings")} />}
         {tab === "explore" && <ExplorePage view={exploreView} setView={navigateExplore} request={(path,init)=>apiFetch(`${API}${path}`,init)} onManageUniverse={()=>navigatePortfolio("holdings")} scenarios={scenarios} contracts={contracts} fetchedAt={scenarioFetchedAt} regimeHistory={regimeHistory} warnings={scenarioWarnings} onRefreshMarkets={refreshMarkets} rows={sortedResearch} holdings={holdings} profile={profile} presentationLevel={preferences.presentation_level} sortKey={sortKey} setSortKey={setSortKey} onRefreshResearch={refreshResearch} widgets={preferences.research_widgets} macro={macro} macroFactors={macroFactors} watchlist={profile.watchlist} researchChatMessages={researchChatMessages} researchChatQuestion={researchChatQuestion} setResearchChatQuestion={setResearchChatQuestion} onAskResearch={askResearchChat} researchChatBusy={researchChatBusy} researchConversationControls={{conversations:researchConversations,currentId:researchConversationId,artifacts:researchChatArtifacts,onNew:()=>void newChatConversation("research"),onOpen:id=>void openChatConversation("research",id),onRename:id=>void renameChatConversation("research",id),onDelete:id=>void deleteChatConversation("research",id),onBuildBoard:()=>buildBoardFromConversation("research")}} />}
         {tab === "learn" && <LearnPage request={apiRequest} moduleSlug={learningModule} lessonId={learningLesson} onOpenLesson={navigateLearn} onOpenHub={()=>navigateLearn()} onDeepLink={navigateDeepLink} />}

@@ -507,6 +507,25 @@ def list_portfolios(user_id: str | None = None) -> list[dict[str, Any]]:
     ]
 
 
+def activate_portfolio(portfolio_id: str | int, user_id: str | None = None) -> dict[str, Any]:
+    """Make a saved portfolio the user's current workspace without changing its holdings."""
+    now = utc_now()
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                "UPDATE public.portfolios SET updated_at=%s WHERE id=%s AND user_id IS NOT DISTINCT FROM %s RETURNING id",
+                (now, portfolio_id, user_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(portfolio_id)
+    else:
+        with sqlite_connection() as conn:
+            cursor = conn.execute("UPDATE portfolios SET updated_at=? WHERE id=?", (now, portfolio_id))
+            if cursor.rowcount == 0:
+                raise KeyError(portfolio_id)
+    return get_portfolio(portfolio_id, user_id)
+
+
 def save_profile(profile: dict[str, Any], user_id: str | None = None) -> dict[str, Any]:
     if DATABASE_URL:
         now = utc_now()
@@ -1291,21 +1310,26 @@ def load_analysis(run_id: str, user_id: str | None = None) -> dict[str, Any]:
     return json.loads(row["result_json"])
 
 
-def latest_analysis(user_id: str | None = None) -> dict[str, Any] | None:
+def latest_analysis(user_id: str | None = None, portfolio_id: str | int | None = None) -> dict[str, Any] | None:
     if DATABASE_URL:
         with postgres_connection() as conn:
             row = conn.execute(
                 """SELECT result_snapshot FROM public.analysis_runs
-                WHERE status = 'completed' AND user_id IS NOT DISTINCT FROM %s ORDER BY created_at DESC LIMIT 1""",
-                (user_id,),
+                WHERE status = 'completed' AND user_id IS NOT DISTINCT FROM %s
+                AND (%s::text IS NULL OR portfolio_id::text=%s::text) ORDER BY created_at DESC LIMIT 1""",
+                (user_id, portfolio_id, portfolio_id),
             ).fetchone()
         return None if row is None else row["result_snapshot"]
 
     with sqlite_connection() as conn:
-        row = conn.execute(
-            "SELECT result_json FROM analysis_runs ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-    return None if row is None else json.loads(row["result_json"])
+        rows = conn.execute(
+            "SELECT request_json, result_json FROM analysis_runs ORDER BY created_at DESC"
+        ).fetchall()
+    for row in rows:
+        request = json.loads(row["request_json"])
+        if portfolio_id is None or str(request.get("portfolio_id")) == str(portfolio_id):
+            return json.loads(row["result_json"])
+    return None
 
 
 def cached_analysis(cache_key: str, user_id: str | None = None) -> dict[str, Any] | None:

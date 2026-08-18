@@ -92,7 +92,7 @@ def test_balanced_rebalance_answer_uses_latest_saved_allocations(monkeypatch) ->
         "warnings": [],
         "model_diagnostics": {},
     }
-    monkeypatch.setattr("backend.main.database.latest_analysis", lambda user_id: analysis)
+    monkeypatch.setattr("backend.main.database.latest_analysis", lambda user_id, portfolio_id=None: analysis)
 
     tools, evidence = _portfolio_chat_tools(
         "user-1", "Why does the Balanced alternative rebalance these holdings?"
@@ -279,6 +279,23 @@ def test_csv_import_validation() -> None:
         response = client.post("/api/portfolios/import", json={"name": "Test", "csv_text": "ticker,weight,account_type\nSPY,0.6,taxable\nBND,0.4,traditional_ira\n"})
     assert response.status_code == 200
     assert response.json()["validated_rows"] == 2
+
+
+def test_users_can_keep_and_reopen_multiple_saved_portfolios() -> None:
+    with TestClient(app) as client:
+        first = client.post("/api/portfolios", json={
+            "name": "Long-term account", "holdings": [{"ticker": "SPY", "weight": 1, "account_type": "taxable"}],
+        }).json()
+        second = client.post("/api/portfolios", json={
+            "name": "Retirement account", "holdings": [{"ticker": "BND", "weight": 1, "account_type": "traditional_ira"}],
+        }).json()
+        saved = client.get("/api/portfolios").json()
+        reopened = client.post(f"/api/portfolios/{first['id']}/activate")
+        active = client.get("/api/portfolios").json()
+    assert {first["id"], second["id"]}.issubset({item["id"] for item in saved})
+    assert reopened.status_code == 200
+    assert reopened.json()["holdings"] == first["holdings"]
+    assert active[0]["id"] == first["id"]
 
 
 def test_csv_import_assigns_reviewable_placeholder_weight_without_size() -> None:

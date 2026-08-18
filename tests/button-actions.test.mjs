@@ -40,8 +40,8 @@ test("portfolio analysis persists, auto-runs after save, and refreshes from obje
   const dashboard = await readFile(dashboardPath, "utf8");
   const workspaces = await readFile(workspacesPath, "utf8");
   assert.match(dashboard, /\/analyses\/latest/);
-  assert.match(dashboard, /executeAnalysis\(saved\.holdings, saved\.name, profile, "portfolio_saved"\)/);
-  assert.match(dashboard, /executeAnalysis\(data\.portfolio\.holdings, data\.portfolio\.name, profile, "portfolio_saved"\)/);
+  assert.match(dashboard, /executeAnalysis\(saved\.holdings, saved\.name, profile, "portfolio_saved", saved\.id\)/);
+  assert.match(dashboard, /executeAnalysis\(data\.portfolio\.holdings, data\.portfolio\.name, profile, "portfolio_saved", data\.portfolio\.id\)/);
   assert.match(dashboard, /analysisRefreshTimer/);
   assert.match(dashboard, /"objectives_changed"/);
   assert.match(workspaces, /onObjectiveProfileChange/);

@@ -317,7 +317,7 @@ def overview(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     tickers = [holding["ticker"] for holding in holdings]
     research = security_research(tickers)
     return {
-        "portfolio": portfolio, "profile": profile, "macro": macro, "macro_factors": {"factors": []},
+        "portfolio": portfolio, "portfolios": portfolios, "profile": profile, "macro": macro, "macro_factors": {"factors": []},
         "scenarios": scenarios, "research": research, "storage": database.storage_mode(),
         # Detailed provider counts and factor panels are loaded by their own
         # Research/Advanced endpoints; they should not block every page.
@@ -595,6 +595,14 @@ def update_portfolio(portfolio_id: str, payload: PortfolioPayload, user: Authent
         raise HTTPException(404, "Portfolio not found") from exc
 
 
+@app.post("/api/portfolios/{portfolio_id}/activate")
+def activate_portfolio(portfolio_id: str, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        return database.activate_portfolio(portfolio_id, user.id)
+    except KeyError as exc:
+        raise HTTPException(404, "Portfolio not found") from exc
+
+
 @app.post("/api/portfolios/import")
 def import_portfolio(payload: CsvImport, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     try:
@@ -614,11 +622,13 @@ def import_portfolio(payload: CsvImport, user: AuthenticatedUser = Depends(requi
     }
 
 
-def _portfolio_intelligence_payload(user_id: str) -> dict[str, Any]:
+def _portfolio_intelligence_payload(user_id: str, portfolio_id: str | None = None) -> dict[str, Any]:
     portfolios = database.list_portfolios(user_id)
-    holdings = portfolios[0].get("holdings", []) if portfolios else []
+    portfolio = next((item for item in portfolios if str(item.get("id")) == str(portfolio_id)), None) if portfolio_id else None
+    portfolio = portfolio or (portfolios[0] if portfolios else {})
+    holdings = portfolio.get("holdings", [])
     tickers = [str(row.get("ticker") or "").upper() for row in holdings if str(row.get("ticker") or "").upper() != "CASH"]
-    latest = database.latest_analysis(user_id) or {}
+    latest = database.latest_analysis(user_id, portfolio.get("id")) or {}
     security_bundle = database.security_data(tickers, price_limit=1300)
     diagnostics = build_portfolio_diagnostics(holdings, security_bundle, database.fund_reference_data(tickers), latest.get("implementation_paths") or [])
     thesis_workspace = theses.workspace(user_id, holdings, [])
@@ -641,8 +651,11 @@ def _portfolio_intelligence_payload(user_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/portfolio/diagnostics")
-def portfolio_diagnostics(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    return _portfolio_intelligence_payload(user.id)
+def portfolio_diagnostics(
+    portfolio_id: str | None = Query(default=None),
+    user: AuthenticatedUser = Depends(require_user),
+) -> dict[str, Any]:
+    return _portfolio_intelligence_payload(user.id, portfolio_id)
 
 
 @app.get("/api/research/{ticker}/earnings")
@@ -1813,8 +1826,11 @@ def create_analysis(request: AnalysisRequest, user: AuthenticatedUser = Depends(
 
 
 @app.get("/api/analyses/latest")
-def get_latest_analysis(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    result = database.latest_analysis(user.id)
+def get_latest_analysis(
+    portfolio_id: str | None = Query(default=None),
+    user: AuthenticatedUser = Depends(require_user),
+) -> dict[str, Any]:
+    result = database.latest_analysis(user.id, portfolio_id)
     return {"analysis": result}
 
 
@@ -2313,12 +2329,13 @@ def _portfolio_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, A
     lowered = question.lower()
     tool_results: list[dict[str, Any]] = []
     tool_evidence: list[dict[str, Any]] = []
+    portfolios = database.list_portfolios(user_id)
+    active_portfolio = portfolios[0] if portfolios else None
     simulation_requested = any(term in lowered for term in (
         "simulate", "simulation", "what if", "stress test", "market falls", "market fell",
         "drawdown scenario", "recession scenario", "oil shock", "credit shock",
     ))
     if simulation_requested:
-        portfolios = database.list_portfolios(user_id)
         if not portfolios or not portfolios[0].get("holdings"):
             tool_results.append({
                 "tool_name": "portfolio_decision_lab", "status": "failed", "title": "Portfolio simulation",
@@ -2366,7 +2383,7 @@ def _portfolio_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, A
                     "error": str(exc),
                 })
     if any(term in lowered for term in ("rebalance", "alternative", "optimizer", "allocation", "concentration", "risk")):
-        analysis = database.latest_analysis(user_id)
+        analysis = database.latest_analysis(user_id, (active_portfolio or {}).get("id"))
         if analysis:
             alternatives = list(analysis.get("alternatives") or [])
             requested_name = next(
