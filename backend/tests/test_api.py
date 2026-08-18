@@ -159,6 +159,11 @@ def test_manual_terminal_portfolio_performance_uses_verified_calculation(monkeyp
     expected = {"status":"READY", "data":{"total_return":.12}, "verification":{"status":"passed"}}
     monkeypatch.setattr("backend.main.portfolio_performance_widget", lambda portfolio, years: {**expected, "years":years})
     with TestClient(app) as client:
+        created = client.post("/api/portfolios", json={
+            "name": "Test portfolio",
+            "holdings": [{"ticker": "SPY", "weight": 1, "account_type": "taxable"}],
+        })
+        assert created.status_code == 200
         response = client.get("/api/terminal/portfolio-performance?years=3")
     assert response.status_code == 200
     assert response.json()["data"]["total_return"] == .12
@@ -381,7 +386,13 @@ def test_research_refresh_updates_saved_universe(monkeypatch) -> None:
 
 def test_portfolio_update_and_research_include_new_holding() -> None:
     with TestClient(app) as client:
-        portfolio = client.get("/api/portfolios").json()[0]
+        portfolio = client.post(
+            "/api/portfolios",
+            json={
+                "name": "Initial portfolio",
+                "holdings": [{"ticker": "AAPL", "weight": 1, "account_type": "taxable"}],
+            },
+        ).json()
         saved = client.put(
             f"/api/portfolios/{portfolio['id']}",
             json={
@@ -396,6 +407,13 @@ def test_portfolio_update_and_research_include_new_holding() -> None:
     assert saved.status_code == 200
     assert {row["ticker"] for row in saved.json()["holdings"]} == {"AAPL", "NVDA"}
     assert {row["ticker"] for row in research.json()} == {"AAPL", "NVDA"}
+
+
+def test_new_workspace_starts_without_a_portfolio() -> None:
+    with TestClient(app) as client:
+        response = client.get("/api/portfolios")
+    assert response.status_code == 200
+    assert response.json() == []
 
 
 def test_chat_returns_grounded_reply(monkeypatch) -> None:

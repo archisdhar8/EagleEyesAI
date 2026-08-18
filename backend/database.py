@@ -2802,17 +2802,6 @@ def ensure_user_workspace(user_id: str, default_profile: dict[str, Any]) -> None
             conn.execute("UPDATE public.chat_conversations SET user_id=%s WHERE user_id IS NULL", (user_id,))
     if load_profile(user_id) is None:
         save_profile(default_profile, user_id)
-    if not list_portfolios(user_id):
-        save_portfolio(
-            "Starter portfolio",
-            [
-                {"ticker": "SPY", "weight": 0.45, "account_type": "taxable"},
-                {"ticker": "QQQ", "weight": 0.25, "account_type": "taxable"},
-                {"ticker": "BND", "weight": 0.20, "account_type": "taxable"},
-                {"ticker": "CASH", "weight": 0.10, "account_type": "taxable"},
-            ],
-            user_id=user_id,
-        )
     save_preferences(user_id, load_preferences(user_id))
 
 

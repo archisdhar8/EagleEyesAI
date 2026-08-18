@@ -79,17 +79,6 @@ async def lifespan(_: FastAPI):
     database.initialize()
     if not database.DATABASE_URL and database.load_profile() is None:
         database.save_profile(InvestorProfile().model_dump(mode="json"))
-    if not database.DATABASE_URL and not database.list_portfolios():
-        database.save_portfolio(
-            "Starter portfolio",
-            [
-                {"ticker": "AAPL", "weight": 0.28, "account_type": "taxable"},
-                {"ticker": "MU", "weight": 0.22, "account_type": "taxable"},
-                {"ticker": "CSCO", "weight": 0.18, "account_type": "taxable"},
-                {"ticker": "SPY", "weight": 0.22, "account_type": "taxable"},
-                {"ticker": "CASH", "weight": 0.10, "account_type": "taxable"},
-            ],
-        )
     yield
 
 

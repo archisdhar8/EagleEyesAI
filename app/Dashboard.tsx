@@ -42,17 +42,9 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   const [notice, setNotice] = useState("");
   const [portfolioId, setPortfolioId] = useState<string | number | null>(null);
   const [portfolioName, setPortfolioName] = useState("Primary portfolio");
-  const [holdings, setHoldings] = useState<Holding[]>([
-    { ticker: "AAPL", weight: .28, account_type: "taxable" }, { ticker: "MU", weight: .22, account_type: "taxable" },
-    { ticker: "CSCO", weight: .18, account_type: "taxable" }, { ticker: "SPY", weight: .22, account_type: "taxable" },
-    { ticker: "CASH", weight: .10, account_type: "taxable" },
-  ]);
-  const [savedPortfolioSnapshot, setSavedPortfolioSnapshot] = useState(() => portfolioSignature("Primary portfolio", [
-    { ticker: "AAPL", weight: .28, account_type: "taxable" }, { ticker: "MU", weight: .22, account_type: "taxable" },
-    { ticker: "CSCO", weight: .18, account_type: "taxable" }, { ticker: "SPY", weight: .22, account_type: "taxable" },
-    { ticker: "CASH", weight: .10, account_type: "taxable" },
-  ]));
-  const [persistedTickers, setPersistedTickers] = useState(["AAPL", "MU", "CSCO", "SPY", "CASH"]);
+  const [holdings, setHoldings] = useState<Holding[]>([]);
+  const [savedPortfolioSnapshot, setSavedPortfolioSnapshot] = useState(() => portfolioSignature("Primary portfolio", []));
+  const [persistedTickers, setPersistedTickers] = useState<string[]>([]);
 
   useEffect(() => {
     if (!notice) return;
@@ -201,6 +193,10 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
           setPortfolioId(data.portfolio.id); setPortfolioName(data.portfolio.name); setHoldings(data.portfolio.holdings);
           setSavedPortfolioSnapshot(portfolioSignature(data.portfolio.name, data.portfolio.holdings));
           setPersistedTickers(data.portfolio.holdings.map((row: Holding) => row.ticker.trim().toUpperCase()));
+        } else {
+          setPortfolioId(null); setPortfolioName("Primary portfolio"); setHoldings([]);
+          setSavedPortfolioSnapshot(portfolioSignature("Primary portfolio", []));
+          setPersistedTickers([]);
         }
         const loadedPreferences=data.preferences||{};
         const loadedTerminalWidgets = loadedPreferences.terminal_widgets?.length ? adaptTerminalWidgets(loadedPreferences.terminal_widgets) : defaultTerminalWidgets;

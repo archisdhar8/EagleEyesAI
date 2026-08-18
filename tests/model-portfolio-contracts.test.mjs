@@ -6,8 +6,14 @@ const read = path => readFileSync(new URL(`../${path}`, import.meta.url), "utf8"
 
 test("no-portfolio journey is reachable and keeps model holdings separate", () => {
   const routes = read("app/lib/routes.ts");
+  const dashboard = read("app/Dashboard.tsx");
+  const main = read("backend/main.py");
+  const database = read("backend/database.py");
   const research = read("app/components/shared/workspace-implementations.tsx");
   const builder = read("app/components/research/ModelPortfolioBuilder.tsx");
+  assert.match(dashboard, /useState<Holding\[\]>\(\[\]\)/);
+  assert.doesNotMatch(main, /"Starter portfolio"/);
+  assert.doesNotMatch(database, /"Starter portfolio"/);
   assert.match(routes, /portfolio-builder/);
   assert.match(research, /Start a portfolio/);
   assert.match(builder, /Ask EagleEyes for candidates/);
