@@ -10,6 +10,7 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -3570,6 +3571,28 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
         history = database.conversation_messages(user.id, conversation_id)
     previous_context = ask_orchestration.previous_analysis_context(history)
     plan = ask_orchestration.build_plan(payload.question, payload.workspace, page_context, previous_context)
+    if not plan.tickers and plan.intent in {"GENERAL", "COMPANY_RESEARCH", "CHANGE", "EARNINGS", "COMPARISON", "SCORE_ATTRIBUTION"}:
+        try:
+            mentions = database.resolve_security_mentions(payload.question, 5)
+        except Exception:
+            mentions = []
+        resolved = tuple(dict.fromkeys(row["ticker"] for row in mentions))
+        if len(resolved) == 1:
+            plan = ask_orchestration.build_plan(
+                f"{payload.question} {resolved[0]}", payload.workspace, page_context, previous_context,
+            )
+            plan = replace(plan, rationale=plan.rationale + " Resolved one validated company name.")
+        elif len(resolved) > 1:
+            names = ", ".join(f"{row['name']} ({row['ticker']})" for row in mentions)
+            raise HTTPException(422, f"The company reference is ambiguous: {names}. Name the ticker you mean.")
+    if plan.tickers:
+        try:
+            valid_tickers = database.validate_security_tickers(list(plan.tickers))
+        except Exception:
+            valid_tickers = set(plan.tickers)
+        invalid = [ticker for ticker in plan.tickers if ticker not in valid_tickers]
+        if invalid:
+            raise HTTPException(422, f"Unsupported or ambiguous ticker: {', '.join(invalid)}. Name a supported company or ticker.")
     if not ASK_ROUTER_V2_ENABLED and plan.intent in {
         "OPPORTUNITY_RANKING", "THESIS_REPLACEMENT", "PORTFOLIO_CHANGE", "VALUATION_RANKING",
         "HIDDEN_RISK", "MULTI_SCENARIO", "WATCHLIST_COMPARISON", "PORTFOLIO_EVENTS",

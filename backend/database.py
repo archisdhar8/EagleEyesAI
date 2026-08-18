@@ -1828,6 +1828,42 @@ def search_security_master(query: str, limit: int = 50) -> dict[str, Any]:
     }
 
 
+def resolve_security_mentions(text: str, limit: int = 5) -> list[dict[str, Any]]:
+    """Resolve company names contained in natural language without guessing symbols."""
+    if not DATABASE_URL or not text.strip():
+        return []
+    with postgres_connection() as conn:
+        rows = conn.execute(
+            """SELECT ticker,name FROM public.security_master
+               WHERE active=true AND length(name)>=4
+                 AND lower(%s) LIKE '%%' || lower(name) || '%%'
+               ORDER BY length(name) DESC,ticker LIMIT %s""",
+            (text, max(1, min(limit, 10))),
+        ).fetchall()
+        if not rows:
+            rows = conn.execute(
+                """SELECT ticker,coalesce(company_name,ticker) AS name FROM public.securities
+                   WHERE active=true AND length(coalesce(company_name,''))>=4
+                     AND lower(%s) LIKE '%%' || lower(company_name) || '%%'
+                   ORDER BY length(company_name) DESC,ticker LIMIT %s""",
+                (text, max(1, min(limit, 10))),
+            ).fetchall()
+    return [{"ticker": str(row["ticker"]).upper(), "name": row["name"]} for row in rows]
+
+
+def validate_security_tickers(tickers: list[str]) -> set[str]:
+    normalized = sorted(set(str(value).upper() for value in tickers if value))
+    if not DATABASE_URL or not normalized:
+        return set()
+    with postgres_connection() as conn:
+        rows = conn.execute(
+            """SELECT upper(ticker) ticker FROM public.security_master WHERE active=true AND upper(ticker)=ANY(%s)
+               UNION SELECT upper(ticker) FROM public.securities WHERE active=true AND upper(ticker)=ANY(%s)""",
+            (normalized, normalized),
+        ).fetchall()
+    return {str(row["ticker"]).upper() for row in rows}
+
+
 def sync_security_master(tickers: list[str] | None = None) -> int:
     """Promote provider-validated security records into the explicit support catalog."""
     if not DATABASE_URL:
