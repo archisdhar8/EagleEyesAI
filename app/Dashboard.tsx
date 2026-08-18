@@ -193,9 +193,23 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
         const rememberedId=window.localStorage.getItem(`eagleeyes-active-portfolio-${email}`);
         const librarySelection=libraryRows.find(item=>String(item.id)===rememberedId)||libraryRows[0];
         if(active&&libraryResponse.ok){portfolioLibraryLoaded=true;setConnected(true);setPortfolios(libraryRows);if(librarySelection)showPortfolio(librarySelection);}
-        const response = await apiFetch(`${API}/home/briefing`);
+        // Today is composed from the server's active portfolio. Restore that
+        // selection before requesting the briefing so a returning user never
+        // sees a false "no portfolio" state while their saved holdings exist.
+        if(librarySelection){
+          const activation=await apiFetch(`${API}/portfolios/${librarySelection.id}/activate`,{method:"POST"});
+          // Keep rendering the saved client-side selection if activation is
+          // temporarily unavailable; the briefing retry below can still
+          // recover without trapping the user on an empty loading screen.
+          if(!activation.ok&&active)setNotice("Your saved portfolio is loaded. Its latest evidence is still reconnecting.");
+        }
+        let response = await apiFetch(`${API}/home/briefing`);
         if (!response.ok) throw new Error("Local API unavailable");
-        const data = await response.json();
+        let data = await response.json();
+        if(librarySelection?.holdings.length&&!data.briefing?.portfolio_context?.available){
+          response=await apiFetch(`${API}/home/briefing`);
+          if(response.ok)data=await response.json();
+        }
         if (!active) return;
         setConnected(true);
         const savedPortfolios:SavedPortfolio[]=libraryRows.length?libraryRows:Array.isArray(data.portfolios)?data.portfolios:(data.portfolio?[data.portfolio]:[]);
@@ -218,6 +232,18 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
         const analysisResponse=selectedId?await apiFetch(`${API}/analyses/latest?portfolio_id=${encodeURIComponent(String(selectedId))}`):null;
         const selectedAnalysis=analysisResponse?.ok?(await analysisResponse.json()).analysis:null;
         if(active)setAnalysis(selectedAnalysis?.alternatives?.length?selectedAnalysis:null);
+        const autoRefreshKey=`eagleeyes-today-refresh-${email}-${new Date().toISOString().slice(0,10)}`;
+        if(active&&data.briefing?.evidence_state!=="current"&&!window.sessionStorage.getItem(autoRefreshKey)){
+          window.sessionStorage.setItem(autoRefreshKey,"started");
+          void apiFetch(`${API}/home/refresh`,{method:"POST"}).then(async refreshResponse=>{
+            if(!refreshResponse.ok||!active)return;
+            const refreshed=await refreshResponse.json();
+            if(!active)return;
+            setHomeBriefing(refreshed.briefing||data.briefing||null);setMacro(refreshed.macro||data.macro);
+            setMacroFactors(refreshed.macro_factors?.factors||data.macro_factors?.factors||[]);
+            setDataStatus(refreshed.data_status||data.data_status);setResearch(refreshed.research||data.research||[]);
+          }).catch(()=>undefined);
+        }
       } catch {
         if (active) setConnected(portfolioLibraryLoaded);
       } finally { if (active) setLoading(false); }
@@ -909,7 +935,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     <AppShell activeTab={tab} density={preferences.density} connected={connected} dark={dark} email={email} freshness={macro.as_of || "Awaiting refresh"} presentationLevel={preferences.presentation_level} onNavigate={navigate} onPresentationLevel={level=>void savePreferences({...preferences,presentation_level:level})} onToggleTheme={toggleTheme} onSignOut={onSignOut} onLearnConcept={navigateLearn} onDismissNotice={()=>setNotice("")} status={busy} notice={notice}
       topAction={tab==="learn"?<button className="widget-button" onClick={()=>navigateExplore("stocks")}>Open Research →</button>:tab==="decisions"?<button className="primary" onClick={()=>navigatePortfolio("holdings")}>Review portfolio <span>→</span></button>:<>{tab==="advanced"&&advancedView==="terminal"?<button className="widget-button" onClick={()=>setTerminalCatalogOpen(true)}>＋ Add widget</button>:<button className="widget-button" onClick={()=>setCustomizing(!customizing)}>View settings</button>}<button className="primary" onClick={() => navigatePortfolio("analysis")}>Run analysis <span>→</span></button></>}
       drawer={customizing ? <div className="widget-drawer"><div><strong>Macro evidence</strong>{["rates","inflation","growth","labor","credit"].map(key => <label key={key}><input type="checkbox" checked={preferences.macro_widgets.includes(key)} onChange={() => toggleWidget("macro_widgets", key)} />{key}</label>)}</div><div><strong>Security evidence</strong>{["market","scores","fundamentals","news","prediction_markets"].map(key => <label key={key}><input type="checkbox" checked={preferences.research_widgets.includes(key)} onChange={() => toggleWidget("research_widgets", key)} />{key.replaceAll("_", " ")}</label>)}</div><label>Density<select value={preferences.density} onChange={event => void savePreferences({ ...preferences, density: event.target.value as Preferences["density"] })}><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select></label></div> : undefined}>
-        {tab === "today" && <TodayPage loading={loading} refreshing={busy === "Refreshing market and macro data"} briefing={homeBriefing} macroFactors={macroFactors.filter(item => preferences.macro_widgets.includes(item.key))} dataStatus={dataStatus} onRefresh={refreshToday} onNavigate={navigate} onExplore={navigateExplore} onPortfolio={navigatePortfolio} onAdvanced={navigateAdvanced} request={apiRequest} />}
+        {tab === "today" && <TodayPage loading={loading} refreshing={busy === "Refreshing market and macro data"} briefing={homeBriefing} hasSavedPortfolio={holdings.length>0} macroFactors={macroFactors.filter(item => preferences.macro_widgets.includes(item.key))} dataStatus={dataStatus} onRefresh={refreshToday} onNavigate={navigate} onExplore={navigateExplore} onPortfolio={navigatePortfolio} onAdvanced={navigateAdvanced} request={apiRequest} />}
         {tab === "plan" && <PlanPage profile={profile} setProfile={setProfile} goals={goals} projections={goalProjections} policy={investmentPolicy} setPolicy={setInvestmentPolicy} guidance={planGuidance} onSavePolicy={()=>saveInvestmentPolicy(false)} onApprovePolicy={()=>saveInvestmentPolicy(true)} onSaveProfile={savePlanProfile} onSaveGoal={saveGoal} onDeleteGoal={deleteGoal} onProject={projectGoal} onOpenPortfolio={()=>navigatePortfolio("analysis")} />}
         {tab === "portfolio" && <PortfolioPage view={portfolioView} setView={navigatePortfolio} request={apiRequest} portfolioId={portfolioId} portfolios={portfolios} onSelectPortfolio={id=>void selectPortfolio(id)} onNewPortfolio={newPortfolio} holdings={holdings} setHoldings={setHoldings} name={portfolioName} setName={setPortfolioName} total={currentWeightTotal} dirty={portfolioDirty} errors={portfolioErrors} saving={busy === "Saving portfolio"} onSave={savePortfolio} onImport={importCsv} profile={profile} goals={goals} setProfile={setProfile} onObjectiveProfileChange={updateObjectiveProfile} analysis={analysis} monitoring={monitoring} guidance={planGuidance} diagnostics={portfolioDiagnostics} performance={terminalPerformance} presentationLevel={preferences.presentation_level} selected={selectedAlternative} setSelected={setSelectedAlternative} onRun={runOptimization} analysisBusy={busy === "Running scenario analysis"} narrative={narrative} onNarrative={generateNarrative} portfolioChatMessages={portfolioChatMessages} portfolioChatQuestion={portfolioChatQuestion} setPortfolioChatQuestion={setPortfolioChatQuestion} onAskPortfolio={askPortfolioChat} portfolioChatBusy={portfolioChatBusy} portfolioConversationControls={{conversations:portfolioConversations,currentId:portfolioConversationId,artifacts:portfolioChatArtifacts,onNew:()=>void newChatConversation("portfolio"),onOpen:id=>void openChatConversation("portfolio",id),onRename:id=>void renameChatConversation("portfolio",id),onDelete:id=>void deleteChatConversation("portfolio",id),onBuildBoard:()=>buildBoardFromConversation("portfolio")}} />}
         {tab === "decisions" && <DecisionsPage request={apiRequest} holdings={holdings} profile={profile} goals={goals} onOpenPortfolio={()=>navigatePortfolio("holdings")} />}

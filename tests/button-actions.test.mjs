@@ -81,7 +81,7 @@ test("market workspace keeps planning secondary and route compatibility explicit
   for (const legacy of ["/overview", "/scenarios", "/research", "/optimize", "/ai-workspace", "/research-terminal", "/decision-lab"]) {
     assert.match(routes, new RegExp(legacy.replaceAll("/", "\\/")));
   }
-  assert.match(today, /What requires my attention today\?/);
+  assert.match(today, /Your portfolio is up to date/);
   assert.match(source, /Hypothetical one-year return using current holdings and weights/);
   assert.match(source, /Customize the research around what the portfolio is for/);
   for (const path of ["Current / do nothing", "Contributions only", "Gradual transition", "Immediate transition"]) {
@@ -110,7 +110,7 @@ test("planning, guidance, and flexible portfolio import are visible and actionab
 test("default research presentation avoids false precision", async () => {
   const source = await dashboardSurface();
   const today = await readFile(todayPath, "utf8");
-  assert.match(today, /What requires my attention today\?/);
+  assert.match(today, /Preparing your daily brief/);
   assert.match(source, /Independent evidence dimensions/);
   assert.match(source, /not forced into one 100% distribution/);
   assert.match(source, /Stock research library/);

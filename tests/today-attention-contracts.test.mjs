@@ -6,11 +6,16 @@ const root = new URL("../", import.meta.url);
 const read = (path) => readFile(new URL(path, root), "utf8");
 
 test("Today is attention-first and keeps price movement contextual", async () => {
-  const [page, attention] = await Promise.all([
+  const [page, attention, dashboard] = await Promise.all([
     read("app/components/today/TodayPage.tsx"),
     read("backend/attention.py"),
+    read("app/Dashboard.tsx"),
   ]);
-  assert.match(page, /What requires my attention today\?/);
+  assert.match(page, /Your portfolio is up to date/);
+  assert.match(page, /Preparing your daily brief/);
+  assert.match(page, /restore it automatically on future sign-ins/);
+  assert.match(dashboard, /Your saved portfolio is loaded/);
+  assert.match(dashboard, /eagleeyes-today-refresh/);
   assert.match(page, /Nothing material changed/);
   assert.match(page, /Price is context/);
   assert.match(page, /Mark read/);

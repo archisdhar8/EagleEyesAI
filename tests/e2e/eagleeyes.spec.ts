@@ -7,7 +7,7 @@ async function signIn(page: Page) {
   await page.getByTestId("auth-password").fill("browser-test-password");
   await page.getByTestId("auth-submit").click();
   await expect(page.getByRole("heading", { name: "Today", exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "What requires my attention today?", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /Your portfolio is up to date|Welcome to your research workspace|Preparing your daily brief/ })).toBeVisible();
 }
 
 async function buildBoard(page: Page, prompt = "Show my portfolio return and risks") {
@@ -36,7 +36,7 @@ test("login survives refresh and sign-out clears the local test session", async 
   });
   await page.reload();
   await expect(page.getByRole("heading", { name: "Today", exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "What requires my attention today?", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /Your portfolio is up to date|Welcome to your research workspace|Preparing your daily brief/ })).toBeVisible();
   await expect.poll(() => state.authGrants).toContain("refresh_token");
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByTestId("auth-form")).toBeVisible();
@@ -51,6 +51,8 @@ test("portfolio import flows to Research and analysis", async ({ page }) => {
   });
   await expect(page.locator(".save-state")).toContainText("All changes saved");
   await page.goto("/research?view=stocks");
+  await page.getByLabel("Stock, ETF, or company").fill("AAPL");
+  await page.getByRole("button", { name: "Search research" }).click();
   await expect(page.getByText("Apple Inc.")).toBeVisible();
   await page.goto("/portfolio?view=analysis");
   await page.getByRole("button", { name: "Run portfolio analysis →" }).click();
@@ -171,9 +173,11 @@ test("partial widget failure preserves successful evidence and narration", async
 test("stale fallback and no-portfolio mode remain useful", async ({ page }) => {
   await installApiMock(page, { portfolio: false, stale: true });
   await signIn(page);
-  await expect(page.getByText("General research mode")).toBeVisible();
+  await expect(page.getByText("Start your workspace")).toBeVisible();
   await expect(page.getByText("Using last validated provider snapshot")).toBeVisible();
   await page.goto("/research?view=stocks");
+  await page.getByLabel("Stock, ETF, or company").fill("AAPL");
+  await page.getByRole("button", { name: "Search research" }).click();
   await expect(page.getByText("Browser fixture universe")).toBeVisible();
   await expect(page.getByText("Apple Inc.")).toBeVisible();
 });

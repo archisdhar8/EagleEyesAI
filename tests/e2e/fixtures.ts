@@ -105,6 +105,15 @@ function json(route: Route, value: unknown, status = 200) {
 
 export async function installApiMock(page: Page, options: { portfolio?: boolean; stale?: boolean; partial?: boolean } = {}) {
   const state = createState(options);
+  const homePayload = () => ({
+    portfolio: state.holdings.length ? { id: "portfolio-1", name: "Browser portfolio", holdings: state.holdings } : null,
+    preferences: { presentation_level: "detailed", density: "comfortable", macro_widgets: ["rates", "inflation", "growth", "labor", "credit"], research_widgets: ["market", "scores", "fundamentals", "news", "prediction_markets"], overview_widgets: [], focused_tickers: [], terminal_widgets: state.terminalWidgets },
+    profile, briefing: { ...briefing, evidence_state: options.stale ? "stale_fallback" : "current", warnings: options.stale ? ["Using last validated provider snapshot"] : [], portfolio_context: { ...briefing.portfolio_context, available: state.holdings.length > 0, holding_count: state.holdings.length } },
+    macro: { regime: "neutral", score: 50, as_of: now }, macro_factors: { factors: [] },
+    scenarios: { condition_dimensions: scenarios, scenarios, contracts: [], fetched_at: now, warnings: options.stale ? ["Provider stale fallback"] : [] },
+    research, data_status: { storage: "fixture", counts: {}, freshness: {}, providers: [] },
+    regime_history: { latest: null, sample_counts: {}, total_samples: 0 }, model_monitoring: null, latest_analysis: null,
+  });
   await page.route("**/auth/v1/token**", route => {
     state.authGrants.push(new URL(route.request().url()).searchParams.get("grant_type") || "unknown");
     return json(route, {
@@ -143,15 +152,10 @@ export async function installApiMock(page: Page, options: { portfolio?: boolean;
     if (path === "/learn/progress" && method === "GET") return json(route, state.learningProgress);
     if (path === "/learn/quizzes/why-invest-v1/attempts" && method === "POST") { state.learningProgress = [{ id: "progress-1", module_id: "start-safely", lesson_id: "why-invest", content_version: "2026.08.1", status: "mastered", completion_percentage: 1, best_score: 1, updated_at: now }]; return json(route, { score: 2, total_questions: 2, percentage: 1, mastery_eligible: true, feedback: [{ correct: true, correct_index: 0, explanation: "Emergency money needs stability." }, { correct: true, correct_index: 1, explanation: "Earlier growth can earn later growth." }], progress: state.learningProgress[0] }, 201); }
 
-    if (path === "/home/briefing") return json(route, {
-      portfolio: state.holdings.length ? { id: "portfolio-1", name: "Browser portfolio", holdings: state.holdings } : null,
-      preferences: { presentation_level: "detailed", density: "comfortable", macro_widgets: ["rates", "inflation", "growth", "labor", "credit"], research_widgets: ["market", "scores", "fundamentals", "news", "prediction_markets"], overview_widgets: [], focused_tickers: [], terminal_widgets: state.terminalWidgets },
-      profile, briefing: { ...briefing, evidence_state: options.stale ? "stale_fallback" : "current", warnings: options.stale ? ["Using last validated provider snapshot"] : [], portfolio_context: { ...briefing.portfolio_context, available: state.holdings.length > 0, holding_count: state.holdings.length } },
-      macro: { regime: "neutral", score: 50, as_of: now }, macro_factors: { factors: [] },
-      scenarios: { condition_dimensions: scenarios, scenarios, contracts: [], fetched_at: now, warnings: options.stale ? ["Provider stale fallback"] : [] },
-      research, data_status: { storage: "fixture", counts: {}, freshness: {}, providers: [] },
-      regime_history: { latest: null, sample_counts: {}, total_samples: 0 }, model_monitoring: null, latest_analysis: null,
-    });
+    if (path === "/portfolios" && method === "GET") return json(route, state.holdings.length ? [{ id: "portfolio-1", name: "Browser portfolio", holdings: state.holdings, updated_at: now }] : []);
+    if (/^\/portfolios\/[^/]+\/activate$/.test(path) && method === "POST") return json(route, { id: path.split("/")[2], name: "Browser portfolio", holdings: state.holdings, updated_at: now });
+    if (path === "/home/briefing") return json(route, homePayload());
+    if (path === "/home/refresh" && method === "POST") return json(route, homePayload());
     if (path === "/decisions/workspace") return json(route, { active_theses: state.theses, recent_decisions: [], needs_thesis: [], review_dates: [], contexts: {} });
     if (path === "/decision-journal") return json(route, { version: "decision-journal-v1", recent_decisions: [], ready_for_review: [], completed_retrospectives: [], patterns: { reviewed_decisions: 0, minimum_sample: 5, status: "INSUFFICIENT_SAMPLE", patterns: [] }, forecast_calibration: { sample_size: 0, brier_score: null, status: "INSUFFICIENT_SAMPLE", message: "No resolved forecasts.", buckets: [], methodology: "No calibration result without resolved forecasts." } });
     if (path === "/personalization" && method === "GET") return json(route, { version: "decision-preferences-v1", explicit: {}, accepted: {}, inferred: [], dismissed: [], minimum_reviewed_decisions: 5, reviewed_decisions: 0 });
@@ -190,6 +194,9 @@ export async function installApiMock(page: Page, options: { portfolio?: boolean;
     if (/\/dashboard\/views\/[^/]+$/.test(path) && method === "GET") { const view = state.views.find(item => item.id === path.split("/").at(-1)); return view ? json(route, view) : json(route, { detail: "Not found" }, 404); }
     if (path === "/research/refresh" && method === "POST") return json(route, { research, searched: research.length, markets_found: 0, warnings: [] });
     if (path === "/research" || path.startsWith("/research?")) return json(route, research);
+    if (/^\/evidence\/securities\/[^/]+\/changes$/.test(path)) return json(route, { baseline: { as_of: now, source: "fixture", fallback_reason: null }, current_as_of: now, changes: [], coverage: [] });
+    if (/^\/forecasting\/securities\/[^/]+\/markets$/.test(path)) return json(route, { markets: [] });
+    if (/^\/research\/[^/]+\/earnings$/.test(path)) return json(route, { status: "UNAVAILABLE", actual_vs_expectations: {}, changes: [], guidance_changes: [], estimate_revisions: [], warnings: ["No fixture earnings period"] });
     if (path === "/research/search") return json(route, { query: url.searchParams.get("q") || "", filters: {}, universe: { definition: "Browser fixture universe", source: "fixture", total: research.length, holdings: state.holdings.length, watchlist: 2, explicitly_requested: 0, sector_or_broad_etfs: 1, tickers: research.map(row => row.ticker) }, results: research.map((row, index) => ({ ...row, relative_rank: index + 1, evidence_bucket: index ? "Constructive evidence" : "Leading evidence", bucket_explanation: "Deterministic fixture bucket", strengths: [{ label: "Fundamentals", evidence: row.fundamental_score }], weaknesses: [{ label: "Valuation", evidence: row.valuation_score }], valuation_range: { label: "Reasonable", basis: "Fixture valuation" }, fundamental_trend: { label: "Stable", revenue_growth: row.revenue_growth, net_margin: row.net_margin }, price_behavior: { label: "Positive", one_year_change: row.price_change_1y }, catalysts: [], thesis_risks: row.risk_flags, portfolio_fit: "Review concentration", what_would_change_the_view: "Material earnings deterioration", freshness: { status: "current", price_as_of: now, fundamentals_as_of: now, coverage: "high", confidence_reasons: ["fixture"] }, disclaimer: "Research only" })), method: { name: "fixture", version: "v1", ranking_use: "ordering" }, disclaimer: "Not a recommendation" });
     if (path === "/builders/etf/optimize" && method === "POST") return json(route, {
       id: "etf-builder-1", builder_type: "etf", model_version: "etf-allocation-builder-v1.0.0", objective: body.objective,
