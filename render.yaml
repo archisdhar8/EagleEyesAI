@@ -19,6 +19,14 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      - key: CHAT_ANALYSIS_CONCURRENCY
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
       - key: POLYGON_API_KEY
         sync: false
       - key: TIINGO_API_KEY

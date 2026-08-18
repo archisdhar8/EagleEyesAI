@@ -39,7 +39,9 @@ def retrieve_evidence(user_id: str, question: str) -> list[dict[str, Any]]:
         [item["ticker"] for item in portfolio.get("holdings", [])]
         + profile.get("watchlist", [])
     ))
-    research = security_research(_ticker_candidates(question, universe))
+    # Chat only needs a recent trading year for its compact evidence summary.
+    # The broader research/analysis workspaces retain their longer histories.
+    research = security_research(_ticker_candidates(question, universe), price_limit=260)
     factors = macro_factor_dashboard()
     scenarios = database.latest_scenario_snapshot() or {"scenarios": [], "fetched_at": None}
     analysis = database.latest_analysis(user_id)

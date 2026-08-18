@@ -1,4 +1,4 @@
-from backend.chat import ask_gemini
+from backend.chat import ask_gemini, retrieve_evidence
 
 
 class _Response:
@@ -58,3 +58,24 @@ def test_chat_cleans_partial_answer_without_a_second_request(monkeypatch) -> Non
     assert answer.startswith("A completed evidence-backed sentence.")
     assert "unfinished fragment" not in answer
     assert "response was shortened" in answer.lower()
+
+
+def test_generic_chat_evidence_uses_bounded_price_history(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr("backend.chat.database.list_portfolios", lambda user_id: [{
+        "name": "Large", "updated_at": "2026-08-18", "holdings": [
+            {"ticker": f"S{index}"} for index in range(61)
+        ],
+    }])
+    monkeypatch.setattr("backend.chat.database.load_profile", lambda user_id: {})
+    monkeypatch.setattr("backend.chat.database.latest_scenario_snapshot", lambda: None)
+    monkeypatch.setattr("backend.chat.database.latest_analysis", lambda user_id: None)
+    monkeypatch.setattr("backend.chat.security_research", lambda tickers, price_limit=756: calls.append(
+        (list(tickers), price_limit)
+    ) or [])
+    monkeypatch.setattr("backend.chat.macro_factor_dashboard", lambda: {"factors": []})
+    monkeypatch.setattr("backend.chat.latest_macro", lambda: {"as_of": "2026-08-18"})
+
+    retrieve_evidence("bounded-history-user", "Explain my portfolio")
+
+    assert calls == [([f"S{index}" for index in range(12)], 260)]

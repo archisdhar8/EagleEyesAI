@@ -1,9 +1,12 @@
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.main import (
     _benchmark_outlook_chat_tools, _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
-    _cors_allowed_origins, _portfolio_chat_tools, _portfolio_risk_chat_tools, _security_ranking_chat_tools, app,
+    _cors_allowed_origins, _execute_chat_plan_tools, _portfolio_chat_tools, _portfolio_risk_chat_tools,
+    _security_ranking_chat_tools, app,
 )
 
 
@@ -581,12 +584,36 @@ def test_chat_returns_tool_fallback_instead_of_502_when_gemini_times_out(monkeyp
     assert "did not respond within the interactive deadline" in response.json()["message"]["content"]
 
 
+def test_chat_analysis_tools_execute_sequentially_without_background_futures(monkeypatch) -> None:
+    order = []
+
+    def fake_tool(tool, user_id, question):
+        order.extend([f"start:{tool}", f"finish:{tool}"])
+        return ([{"tool_name": tool, "status": "complete", "title": tool}], [
+            {"label": tool, "as_of": "2026-08-18", "data": {}}
+        ])
+
+    monkeypatch.setattr("backend.main._instrumented_ask_tool", fake_tool)
+    results, evidence, steps = _execute_chat_plan_tools(
+        ("first", "second"), "user-1", "question", time.monotonic(),
+    )
+
+    assert order == ["start:first", "finish:first", "start:second", "finish:second"]
+    assert [item["tool_name"] for item in results] == ["first", "second"]
+    assert [item["label"] for item in evidence] == ["first", "second"]
+    assert steps == [
+        {"tool_name": "first", "state": "SUCCESS"},
+        {"tool_name": "second", "state": "SUCCESS"},
+    ]
+
+
 def test_portfolio_chat_runs_simulation_as_visible_tool(monkeypatch) -> None:
     monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{"id": "portfolio-1", "holdings": [{"ticker": "SPY", "weight": 1.0}]}])
     monkeypatch.setattr("backend.main.database.load_profile", lambda user_id: {"horizon_years": 10})
     monkeypatch.setattr("backend.main.database.list_goals", lambda user_id: [])
     monkeypatch.setattr("backend.main.database.save_simulation_run", lambda user_id, result: result["id"])
-    monkeypatch.setattr("backend.main.run_simulation", lambda payload: {
+    simulation_calls = []
+    monkeypatch.setattr("backend.main.run_simulation", lambda payload, **kwargs: simulation_calls.append(kwargs) or {
         "id": "simulation-1", "created_at": "2026-08-15T12:00:00Z", "model_version": "simulation-v-test",
         "warnings": [], "assumptions": ["Shared paths"], "lineage": [{"provider": "fixture"}],
         "outcomes": [{
@@ -604,6 +631,7 @@ def test_portfolio_chat_runs_simulation_as_visible_tool(monkeypatch) -> None:
     }
     assert tools[0]["summary"]["strategies"][0]["median_wealth"] == 125000.0
     assert evidence[0]["label"] == "Portfolio Decision Lab tool result"
+    assert simulation_calls == [{"price_limit_per_ticker": 1260}]
 
 
 def test_scenario_fast_answer_compares_paths_without_claiming_a_twenty_year_recession() -> None:

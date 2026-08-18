@@ -265,12 +265,19 @@ def _robust_weights(sampled: np.ndarray, current: np.ndarray, mode: str) -> tupl
     return result.x, []
 
 
-def run_simulation(payload: SimulationRunInput, price_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def run_simulation(
+    payload: SimulationRunInput,
+    price_rows: list[dict[str, Any]] | None = None,
+    *,
+    price_limit_per_ticker: int = 10000,
+) -> dict[str, Any]:
     strategies = payload.strategies or default_strategies(payload)
     current_map, initial_value = _current_weights(payload)
     tickers = sorted(set(current_map) | {ticker for strategy in strategies for ticker in strategy.weights})
     query_tickers = sorted(set(tickers) | {"VTI"})
-    rows = price_rows if price_rows is not None else database.price_history(query_tickers, 10000)
+    rows = price_rows if price_rows is not None else database.price_history(
+        query_tickers, max(504, min(price_limit_per_ticker, 10000))
+    )
     monthly, providers, warnings = _monthly_matrix(query_tickers, rows)
     if len(monthly) < 24:
         raise ValueError("At least 24 common monthly adjusted-price observations are required for simulation")

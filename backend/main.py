@@ -6,9 +6,10 @@ import math
 import os
 import random
 import re
+import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
@@ -2144,7 +2145,14 @@ _CHAT_SECURITY_STOPWORDS = {
 }
 
 _CHAT_RESEARCH_CACHE = TTLCache(max_entries=128)
-_CHAT_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=10, thread_name_prefix="chat-tool")
+# Render's free instance has a 512 MB memory ceiling. Chat tools can build
+# pandas/numpy research matrices, so running several of them concurrently (and
+# leaving timed-out futures alive) can exhaust the process even after the HTTP
+# request has already returned. One bounded analysis slot keeps peak memory
+# predictable; narration and ordinary API traffic remain concurrent.
+_CHAT_ANALYSIS_SLOTS = threading.BoundedSemaphore(
+    max(1, min(2, int(os.getenv("CHAT_ANALYSIS_CONCURRENCY", "1"))))
+)
 
 
 def _resolve_chat_tickers(question: str) -> list[str]:
@@ -2374,10 +2382,10 @@ def _portfolio_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, A
                     # Keep interactive portfolio chat within the free Render
                     # instance's memory envelope; the full Decision Lab still
                     # supports larger user-requested runs.
-                    "paths": 500,
+                    "paths": 300 if len(portfolio["holdings"]) > 40 else 500,
                     "seed": 90210,
                 })
-                result = run_simulation(simulation_input)
+                result = run_simulation(simulation_input, price_limit_per_ticker=1260)
                 if re.search(r"\b\d{1,2}\s*%", question):
                     result.setdefault("warnings", []).append(
                         "The engine conditions on historical states; it does not impose the question's exact percentage as an instantaneous market shock."
@@ -3162,6 +3170,75 @@ def _instrumented_ask_tool(tool: str, user_id: str, question: str) -> tuple[list
         record_metric("ask.tool.latency_ms",(time.monotonic()-started)*1000,tags={"tool":tool})
 
 
+def _execute_chat_plan_tools(
+    tools: tuple[str, ...], user_id: str, question: str, started: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Execute a chat plan without orphaned background analysis threads.
+
+    Python cannot cancel a running thread. The previous executor-based timeout
+    returned a fallback while expensive pandas/numpy work continued in the
+    background, allowing retries to stack until Render killed the process. This
+    bounded sequential path favors a slightly longer first answer over a crash
+    that interrupts every user.
+    """
+    tool_results: list[dict[str, Any]] = []
+    evidence_rows: list[dict[str, Any]] = []
+    execution_steps: list[dict[str, Any]] = []
+    wait_budget = max(0.1, ask_orchestration.OVERALL_BUDGET_SECONDS - (time.monotonic() - started))
+    acquired = _CHAT_ANALYSIS_SLOTS.acquire(timeout=wait_budget)
+    if not acquired:
+        for tool in tools:
+            tool_results.append({
+                "tool_name": tool, "status": "failed", "execution_state": "FAILED",
+                "title": tool.replace("_", " ").title(),
+                "error": "Another portfolio analysis is still running. Retry when it finishes.",
+            })
+            execution_steps.append({"tool_name": tool, "state": "FAILED"})
+        record_metric("ask.analysis.busy")
+        return tool_results, evidence_rows, execution_steps
+
+    try:
+        for tool in tools:
+            if time.monotonic() - started >= ask_orchestration.OVERALL_BUDGET_SECONDS:
+                tool_results.append({
+                    "tool_name": tool, "status": "failed", "execution_state": "FAILED",
+                    "title": tool.replace("_", " ").title(),
+                    "error": "The interactive analysis budget was reached before this step began.",
+                })
+                execution_steps.append({"tool_name": tool, "state": "FAILED"})
+                continue
+            try:
+                results, grounded = _instrumented_ask_tool(tool, user_id, question)
+                if not results:
+                    results = [{
+                        "tool_name": tool, "status": "unavailable",
+                        "title": tool.replace("_", " ").title(),
+                        "summary": {"message": "No matching stored evidence was available."},
+                    }]
+                for result in results:
+                    result["execution_state"] = ask_orchestration.execution_state(
+                        str(result.get("status", "partial"))
+                    )
+                    tool_results.append(result)
+                evidence_rows.extend(grounded)
+                state = (
+                    "PARTIAL"
+                    if any(item["execution_state"] == "PARTIAL" for item in results)
+                    else results[0]["execution_state"]
+                )
+            except Exception as exc:
+                state = "FAILED"
+                tool_results.append({
+                    "tool_name": tool, "status": "failed", "execution_state": state,
+                    "title": tool.replace("_", " ").title(),
+                    "error": f"The approved analysis failed; no result was invented ({type(exc).__name__}).",
+                })
+            execution_steps.append({"tool_name": tool, "state": state})
+    finally:
+        _CHAT_ANALYSIS_SLOTS.release()
+    return tool_results, evidence_rows, execution_steps
+
+
 def _conversation_summary(messages: list[dict[str, Any]], previous: str = "") -> str:
     """Create compact deterministic memory without asking the LLM to invent context."""
     user_topics = [
@@ -3234,32 +3311,9 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
                                {"page_context": page_context, "planned_intent": plan.intent})
     started = time.monotonic()
     tool_started = started
-    futures = {
-        tool: _CHAT_TOOL_EXECUTOR.submit(_instrumented_ask_tool, tool, user.id, routed_question)
-        for tool in plan.tools
-    }
-    tool_results: list[dict[str, Any]] = []
-    evidence_rows: list[dict[str, Any]] = []
-    execution_steps: list[dict[str, Any]] = []
-    for tool, future in futures.items():
-        remaining = max(0.1, ask_orchestration.OVERALL_BUDGET_SECONDS - (time.monotonic() - started))
-        try:
-            results, grounded = future.result(timeout=remaining)
-            if not results:
-                results = [{"tool_name": tool, "status": "unavailable", "title": tool.replace("_", " ").title(),
-                            "summary": {"message": "No matching stored evidence was available."}}]
-            for result in results:
-                result["execution_state"] = ask_orchestration.execution_state(str(result.get("status", "partial")))
-                tool_results.append(result)
-            evidence_rows.extend(grounded)
-            state = "PARTIAL" if any(item["execution_state"] == "PARTIAL" for item in results) else results[0]["execution_state"]
-        except (FuturesTimeoutError, Exception) as exc:
-            future.cancel()
-            state = "FAILED"
-            tool_results.append({"tool_name": tool, "status": "failed", "execution_state": state,
-                                 "title": tool.replace("_", " ").title(),
-                                 "error": f"The approved tool did not complete; no result was invented ({type(exc).__name__})."})
-        execution_steps.append({"tool_name": tool, "state": state})
+    tool_results, evidence_rows, execution_steps = _execute_chat_plan_tools(
+        plan.tools, user.id, routed_question, started,
+    )
     tools_elapsed = time.monotonic() - tool_started
     # Keep the grounded prompt bounded even when several securities each have
     # multiple articles. On-demand company evidence is ordered first so the
