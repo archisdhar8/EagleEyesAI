@@ -355,7 +355,7 @@ def test_manual_terminal_layout_crud() -> None:
 
 def test_market_workspace_aliases_return_existing_evidence(monkeypatch) -> None:
     monkeypatch.setattr("backend.main.refresh_scenarios", lambda force=False: {"scenarios": [], "contracts": [], "warnings": [], "fetched_at": None})
-    monkeypatch.setattr("backend.main.security_research", lambda tickers: [{"ticker": ticker} for ticker in tickers])
+    monkeypatch.setattr("backend.main.security_research", lambda tickers, **kwargs: [{"ticker": ticker} for ticker in tickers])
     with TestClient(app) as client:
         home = client.get("/api/home/briefing")
         securities = client.get("/api/explore/securities?tickers=AAPL,MSFT")
@@ -734,6 +734,29 @@ def test_slow_narrator_fallback_preserves_company_tool_evidence() -> None:
     assert "MU" in answer and "$142.50" in answer and "18.0%" in answer
     assert "did not respond within the interactive deadline" in answer
     assert "invent" in answer
+
+
+def test_earnings_fallback_formats_period_values_and_thesis_status() -> None:
+    answer = _deterministic_chat_answer("EARNINGS", [{
+        "tool_name": "earnings_intelligence", "status": "complete", "ticker": "MSFT",
+        "summary": {
+            "period": {"fiscal_period": "FY", "fiscal_year": 2026, "period_end": "2026-06-30"},
+            "actual_vs_expectations": {
+                "revenue": {"actual": 331_839_000_000, "consensus": None, "surprise_percent": None},
+                "eps": {"actual": 17.95, "consensus": None, "surprise_percent": None},
+            },
+            "thesis_impact": {"overall_status": "WEAKENING", "assumptions": [{
+                "description": "Cloud growth remains durable", "state": "WEAKENS",
+            }]},
+            "warnings": ["Consensus not available; it is not interpreted as unchanged."],
+        },
+    }])
+    assert answer is not None
+    assert "FY 2026, ended June 30, 2026" in answer
+    assert "$331.8B" in answer
+    assert "$17.95 per share" in answer
+    assert "Cloud growth remains durable: weakens" in answer
+    assert "{'fiscal_period'" not in answer
 
 
 def test_company_chat_refreshes_approved_research_and_returns_article_lineage(monkeypatch) -> None:

@@ -32,7 +32,7 @@ def test_followup_continuity_preserves_comparison_entities():
 
 def test_specialized_intents_do_not_receive_unrelated_tools():
     earnings = build_plan("What changed in AAPL earnings?", "research")
-    assert earnings.tools == ("earnings_intelligence", "thesis_monitor")
+    assert earnings.tools == ("earnings_intelligence",)
     assert "today_attention" not in earnings.tools
     assert "decision_journal" not in earnings.tools
 

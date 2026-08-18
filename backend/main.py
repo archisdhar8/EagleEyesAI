@@ -2908,6 +2908,35 @@ def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]]) 
             for result in results:
                 summary = result.get("summary") or {}
                 ticker = result.get("ticker") or "Company"
+                period = summary.get("period") or {}
+                if isinstance(period, dict):
+                    fiscal_period = str(period.get("fiscal_period") or "").upper()
+                    fiscal_year = period.get("fiscal_year")
+                    period_end = period.get("period_end")
+                    period_parts = [part for part in (fiscal_period, str(fiscal_year) if fiscal_year else None) if part]
+                    period_label = " ".join(period_parts) or "latest stored period"
+                    if period_end:
+                        try:
+                            period_label += f", ended {datetime.fromisoformat(str(period_end)).strftime('%B %-d, %Y')}"
+                        except ValueError:
+                            period_label += f", ended {period_end}"
+                else:
+                    period_label = str(period)
+
+                def metric_value(metric: str, value: Any) -> str:
+                    if value is None:
+                        return "unavailable"
+                    number = float(value)
+                    if metric.lower() == "revenue":
+                        if abs(number) >= 1_000_000_000:
+                            return f"${number / 1_000_000_000:,.1f}B"
+                        if abs(number) >= 1_000_000:
+                            return f"${number / 1_000_000:,.1f}M"
+                        return f"${number:,.0f}"
+                    if metric.lower() in {"eps", "eps diluted", "diluted eps"}:
+                        return f"${number:,.2f} per share"
+                    return f"{number:,.2f}"
+
                 comparisons = summary.get("actual_vs_expectations") or {}
                 comparison_lines = []
                 for metric, values in list(comparisons.items())[:6]:
@@ -2915,21 +2944,33 @@ def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]]) 
                         continue
                     surprise = values.get("surprise_percent")
                     comparison_lines.append(
-                        f"- **{str(metric).replace('_', ' ').title()}**: actual {values.get('actual') if values.get('actual') is not None else 'unavailable'}; "
-                        f"consensus {values.get('consensus') if values.get('consensus') is not None else 'unavailable'}"
+                        f"- **{str(metric).replace('_', ' ').title()}**: {metric_value(str(metric), values.get('actual'))}; "
+                        f"consensus {metric_value(str(metric), values.get('consensus'))}"
                         + (f"; surprise **{float(surprise):+.1%}**" if surprise is not None else "; no validated surprise")
                     )
                 impact = summary.get("thesis_impact") or {}
+                assumptions = list(impact.get("assumptions") or [])
+                impact_status = str(impact.get("overall_status") or "not evaluated").replace("_", " ").lower()
+                impact_text = (
+                    f"The saved thesis monitor is **{impact_status}**. "
+                    + " ".join(
+                        f"{item.get('description')}: {str(item.get('state') or 'not evaluated').replace('_', ' ').lower()}."
+                        for item in assumptions[:4] if item.get("description")
+                    )
+                ) if impact.get("overall_status") or assumptions else (
+                    f"No saved {ticker} thesis assumption was linked to this earnings record, so EagleEyes cannot claim that the thesis strengthened or weakened."
+                )
+                warnings = list(summary.get("warnings") or [])
                 sections.append(
-                    f"### {ticker} earnings\nPeriod: **{summary.get('period') or 'latest stored period'}**; reported {summary.get('reported_at') or 'date unavailable'} [S1].\n"
+                    f"### What changed in {ticker} earnings\nThe latest stored report covers **{period_label}** [S1].\n\n"
                     + ("\n".join(comparison_lines) if comparison_lines else "- Provider-supplied consensus comparisons are unavailable; no beat or miss was inferred.")
-                    + f"\n- Thesis impact: **{impact.get('overall_status') or 'not evaluated'}**."
-                    + (f"\n- Warnings: {'; '.join(summary.get('warnings') or [])}" if summary.get("warnings") else "")
+                    + f"\n\n### Does it affect the thesis?\n{impact_text}"
+                    + (f"\n\n### What is still missing\n{' '.join(warnings)}" if warnings else "")
                 )
             return (
                 "\n\n".join(sections)
-                + "\n\nEarnings facts, management guidance, consensus comparisons, and thesis interpretation are kept separate. Missing consensus is not treated as an in-line result, and an earnings beat alone does not determine portfolio fit.\n\n"
-                "**What to verify:** inspect the reported period, provider source, guidance changes, estimate-revision window, and the specific saved thesis assumptions affected."
+                + "\n\n### Bottom line\nThe reported figures are verified stored facts, but missing consensus, guidance, and estimate revisions prevent a confident conclusion about the earnings surprise or forward change. An earnings result alone does not determine portfolio fit.\n\n"
+                "**What to verify:** connect or review the specific saved thesis assumptions, provider consensus, guidance, and post-earnings estimate revisions before changing the decision."
             )
     if intent == "FORECAST":
         result = next((item for item in tool_results if item.get("tool_name") == "prediction_market_intelligence"), None)
@@ -3397,8 +3438,14 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
     if any(step["state"] in {"PARTIAL","FAILED"} for step in execution_steps):
         record_metric("ask.partial", tags={"intent":plan.intent})
     narration_started = time.monotonic()
-    answer = _deterministic_chat_answer(plan.intent, tool_results)
-    if answer is not None:
+    deterministic_answer = _deterministic_chat_answer(plan.intent, tool_results)
+    # Earnings questions ask for interpretation ("what changed" and thesis
+    # impact), not merely a dump of stored fields. Use Gemini when configured,
+    # while retaining the polished deterministic answer as a zero-latency and
+    # outage-safe fallback.
+    interpret_with_gemini = plan.intent == "EARNINGS" and bool(os.getenv("GEMINI_API_KEY", "").strip())
+    if deterministic_answer is not None and not interpret_with_gemini:
+        answer = deterministic_answer
         model = "deterministic-chat-composer-v1"
         record_metric("ask.narration.fast_path", tags={"intent": plan.intent})
     else:
@@ -3406,7 +3453,7 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
             answer, model = ask_gemini(payload.question, evidence, history, conversation_meta.get("summary") or "")
         except RuntimeError as exc:
             record_metric("ask.narration.fallback", tags={"intent": plan.intent, "error_type": type(exc).__name__})
-            answer = _chat_narration_fallback(tool_results)
+            answer = deterministic_answer or _chat_narration_fallback(tool_results)
             model = "deterministic-timeout-fallback-v1"
     narration_elapsed = time.monotonic() - narration_started
     sources = [{"id": f"S{index + 1}", "label": item["label"], "url": item.get("url"), "as_of": item.get("as_of")} for index, item in enumerate(evidence)]

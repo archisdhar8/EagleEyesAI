@@ -66,7 +66,10 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
     tickers = _tickers(question, page_context, previous_analysis)
     mappings = {
         "RETROSPECTIVE": ("decision_journal",),
-        "EARNINGS": ("earnings_intelligence", "thesis_monitor"),
+        # Earnings intelligence already joins the latest saved thesis-monitor
+        # result for the requested ticker. Running thesis_monitor again only
+        # repeats owner-scoped database work and lengthens the answer path.
+        "EARNINGS": ("earnings_intelligence",),
         "CHANGE": ("evidence_changes", "thesis_monitor"),
         "THESIS": ("thesis_monitor", "evidence_changes"),
         "SCENARIO": ("portfolio_scenario",),

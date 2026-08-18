@@ -108,6 +108,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   const [draggedTerminalWidget, setDraggedTerminalWidget] = useState<string | null>(null);
   const [terminalLayouts, setTerminalLayouts] = useState<TerminalLayout[]>([]);
   const [selectedTerminalLayout, setSelectedTerminalLayout] = useState<string | null>(null);
+  const restoredChatWorkspaces=useRef(new Set<"research"|"portfolio">());
 
   const apiFetch = useCallback(async (input: string, init: RequestInit = {}) => {
     const headers = new Headers(init.headers);
@@ -141,28 +142,32 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   },[todayCacheKey]);
 
   useEffect(()=>{
+    const workspace=tab==="ask"?"research":tab==="portfolio"?"portfolio":null;
+    if(!workspace||restoredChatWorkspaces.current.has(workspace))return;
+    const activeWorkspace: "research"|"portfolio"=workspace;
     let active=true;
-    async function restore(workspace:"research"|"portfolio"){
-      const response=await apiRequest(`/chat/conversations?workspace=${workspace}`);
+    async function restore(){
+      const response=await apiRequest(`/chat/conversations?workspace=${activeWorkspace}`);
       if(!response.ok)return;
       const payload=await response.json();
       const rows:ChatConversation[]=Array.isArray(payload)?payload:[];
       if(!active)return;
-      if(workspace==="research")setResearchConversations(rows);else setPortfolioConversations(rows);
-      const remembered=window.localStorage.getItem(`eagleeyes-${workspace}-conversation`);
+      restoredChatWorkspaces.current.add(activeWorkspace);
+      if(activeWorkspace==="research")setResearchConversations(rows);else setPortfolioConversations(rows);
+      const remembered=window.localStorage.getItem(`eagleeyes-${activeWorkspace}-conversation`);
       const selected=rows.find(item=>item.id===remembered)?.id||rows[0]?.id;
       if(!selected)return;
       const detailResponse=await apiRequest(`/chat/conversations/${selected}`);
       if(!detailResponse.ok||!active)return;
       const detail=await detailResponse.json();
-      conversationCache.current[workspace].set(selected,{messages:detail.messages||[],artifacts:detail.artifacts||[]});
-      if(workspace==="research"){setResearchConversationId(selected);setResearchChatMessages(detail.messages||[]);setResearchChatArtifacts(detail.artifacts||[]);}
+      conversationCache.current[activeWorkspace].set(selected,{messages:detail.messages||[],artifacts:detail.artifacts||[]});
+      if(activeWorkspace==="research"){setResearchConversationId(selected);setResearchChatMessages(detail.messages||[]);setResearchChatArtifacts(detail.artifacts||[]);}
       else{setPortfolioConversationId(selected);setPortfolioChatMessages(detail.messages||[]);setPortfolioChatArtifacts(detail.artifacts||[]);}
-      window.localStorage.setItem(`eagleeyes-${workspace}-conversation`,selected);
+      window.localStorage.setItem(`eagleeyes-${activeWorkspace}-conversation`,selected);
     }
-    void Promise.all([restore("research"),restore("portfolio")]);
+    void restore();
     return()=>{active=false;};
-  },[apiRequest]);
+  },[apiRequest,tab]);
 
   useEffect(() => {
     function applyRoute(route: RouteState) {
@@ -187,6 +192,22 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     window.addEventListener("popstate", handleLocation);
     return()=>{window.cancelAnimationFrame(frame);window.removeEventListener("popstate",handleLocation);};
   },[]);
+
+  useEffect(()=>{
+    function handleInternalLink(event:MouseEvent){
+      if(event.defaultPrevented||event.button!==0||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;
+      const target=event.target;
+      if(!(target instanceof Element))return;
+      const anchor=target.closest("a[href]") as HTMLAnchorElement|null;
+      if(!anchor||anchor.target||anchor.hasAttribute("download"))return;
+      const url=new URL(anchor.href,window.location.origin);
+      if(url.origin!==window.location.origin||!resolveAppRoute(url.pathname,url.search))return;
+      event.preventDefault();
+      navigateDeepLink(`${url.pathname}${url.search}${url.hash}`);
+    }
+    document.addEventListener("click",handleInternalLink);
+    return()=>document.removeEventListener("click",handleInternalLink);
+  });
 
   useEffect(() => {
     document.title = `${navigationLabel(tab)} — EagleEyes`;
