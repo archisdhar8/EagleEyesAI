@@ -6,12 +6,13 @@ import type { PresentationLevel } from "../../lib/presentation-level";
 import { ConceptGlossary } from "../learn/ConceptGlossary";
 
 export function AppShell({
-  activeTab, density, connected, dark, email, freshness, presentationLevel, children,
+  activeTab, density, connected, connectionChecked, dark, email, freshness, presentationLevel, children,
   onNavigate, onPresentationLevel, onToggleTheme, onSignOut, onLearnConcept, topAction, drawer, status, notice, onDismissNotice,
 }: {
   activeTab: Tab;
   density: "compact" | "comfortable";
   connected: boolean;
+  connectionChecked: boolean;
   dark: boolean;
   email: string;
   freshness: string;
@@ -35,7 +36,7 @@ export function AppShell({
         {PRIMARY_NAV_ITEMS.map(([key, icon, label]) => <button key={key} className={activeTab === key ? "active" : ""} onClick={() => onNavigate(key)}><span aria-hidden>{icon}</span>{label}</button>)}
       </nav>
       <div className="sidebar-foot">
-        <div className={`connection ${connected ? "online" : ""}`}><i />{connected ? "Research engine connected" : "Research engine offline"}</div>
+        <div className={`connection ${connected ? "online" : ""}`}><i />{connected ? "Research engine connected" : connectionChecked ? "Research engine unavailable" : "Research engine connecting"}</div>
         <ConceptGlossary onOpen={onLearnConcept} />
         <button className="theme-button" onClick={onToggleTheme}>{dark ? "☀" : "◐"} {dark ? "Light mode" : "Dark mode"}</button>
         <button className="theme-button" onClick={onSignOut}>↪ Sign out</button>

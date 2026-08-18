@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from backend import database
 from backend.main import (
     _benchmark_outlook_chat_tools, _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
-    _cors_allowed_origins, _execute_chat_plan_tools, _portfolio_chat_tools, _portfolio_risk_chat_tools,
+    _cors_allowed_origins, _decision_workspace_inputs, _execute_chat_plan_tools, _portfolio_chat_tools, _portfolio_risk_chat_tools,
     _security_ranking_chat_tools, app,
 )
 
@@ -89,6 +89,21 @@ def test_provider_health_never_requires_live_network_for_status() -> None:
     payload = response.json()
     assert payload["version"] == "provider-health-v1"
     assert {row["key"] for row in payload["providers"]} == {"supabase", "fred", "prices", "market_snapshots", "events", "kalshi", "polymarket", "sec", "gemini"}
+
+
+def test_decision_workspace_uses_only_selected_portfolio(monkeypatch) -> None:
+    monkeypatch.setattr(database, "get_portfolio", lambda portfolio_id, user_id: {
+        "id": portfolio_id, "holdings": [{"ticker": "AAPL"}], "user_id": user_id,
+    })
+    monkeypatch.setattr(database, "list_portfolios", lambda user_id: [
+        {"id": "wrong", "holdings": [{"ticker": "MSFT"}]},
+    ])
+    monkeypatch.setattr(database, "load_profile", lambda user_id: {"watchlist": ["spy"]})
+
+    holdings, watchlist = _decision_workspace_inputs("user-1", "selected")
+
+    assert holdings == [{"ticker": "AAPL"}]
+    assert watchlist == ["SPY"]
 
 
 def test_balanced_rebalance_answer_uses_latest_saved_allocations(monkeypatch) -> None:

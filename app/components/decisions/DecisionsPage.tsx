@@ -43,9 +43,10 @@ function MonitorEvidenceRow({item}:{item:MonitoringEvidence}) {
 }
 
 export function DecisionsPage({
-  request, holdings, profile, goals, onOpenPortfolio,
+  request, portfolioId, holdings, profile, goals, onOpenPortfolio,
 }: {
   request: (path: string, init?: RequestInit) => Promise<Response>;
+  portfolioId: string | number | null;
   holdings: Holding[];
   profile: Profile;
   goals: Goal[];
@@ -90,11 +91,15 @@ export function DecisionsPage({
   const load = useCallback(async () => {
     setLoading(true); setError("");
     try {
-      const [raw,journalData,personalizationData] = await Promise.all([
-        readJson<Partial<DecisionsWorkspace>>(await request("/decisions/workspace")),
-        readJson<DecisionJournalWorkspace>(await request("/decision-journal")),
-        readJson<DecisionPersonalization>(await request("/personalization")),
+      const [workspaceResult,journalResult,personalizationResult] = await Promise.allSettled([
+        request(`/decisions/workspace${portfolioId?`?portfolio_id=${encodeURIComponent(String(portfolioId))}`:""}`).then(readJson<Partial<DecisionsWorkspace>>),
+        request("/decision-journal").then(readJson<DecisionJournalWorkspace>),
+        request("/personalization").then(readJson<DecisionPersonalization>),
       ]);
+      if(workspaceResult.status==="rejected")throw workspaceResult.reason;
+      const raw=workspaceResult.value;
+      const journalData=journalResult.status==="fulfilled"?journalResult.value:null;
+      const personalizationData=personalizationResult.status==="fulfilled"?personalizationResult.value:null;
       const data: DecisionsWorkspace = {
         active_theses: Array.isArray(raw.active_theses) ? raw.active_theses : [],
         recent_decisions: Array.isArray(raw.recent_decisions) ? raw.recent_decisions : [],
@@ -106,8 +111,8 @@ export function DecisionsPage({
       const queryTicker = searchParams.get("ticker")?.toUpperCase() || "";
       setWorkspace(data);
       setSelectedTicker(current=>current||queryTicker||holdings[0]?.ticker?.toUpperCase()||profile.watchlist[0]?.toUpperCase()||data.active_theses[0]?.ticker||"");
-      setJournal({version:journalData.version||"decision-journal-v1",recent_decisions:Array.isArray(journalData.recent_decisions)?journalData.recent_decisions:[],ready_for_review:Array.isArray(journalData.ready_for_review)?journalData.ready_for_review:[],completed_retrospectives:Array.isArray(journalData.completed_retrospectives)?journalData.completed_retrospectives:[],patterns:{reviewed_decisions:journalData.patterns?.reviewed_decisions||0,minimum_sample:journalData.patterns?.minimum_sample||5,status:journalData.patterns?.status||"INSUFFICIENT_SAMPLE",patterns:Array.isArray(journalData.patterns?.patterns)?journalData.patterns.patterns:[]},forecast_calibration:{sample_size:journalData.forecast_calibration?.sample_size||0,brier_score:journalData.forecast_calibration?.brier_score??null,status:journalData.forecast_calibration?.status||"INSUFFICIENT_SAMPLE",message:journalData.forecast_calibration?.message||"Resolved forecasts are insufficient for calibration.",buckets:Array.isArray(journalData.forecast_calibration?.buckets)?journalData.forecast_calibration.buckets:[],methodology:journalData.forecast_calibration?.methodology||"No calibration result without resolved forecasts."}});
-      setPersonalization({version:personalizationData.version||"decision-preferences-v1",explicit:personalizationData.explicit||{},accepted:personalizationData.accepted||{},inferred:Array.isArray(personalizationData.inferred)?personalizationData.inferred:[],dismissed:Array.isArray(personalizationData.dismissed)?personalizationData.dismissed:[],minimum_reviewed_decisions:personalizationData.minimum_reviewed_decisions||5,reviewed_decisions:personalizationData.reviewed_decisions||0});
+      if(journalData)setJournal({version:journalData.version||"decision-journal-v1",recent_decisions:Array.isArray(journalData.recent_decisions)?journalData.recent_decisions:[],ready_for_review:Array.isArray(journalData.ready_for_review)?journalData.ready_for_review:[],completed_retrospectives:Array.isArray(journalData.completed_retrospectives)?journalData.completed_retrospectives:[],patterns:{reviewed_decisions:journalData.patterns?.reviewed_decisions||0,minimum_sample:journalData.patterns?.minimum_sample||5,status:journalData.patterns?.status||"INSUFFICIENT_SAMPLE",patterns:Array.isArray(journalData.patterns?.patterns)?journalData.patterns.patterns:[]},forecast_calibration:{sample_size:journalData.forecast_calibration?.sample_size||0,brier_score:journalData.forecast_calibration?.brier_score??null,status:journalData.forecast_calibration?.status||"INSUFFICIENT_SAMPLE",message:journalData.forecast_calibration?.message||"Resolved forecasts are insufficient for calibration.",buckets:Array.isArray(journalData.forecast_calibration?.buckets)?journalData.forecast_calibration.buckets:[],methodology:journalData.forecast_calibration?.methodology||"No calibration result without resolved forecasts."}});
+      if(personalizationData)setPersonalization({version:personalizationData.version||"decision-preferences-v1",explicit:personalizationData.explicit||{},accepted:personalizationData.accepted||{},inferred:Array.isArray(personalizationData.inferred)?personalizationData.inferred:[],dismissed:Array.isArray(personalizationData.dismissed)?personalizationData.dismissed:[],minimum_reviewed_decisions:personalizationData.minimum_reviewed_decisions||5,reviewed_decisions:personalizationData.reviewed_decisions||0});
       const queryDecision = searchParams.get("decision")?.toUpperCase() as DecisionType | null;
       if(queryDecision&&["WATCH","BUY","ADD","HOLD","REDUCE","SELL","AVOID"].includes(queryDecision))setDecisionType(queryDecision);
       const selected = data.active_theses.find(item => item.id === selectedId)
@@ -116,7 +121,7 @@ export function DecisionsPage({
       else if (queryTicker && !selectedId) setForm({ ...EMPTY, ticker: queryTicker });
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not load decisions."); }
     finally { setLoading(false); }
-  }, [request, selectedId, holdings, profile.watchlist]);
+  }, [request, portfolioId, selectedId, holdings, profile.watchlist]);
 
   const securityUniverse=useMemo(()=>{
     const source=[...holdings.map(item=>({ticker:item.ticker.toUpperCase(),source:"Holding"})),...profile.watchlist.map(ticker=>({ticker:ticker.toUpperCase(),source:"Watchlist"})),...(workspace?.active_theses||[]).map(item=>({ticker:item.ticker,source:"Thesis"})),...(workspace?.needs_thesis||[]).map(item=>({ticker:item.ticker,source:item.source==="holding"?"Holding":"Watchlist"}))];

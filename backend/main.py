@@ -1138,16 +1138,25 @@ def research(tickers: str = Query(default=""), _: AuthenticatedUser = Depends(re
     return security_research(values[:50])
 
 
-def _decision_workspace_inputs(user_id: str) -> tuple[list[dict[str, Any]], list[str]]:
-    portfolios = database.list_portfolios(user_id)
-    holdings = [holding for portfolio in portfolios for holding in portfolio.get("holdings", [])]
+def _decision_workspace_inputs(user_id: str, portfolio_id: str | None = None) -> tuple[list[dict[str, Any]], list[str]]:
+    if portfolio_id:
+        holdings = database.get_portfolio(portfolio_id, user_id).get("holdings", [])
+    else:
+        portfolio = next(iter(database.list_portfolios(user_id)), None)
+        holdings = (portfolio or {}).get("holdings", [])
     profile = database.load_profile(user_id) or {}
     return holdings, [str(ticker).upper() for ticker in profile.get("watchlist", [])]
 
 
 @app.get("/api/decisions/workspace")
-def decisions_workspace(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    holdings, watchlist = _decision_workspace_inputs(user.id)
+def decisions_workspace(
+    portfolio_id: str | None = Query(default=None),
+    user: AuthenticatedUser = Depends(require_user),
+) -> dict[str, Any]:
+    try:
+        holdings, watchlist = _decision_workspace_inputs(user.id, portfolio_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Portfolio not found") from exc
     return theses.workspace(user.id, holdings, watchlist)
 
 
