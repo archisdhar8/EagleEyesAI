@@ -36,6 +36,20 @@ test("Today refresh returns stored evidence before slow providers finish", async
   assert.doesNotMatch(backend, /def refresh_home_briefing[\s\S]{0,900}refresh_tiingo/);
 });
 
+test("Today restores its last completed brief and avoids duplicate portfolio research", async () => {
+  const [dashboard, backend, analysis, dailyWorkflow, marketWorkflow] = await Promise.all([
+    read("app/Dashboard.tsx"), read("backend/main.py"), read("backend/analysis.py"),
+    read(".github/workflows/ingest-daily.yml"), read(".github/workflows/ingest-markets.yml"),
+  ]);
+  assert.match(dashboard, /eagleeyes-today-cache/);
+  assert.match(dashboard, /36\*60\*60\*1000/);
+  assert.match(backend, /_overview\(user, include_research=False\)/);
+  assert.match(backend, /security_research\(portfolio_tickers, price_limit=40, stored=security_bundle\)/);
+  assert.match(analysis, /stored: dict\[str, Any\] \| None = None/);
+  assert.match(dailyWorkflow, /cron:/);
+  assert.match(marketWorkflow, /cron:/);
+});
+
 test("attention state and Today chat tools stay authenticated and owner-scoped", async () => {
   const [main, migration] = await Promise.all([
     read("backend/main.py"),

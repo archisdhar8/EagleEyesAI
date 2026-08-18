@@ -28,6 +28,7 @@ import {
 const API = (process.env.NEXT_PUBLIC_API_URL || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000/api" : "/api")).replace(/\/$/, "");
 const DASHBOARD_TERMINAL_STATES = new Set(["COMPLETE", "PARTIAL_SUCCESS", "FAILED", "CANCELLED", "EXPIRED"]);
 type SavedPortfolio = { id: string | number; name: string; holdings: Holding[]; updated_at?: string | null };
+type CachedToday = { cachedAt:number; briefing:TodayBriefing; macro?:Macro; macroFactors?:MacroFactor[]; dataStatus?:DataStatus };
 export default function Dashboard({ accessToken, email, onSignOut }: { accessToken: string; email: string; onSignOut: () => void }) {
   const [tab, setTab] = useState<Tab>("today");
   const [exploreView, setExploreView] = useState<ExploreView>("stocks");
@@ -130,6 +131,14 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     throw lastError instanceof Error?lastError:new Error("Request failed");
   }, [accessToken]);
   const apiRequest = useCallback((path: string, init?: RequestInit) => apiFetch(`${API}${path}`, init), [apiFetch]);
+  const todayCacheKey=useCallback((id:string|number)=>`eagleeyes-today-cache-${email}-${id}`,[email]);
+  const storeTodayCache=useCallback((id:string|number|null|undefined,data:{briefing?:TodayBriefing|null;macro?:Macro;macro_factors?:{factors?:MacroFactor[]};data_status?:DataStatus})=>{
+    if(id==null||!data.briefing)return;
+    try{
+      const cached:CachedToday={cachedAt:Date.now(),briefing:data.briefing,macro:data.macro,macroFactors:data.macro_factors?.factors||[],dataStatus:data.data_status};
+      window.localStorage.setItem(todayCacheKey(id),JSON.stringify(cached));
+    }catch{/* A full or unavailable browser cache must never block Today. */}
+  },[todayCacheKey]);
 
   useEffect(()=>{
     let active=true;
@@ -188,6 +197,18 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     async function loadOverview() {
       let portfolioLibraryLoaded=false;
       try {
+        const rememberedBeforeLoad=window.localStorage.getItem(`eagleeyes-active-portfolio-${email}`);
+        if(rememberedBeforeLoad){
+          try{
+            const cached=JSON.parse(window.localStorage.getItem(todayCacheKey(rememberedBeforeLoad))||"null") as CachedToday|null;
+            if(cached&&Date.now()-cached.cachedAt<36*60*60*1000){
+              setHomeBriefing(cached.briefing);
+              if(cached.macro)setMacro(cached.macro);
+              if(cached.macroFactors)setMacroFactors(cached.macroFactors);
+              if(cached.dataStatus)setDataStatus(cached.dataStatus);
+            }
+          }catch{/* Ignore an old or partial browser cache. */}
+        }
         const libraryResponse=await apiFetch(`${API}/portfolios`);
         const libraryRows:SavedPortfolio[]=libraryResponse.ok?await libraryResponse.json():[];
         const rememberedId=window.localStorage.getItem(`eagleeyes-active-portfolio-${email}`);
@@ -226,6 +247,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
         const loadedPreferences=data.preferences||{};
         const loadedTerminalWidgets = loadedPreferences.terminal_widgets?.length ? adaptTerminalWidgets(loadedPreferences.terminal_widgets) : defaultTerminalWidgets;
         setProfile({ ...defaultProfile, ...data.profile, suitability_profile:{...defaultProfile.suitability_profile,...(data.profile?.suitability_profile||{})} }); setHomeBriefing(data.briefing||null); setMacro(data.macro); setMacroFactors(data.macro_factors?.factors || []); setPreferences(current => ({ ...current, ...loadedPreferences, presentation_level:normalizePresentationLevel(loadedPreferences.presentation_level), terminal_widgets: loadedTerminalWidgets })); setScenarios(data.scenarios.condition_dimensions||data.scenarios.scenarios); setContracts(data.scenarios.contracts || []); setScenarioFetchedAt(data.scenarios.fetched_at || null); setScenarioWarnings(data.scenarios.warnings); setResearch(data.research); setDataStatus(data.data_status); setRegimeHistory(data.regime_history || { latest: null, sample_counts: {}, total_samples: 0 });
+        storeTodayCache(selectedPortfolio?.id||data.portfolio?.id,data);
         setMonitoring(data.model_monitoring || null);
         const selectedId=selectedPortfolio?.id;
         const diagnosticsResponse=await apiFetch(`${API}/portfolio/diagnostics${selectedId?`?portfolio_id=${encodeURIComponent(String(selectedId))}`:""}`);if(active&&diagnosticsResponse.ok)setPortfolioDiagnostics(await diagnosticsResponse.json());
@@ -242,6 +264,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
             setHomeBriefing(refreshed.briefing||data.briefing||null);setMacro(refreshed.macro||data.macro);
             setMacroFactors(refreshed.macro_factors?.factors||data.macro_factors?.factors||[]);
             setDataStatus(refreshed.data_status||data.data_status);setResearch(refreshed.research||data.research||[]);
+            storeTodayCache(selectedPortfolio?.id||refreshed.portfolio?.id||data.portfolio?.id,refreshed);
           }).catch(()=>undefined);
         }
       } catch {
@@ -250,7 +273,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     }
     void loadOverview();
     return () => { active = false; };
-  }, [apiFetch,email]);
+  }, [apiFetch,email,storeTodayCache,todayCacheKey]);
 
   useEffect(() => {
     if(!portfolioId){setAnalysis(null);return;}
@@ -465,6 +488,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       if (!response.ok) throw new Error(data.detail || "Today refresh failed");
       setHomeBriefing(data.briefing || null); setMacro(data.macro); setMacroFactors(data.macro_factors?.factors || []);
       setDataStatus(data.data_status); setResearch(data.research || []); setConnected(true);
+      storeTodayCache(portfolioId||data.portfolio?.id,data);
       const warnings = data.refresh?.warnings || [];
       setNotice(data.refresh?.status==="queued"
         ? "Your saved evidence is ready. Fresh price and macro checks are continuing in the background."

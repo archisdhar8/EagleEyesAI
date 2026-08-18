@@ -313,8 +313,7 @@ def health() -> dict[str, Any]:
     }
 
 
-@app.get("/api/overview")
-def overview(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+def _overview(user: AuthenticatedUser, include_research: bool = True) -> dict[str, Any]:
     database.ensure_user_workspace(user.id, InvestorProfile().model_dump(mode="json"))
     # Supabase-backed reads each establish an isolated connection.  These
     # datasets are independent, so fetch them concurrently to keep the shared
@@ -349,7 +348,7 @@ def overview(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     # wait tens of seconds. Research search/Watchlist load their own evidence
     # on demand instead.
     tickers = [holding["ticker"] for holding in holdings]
-    research = security_research(tickers)
+    research = security_research(tickers) if include_research else []
     return {
         "portfolio": portfolio, "portfolios": portfolios, "profile": profile, "macro": macro, "macro_factors": {"factors": []},
         "scenarios": scenarios, "research": research, "storage": database.storage_mode(),
@@ -363,10 +362,17 @@ def overview(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     }
 
 
+@app.get("/api/overview")
+def overview(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    return _overview(user)
+
+
 @app.get("/api/home/briefing")
 @app.get("/api/today/briefing")
 def home_briefing(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    payload = overview(user)
+    # Reuse the compact security bundle loaded below instead of making a
+    # second, long-history research query for every saved holding.
+    payload = _overview(user, include_research=False)
     holdings = (payload.get("portfolio") or {}).get("holdings", [])
     portfolio_tickers = [str(row.get("ticker") or "").upper() for row in holdings]
     market_universe = sorted(set(portfolio_tickers + list(INDEXES) + list(SECTORS)))
@@ -399,6 +405,7 @@ def home_briefing(user: AuthenticatedUser = Depends(require_user)) -> dict[str, 
             decision_reviews = decision_reviews_future.result()
         except Exception:
             decision_reviews = []
+    payload["research"] = security_research(portfolio_tickers, price_limit=40, stored=security_bundle)
     has_fresh_snapshot = any(row["data_status"] in {"live", "delayed"} for row in observations)
     # Keep the read path fast: provider I/O belongs to the explicit refresh
     # endpoint.  Snapshot mode is opt-in for installations with the appropriate
