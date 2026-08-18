@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import math
 import os
 import random
@@ -75,9 +76,34 @@ from .learning import (
 )
 
 
+LOGGER = logging.getLogger("eagleeyes.startup")
+_STORAGE_INITIALIZATION: dict[str, str] = {"status": "pending"}
+
+
+def _initialize_remote_storage() -> None:
+    """Validate remote storage without delaying the web server's port binding."""
+    try:
+        database.initialize()
+    except Exception as exc:  # Request middleware reports dependency failures as 503s.
+        _STORAGE_INITIALIZATION["status"] = "unavailable"
+        LOGGER.warning("Remote storage readiness check failed: %s", type(exc).__name__)
+    else:
+        _STORAGE_INITIALIZATION["status"] = "ready"
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    database.initialize()
+    if database.DATABASE_URL:
+        # DNS and provider cold starts must never prevent Render from opening
+        # the HTTP port. Database-backed requests already use bounded timeouts.
+        threading.Thread(
+            target=_initialize_remote_storage,
+            name="storage-readiness",
+            daemon=True,
+        ).start()
+    else:
+        database.initialize()
+        _STORAGE_INITIALIZATION["status"] = "ready"
     if not database.DATABASE_URL and database.load_profile() is None:
         database.save_profile(InvestorProfile().model_dump(mode="json"))
     yield
@@ -277,7 +303,13 @@ def regime_summary() -> dict[str, Any]:
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     mode = database.storage_mode()
-    return {"status": "ok", "mode": mode, "storage": mode, "trading_enabled": False}
+    return {
+        "status": "ok",
+        "mode": mode,
+        "storage": mode,
+        "storage_readiness": _STORAGE_INITIALIZATION["status"],
+        "trading_enabled": False,
+    }
 
 
 @app.get("/api/overview")

@@ -3,6 +3,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from backend import database
 from backend.main import (
     _benchmark_outlook_chat_tools, _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
     _cors_allowed_origins, _execute_chat_plan_tools, _portfolio_chat_tools, _portfolio_risk_chat_tools,
@@ -13,7 +14,22 @@ from backend.main import (
 def test_health_reports_storage_and_disables_trading() -> None:
     with TestClient(app) as client:
         payload = client.get("/api/health").json()
-    assert payload == {"status": "ok", "mode": "sqlite", "storage": "sqlite", "trading_enabled": False}
+    assert payload == {
+        "status": "ok",
+        "mode": "sqlite",
+        "storage": "sqlite",
+        "storage_readiness": "ready",
+        "trading_enabled": False,
+    }
+
+
+def test_remote_storage_failure_does_not_block_health(monkeypatch) -> None:
+    monkeypatch.setattr(database, "DATABASE_URL", "postgresql://configured")
+    monkeypatch.setattr(database, "initialize", lambda: (_ for _ in ()).throw(TimeoutError()))
+    with TestClient(app) as client:
+        response = client.get("/api/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
 
 
 def test_production_guard_adds_request_id_security_headers_and_metrics() -> None:
