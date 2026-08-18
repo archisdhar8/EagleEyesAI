@@ -17,7 +17,7 @@ from typing import Any, Literal
 
 import pandas as pd
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -78,6 +78,7 @@ from .learning import (
 
 LOGGER = logging.getLogger("eagleeyes.startup")
 _STORAGE_INITIALIZATION: dict[str, str] = {"status": "pending"}
+_HOME_REFRESH_LOCK = threading.Lock()
 
 
 def _initialize_remote_storage() -> None:
@@ -512,36 +513,50 @@ def clear_attention_state(attention_item_id: str,
     database.delete_attention_state(user.id, attention_item_id)
 
 
-@app.post("/api/home/refresh")
-@app.post("/api/today/refresh")
-def refresh_home_briefing(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    """Refresh the market tape and FRED observations before rebuilding Today.
-
-    This is deliberately user initiated because free-provider refreshes can take
-    several seconds.  Provider failures are disclosed while the last validated
-    snapshot remains usable.
-    """
-    warnings: list[str] = []
+def _refresh_home_sources() -> None:
+    """Refresh shared Today providers once without holding an HTTP request open."""
+    if not _HOME_REFRESH_LOCK.acquire(blocking=False):
+        return
     market_tickers = sorted(set(INDEXES) | set(SECTORS))
     try:
-        if os.getenv("TIINGO_API_KEY", "").strip():
-            refresh_tiingo(market_tickers)
-        elif os.getenv("POLYGON_API_KEY", "").strip():
-            refresh_polygon(market_tickers)
-        else:
-            warnings.append("No price-history provider key is configured for an on-demand market refresh.")
-    except Exception as exc:
-        warnings.append(f"Market refresh failed; retained the latest validated prices ({type(exc).__name__}).")
-    try:
-        if os.getenv("FRED_API_KEY", "").strip():
-            refresh_fred()
-        else:
-            warnings.append("FRED is not configured for an on-demand macro refresh.")
-    except Exception as exc:
-        warnings.append(f"FRED refresh failed; retained the latest validated observations ({type(exc).__name__}).")
+        try:
+            if os.getenv("TIINGO_API_KEY", "").strip():
+                refresh_tiingo(market_tickers)
+            elif os.getenv("POLYGON_API_KEY", "").strip():
+                refresh_polygon(market_tickers)
+        except Exception as exc:
+            LOGGER.warning("Background Today price refresh retained stored evidence: %s", type(exc).__name__)
+        try:
+            if os.getenv("FRED_API_KEY", "").strip():
+                refresh_fred()
+        except Exception as exc:
+            LOGGER.warning("Background Today macro refresh retained stored evidence: %s", type(exc).__name__)
+    finally:
+        _HOME_REFRESH_LOCK.release()
+
+
+@app.post("/api/home/refresh")
+@app.post("/api/today/refresh")
+def refresh_home_briefing(background_tasks: BackgroundTasks,
+                           user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    """Return stored Today evidence now and refresh slow providers afterward."""
+    warnings: list[str] = []
+    price_configured = bool(os.getenv("TIINGO_API_KEY", "").strip() or os.getenv("POLYGON_API_KEY", "").strip())
+    fred_configured = bool(os.getenv("FRED_API_KEY", "").strip())
+    if not price_configured:
+        warnings.append("No price-history provider key is configured for an on-demand market refresh.")
+    if not fred_configured:
+        warnings.append("FRED is not configured for an on-demand macro refresh.")
     payload = home_briefing(user)
     payload["briefing"]["warnings"] = list(dict.fromkeys([*payload["briefing"].get("warnings", []), *warnings]))
-    payload["refresh"] = {"completed_at": datetime.now(timezone.utc).isoformat(), "warnings": warnings}
+    if price_configured or fred_configured:
+        background_tasks.add_task(_refresh_home_sources)
+    payload["refresh"] = {
+        "status": "queued" if price_configured or fred_configured else "not_configured",
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "warnings": warnings,
+        "message": "Saved evidence is ready; configured providers are refreshing in the background.",
+    }
     return payload
 
 

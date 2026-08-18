@@ -155,7 +155,7 @@ export async function installApiMock(page: Page, options: { portfolio?: boolean;
     if (path === "/portfolios" && method === "GET") return json(route, state.holdings.length ? [{ id: "portfolio-1", name: "Browser portfolio", holdings: state.holdings, updated_at: now }] : []);
     if (/^\/portfolios\/[^/]+\/activate$/.test(path) && method === "POST") return json(route, { id: path.split("/")[2], name: "Browser portfolio", holdings: state.holdings, updated_at: now });
     if (path === "/home/briefing") return json(route, homePayload());
-    if (path === "/home/refresh" && method === "POST") return json(route, homePayload());
+    if (path === "/home/refresh" && method === "POST") return json(route, { ...homePayload(), refresh: { status: "queued", requested_at: now, warnings: [], message: "Saved evidence is ready; configured providers are refreshing in the background." } });
     if (path === "/decisions/workspace") return json(route, { active_theses: state.theses, recent_decisions: [], needs_thesis: [], review_dates: [], contexts: {} });
     if (path === "/decision-journal") return json(route, { version: "decision-journal-v1", recent_decisions: [], ready_for_review: [], completed_retrospectives: [], patterns: { reviewed_decisions: 0, minimum_sample: 5, status: "INSUFFICIENT_SAMPLE", patterns: [] }, forecast_calibration: { sample_size: 0, brier_score: null, status: "INSUFFICIENT_SAMPLE", message: "No resolved forecasts.", buckets: [], methodology: "No calibration result without resolved forecasts." } });
     if (path === "/personalization" && method === "GET") return json(route, { version: "decision-preferences-v1", explicit: {}, accepted: {}, inferred: [], dismissed: [], minimum_reviewed_decisions: 5, reviewed_decisions: 0 });

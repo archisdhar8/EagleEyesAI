@@ -16,6 +16,7 @@ test("Today is attention-first and keeps price movement contextual", async () =>
   assert.match(page, /restore it automatically on future sign-ins/);
   assert.match(dashboard, /Your saved portfolio is loaded/);
   assert.match(dashboard, /eagleeyes-today-refresh/);
+  assert.match(dashboard, /Fresh price and macro checks are continuing in the background/);
   assert.match(page, /Nothing material changed/);
   assert.match(page, /Price is context/);
   assert.match(page, /Mark read/);
@@ -25,6 +26,14 @@ test("Today is attention-first and keeps price movement contextual", async () =>
   assert.match(attention, /NO_MATERIAL_EVIDENCE_CHANGE/);
   assert.match(attention, /def price_context\(/);
   assert.match(attention, /"price_context": price_context\(/);
+});
+
+test("Today refresh returns stored evidence before slow providers finish", async () => {
+  const backend = await read("backend/main.py");
+  assert.match(backend, /BackgroundTasks/);
+  assert.match(backend, /background_tasks\.add_task\(_refresh_home_sources\)/);
+  assert.match(backend, /_HOME_REFRESH_LOCK\.acquire\(blocking=False\)/);
+  assert.doesNotMatch(backend, /def refresh_home_briefing[\s\S]{0,900}refresh_tiingo/);
 });
 
 test("attention state and Today chat tools stay authenticated and owner-scoped", async () => {

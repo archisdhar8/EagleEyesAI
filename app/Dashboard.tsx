@@ -116,7 +116,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     let lastError:unknown;
     for(let attempt=1;attempt<=attempts;attempt++){
       const controller=new AbortController();
-      const timeout=window.setTimeout(()=>controller.abort(),method==="GET"?20_000:45_000);
+      const timeout=window.setTimeout(()=>controller.abort(new DOMException("Request timed out","TimeoutError")),method==="GET"?20_000:45_000);
       try{
         const response=await fetch(input,{...init,headers,signal:init.signal||controller.signal});
         if(attempt<attempts&&[408,429,500,502,503,504].includes(response.status)){await new Promise(resolve=>window.setTimeout(resolve,250*attempt));continue;}
@@ -466,8 +466,13 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       setHomeBriefing(data.briefing || null); setMacro(data.macro); setMacroFactors(data.macro_factors?.factors || []);
       setDataStatus(data.data_status); setResearch(data.research || []); setConnected(true);
       const warnings = data.refresh?.warnings || [];
-      setNotice(warnings.length ? `Refresh completed with ${warnings.length} provider warning${warnings.length === 1 ? "" : "s"}.` : "Today now uses the latest validated market and macro observations.");
-    } catch (error) { setNotice(error instanceof Error ? error.message : "Today refresh unavailable."); }
+      setNotice(data.refresh?.status==="queued"
+        ? "Your saved evidence is ready. Fresh price and macro checks are continuing in the background."
+        : warnings.length ? `Saved evidence is ready with ${warnings.length} provider warning${warnings.length === 1 ? "" : "s"}.` : "Today uses the latest validated market and macro observations.");
+    } catch (error) {
+      const aborted=error instanceof DOMException&&error.name==="AbortError"||error instanceof Error&&/abort|timeout/i.test(`${error.name} ${error.message}`);
+      setNotice(aborted?"The live refresh is taking longer than expected. Your saved portfolio and evidence remain available; try again shortly.":error instanceof Error?error.message:"Today refresh unavailable.");
+    }
     finally { setBusy(""); }
   }
 
