@@ -170,10 +170,14 @@ def test_evidence_draft_populates_all_cases_from_stored_evidence(monkeypatch) ->
         "what_would_change_the_view": "Sustained market-share losses",
     })
     draft = result["draft"]
+    assert "Why this is the base case" in draft["base_case"]
     assert "Revenue growth remains supportive" in draft["base_case"]
+    assert "Why the bull case could happen" in draft["bull_case"]
     assert "Data-center demand" in draft["bull_case"]
+    assert "Why the bear case could happen" in draft["bear_case"]
     assert "competitive pressure" in draft["bear_case"]
     assert "Sustained market-share losses" in draft["bear_case"]
+    assert len({draft["base_case"], draft["bull_case"], draft["bear_case"]}) == 3
 
 
 def test_ai_prose_draft_is_restricted_to_typed_editable_fields(monkeypatch) -> None:
