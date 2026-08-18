@@ -52,6 +52,9 @@ const percent=(value?:number|null)=>value==null?"—":`${(value*100).toFixed(1)}
 const dateLabel=(value?:string|null)=>value?new Date(value).toLocaleDateString(undefined,{month:"short",day:"numeric",year:"numeric"}):"Unknown";
 const multiple=(value?:number|null)=>value==null?"—":`${value.toFixed(2)}×`;
 const dollars=(value?:number|null)=>value==null?"—":new Intl.NumberFormat(undefined,{style:"currency",currency:"USD",notation:"compact",maximumFractionDigits:2}).format(value);
+const requestMessage=(reason:unknown,fallback:string)=>reason instanceof DOMException&&reason.name==="AbortError"||(reason instanceof Error&&/abort|timeout/i.test(`${reason.name} ${reason.message}`))
+  ?"This symbol lookup exceeded the interactive deadline. Retry once after the Render service wakes; no unsupported result was invented."
+  :reason instanceof Error?reason.message:fallback;
 
 function UniverseCard({universe}:{universe:Universe}){
   const guidance=universe.holdings>0
@@ -173,7 +176,7 @@ export function ResearchDiscovery({view,request,presentationLevel}:{view:"stocks
     try{
       const response=await requestRef.current(`/research/search?${params}`);if(!response.ok)throw new Error(await response.text());const result=await response.json();if(requestId===requestIdRef.current)setPayload(result);
       const exact=search.trim().toUpperCase();if(/^[A-Z][A-Z0-9.-]{0,9}$/.test(exact)&&result.results.some((item:SecurityResult)=>item.ticker===exact)){void loadChanges(exact,"LAST_THESIS_REVIEW");void loadForward(exact);void loadEarnings(exact);}
-    }catch(reason){if(requestId===requestIdRef.current)setError(reason instanceof Error?reason.message:"Research search failed");}finally{if(requestId===requestIdRef.current)setLoading(false);}
+    }catch(reason){if(requestId===requestIdRef.current)setError(requestMessage(reason,"Research search failed"));}finally{if(requestId===requestIdRef.current)setLoading(false);}
   }
 
   async function loadChanges(ticker:string,baseline:string){setChanges(current=>({...current,[ticker]:{status:"loading"}}));try{const response=await requestRef.current(`/evidence/securities/${ticker}/changes?baseline=${baseline}`);if(!response.ok)throw new Error(await response.text());const data=await response.json();setChanges(current=>({...current,[ticker]:{status:"ready",data}}));}catch(reason){setChanges(current=>({...current,[ticker]:{status:"error",message:reason instanceof Error?reason.message:"Change comparison failed"}}));}}

@@ -1272,7 +1272,9 @@ def _research_context(user: AuthenticatedUser, query: str = "", explicit: list[s
     tickers = list(dict.fromkeys(requested if explicit else requested + holdings + watchlist + catalog_tickers))[:200]
     reference = database.research_reference_data(tickers)
     reference["fund_lookup"] = fund_lookup
-    return security_research(tickers), holdings, watchlist, reference
+    # A single-symbol card needs one year of prices, not the broader
+    # three-year discovery window. This bounds latency and allocation churn.
+    return security_research(tickers, price_limit=260 if explicit else 756), holdings, watchlist, reference
 
 
 @app.get("/api/research/search")

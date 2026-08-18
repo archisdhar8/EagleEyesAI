@@ -4,6 +4,7 @@ import json
 import math
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -202,10 +203,14 @@ def _security_market_statistics(prices: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=1)
 def load_rankings() -> pd.DataFrame:
+    """Load the immutable deployment ranking snapshot once per worker."""
     if not RANKINGS_PATH.exists():
         return pd.DataFrame()
-    return pd.read_csv(RANKINGS_PATH).drop_duplicates("ticker", keep="first")
+    frame = pd.read_csv(RANKINGS_PATH).drop_duplicates("ticker", keep="first")
+    frame["ticker_normalized"] = frame["ticker"].astype(str).str.upper()
+    return frame.set_index("ticker_normalized", drop=False)
 
 
 def latest_macro() -> dict[str, Any]:
@@ -311,7 +316,7 @@ def macro_factor_dashboard() -> dict[str, Any]:
 
 def security_research(tickers: list[str], price_limit: int = 756) -> list[dict[str, Any]]:
     rankings = load_rankings()
-    indexed = rankings.set_index(rankings["ticker"].astype(str).str.upper()) if not rankings.empty else pd.DataFrame()
+    indexed = rankings
     stored = database.security_data(tickers, price_limit=price_limit) if database.DATABASE_URL else {
         "securities": [], "fundamentals": [], "prices": [], "news": [], "company_markets": []
     }

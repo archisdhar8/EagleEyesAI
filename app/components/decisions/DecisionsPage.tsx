@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { DecisionLab } from "../portfolio/DecisionLab";
 import type { Goal, Holding, Profile } from "../workspaces";
 import type { DecisionJournalWorkspace, DecisionRetrospective, DecisionType, DecisionsWorkspace, InvestmentThesis, ThesisAssumption, ThesisFactor, ThesisMonitorResult, MonitoringEvidence } from "./contracts";
@@ -12,6 +12,9 @@ const EMPTY: InvestmentThesis = {
   review_date: null, status: "DRAFT", source_context: {}, assumptions: [], factors: [],
 };
 type DecisionPersonalization={version:string;explicit:Record<string,unknown>;accepted:Record<string,{label?:string;basis?:string;sample_size?:number}>;inferred:Array<{key:string;label:string;basis:string;sample_size:number;value:string}>;dismissed:string[];minimum_reviewed_decisions:number;reviewed_decisions:number};
+type SecurityResearch={ticker:string;company?:string;sector?:string;industry?:string;evidence_bucket?:string;bucket_explanation?:string;portfolio_fit?:string;what_would_change_the_view?:string;thesis_risks?:string[];catalysts?:Array<{title:string;source_url?:string|null}>;market_statistics?:Record<string,number|null|string>;fundamental_statistics?:Record<string,number|null|string>;freshness?:{status?:string;price_as_of?:string|null;fundamentals_as_of?:string|null;coverage?:string};strengths?:Array<{label:string;evidence:number}>;weaknesses?:Array<{label:string;evidence:number}>};
+type SecurityIntelligence={research:SecurityResearch|null;earnings:Record<string,unknown>|null;markets:Array<Record<string,unknown>>;warnings:string[]};
+type DecisionChatMessage={role:"user"|"assistant";content:string};
 
 async function readJson<T>(response: Response): Promise<T> {
   const body = await response.json().catch(() => ({}));
@@ -78,6 +81,15 @@ export function DecisionsPage({
   const [relationship,setRelationship]=useState<ThesisRelationship>("CONSIDER");
   const [personalReason,setPersonalReason]=useState("");
   const [reviewConfirmed,setReviewConfirmed]=useState(false);
+  const [selectedTicker,setSelectedTicker]=useState("");
+  const [securitySearch,setSecuritySearch]=useState("");
+  const [intelligence,setIntelligence]=useState<SecurityIntelligence>({research:null,earnings:null,markets:[],warnings:[]});
+  const [intelligenceLoading,setIntelligenceLoading]=useState(false);
+  const [caseTab,setCaseTab]=useState<"base"|"bull"|"bear">("base");
+  const [decisionChat,setDecisionChat]=useState<DecisionChatMessage[]>([]);
+  const [decisionQuestion,setDecisionQuestion]=useState("");
+  const [decisionChatBusy,setDecisionChatBusy]=useState(false);
+  const [decisionConversationId,setDecisionConversationId]=useState<string|null>(null);
 
   const load = useCallback(async () => {
     setLoading(true); setError("");
@@ -94,11 +106,12 @@ export function DecisionsPage({
         review_dates: Array.isArray(raw.review_dates) ? raw.review_dates : [],
         contexts: raw.contexts || {},
       };
-      setWorkspace(data);
-      setJournal({version:journalData.version||"decision-journal-v1",recent_decisions:Array.isArray(journalData.recent_decisions)?journalData.recent_decisions:[],ready_for_review:Array.isArray(journalData.ready_for_review)?journalData.ready_for_review:[],completed_retrospectives:Array.isArray(journalData.completed_retrospectives)?journalData.completed_retrospectives:[],patterns:{reviewed_decisions:journalData.patterns?.reviewed_decisions||0,minimum_sample:journalData.patterns?.minimum_sample||5,status:journalData.patterns?.status||"INSUFFICIENT_SAMPLE",patterns:Array.isArray(journalData.patterns?.patterns)?journalData.patterns.patterns:[]},forecast_calibration:{sample_size:journalData.forecast_calibration?.sample_size||0,brier_score:journalData.forecast_calibration?.brier_score??null,status:journalData.forecast_calibration?.status||"INSUFFICIENT_SAMPLE",message:journalData.forecast_calibration?.message||"Resolved forecasts are insufficient for calibration.",buckets:Array.isArray(journalData.forecast_calibration?.buckets)?journalData.forecast_calibration.buckets:[],methodology:journalData.forecast_calibration?.methodology||"No calibration result without resolved forecasts."}});
-      setPersonalization({version:personalizationData.version||"decision-preferences-v1",explicit:personalizationData.explicit||{},accepted:personalizationData.accepted||{},inferred:Array.isArray(personalizationData.inferred)?personalizationData.inferred:[],dismissed:Array.isArray(personalizationData.dismissed)?personalizationData.dismissed:[],minimum_reviewed_decisions:personalizationData.minimum_reviewed_decisions||5,reviewed_decisions:personalizationData.reviewed_decisions||0});
       const searchParams = typeof window === "undefined" ? new URLSearchParams() : new URLSearchParams(window.location.search);
       const queryTicker = searchParams.get("ticker")?.toUpperCase() || "";
+      setWorkspace(data);
+      setSelectedTicker(current=>current||queryTicker||holdings[0]?.ticker?.toUpperCase()||profile.watchlist[0]?.toUpperCase()||data.active_theses[0]?.ticker||"");
+      setJournal({version:journalData.version||"decision-journal-v1",recent_decisions:Array.isArray(journalData.recent_decisions)?journalData.recent_decisions:[],ready_for_review:Array.isArray(journalData.ready_for_review)?journalData.ready_for_review:[],completed_retrospectives:Array.isArray(journalData.completed_retrospectives)?journalData.completed_retrospectives:[],patterns:{reviewed_decisions:journalData.patterns?.reviewed_decisions||0,minimum_sample:journalData.patterns?.minimum_sample||5,status:journalData.patterns?.status||"INSUFFICIENT_SAMPLE",patterns:Array.isArray(journalData.patterns?.patterns)?journalData.patterns.patterns:[]},forecast_calibration:{sample_size:journalData.forecast_calibration?.sample_size||0,brier_score:journalData.forecast_calibration?.brier_score??null,status:journalData.forecast_calibration?.status||"INSUFFICIENT_SAMPLE",message:journalData.forecast_calibration?.message||"Resolved forecasts are insufficient for calibration.",buckets:Array.isArray(journalData.forecast_calibration?.buckets)?journalData.forecast_calibration.buckets:[],methodology:journalData.forecast_calibration?.methodology||"No calibration result without resolved forecasts."}});
+      setPersonalization({version:personalizationData.version||"decision-preferences-v1",explicit:personalizationData.explicit||{},accepted:personalizationData.accepted||{},inferred:Array.isArray(personalizationData.inferred)?personalizationData.inferred:[],dismissed:Array.isArray(personalizationData.dismissed)?personalizationData.dismissed:[],minimum_reviewed_decisions:personalizationData.minimum_reviewed_decisions||5,reviewed_decisions:personalizationData.reviewed_decisions||0});
       const queryDecision = searchParams.get("decision")?.toUpperCase() as DecisionType | null;
       if(queryDecision&&["WATCH","BUY","ADD","HOLD","REDUCE","SELL","AVOID"].includes(queryDecision))setDecisionType(queryDecision);
       const selected = data.active_theses.find(item => item.id === selectedId)
@@ -107,7 +120,32 @@ export function DecisionsPage({
       else if (queryTicker && !selectedId) setForm({ ...EMPTY, ticker: queryTicker });
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not load decisions."); }
     finally { setLoading(false); }
-  }, [request, selectedId]);
+  }, [request, selectedId, holdings, profile.watchlist]);
+
+  const securityUniverse=useMemo(()=>{
+    const source=[...holdings.map(item=>({ticker:item.ticker.toUpperCase(),source:"Holding"})),...profile.watchlist.map(ticker=>({ticker:ticker.toUpperCase(),source:"Watchlist"})),...(workspace?.active_theses||[]).map(item=>({ticker:item.ticker,source:"Thesis"})),...(workspace?.needs_thesis||[]).map(item=>({ticker:item.ticker,source:item.source==="holding"?"Holding":"Watchlist"}))];
+    const unique=new Map<string,{ticker:string;source:string}>();source.forEach(item=>{if(item.ticker&&!unique.has(item.ticker))unique.set(item.ticker,item);});
+    const needle=securitySearch.trim().toUpperCase();return [...unique.values()].filter(item=>!needle||item.ticker.includes(needle)).sort((a,b)=>a.ticker.localeCompare(b.ticker));
+  },[holdings,profile.watchlist,workspace,securitySearch]);
+
+  useEffect(()=>{
+    if(!selectedTicker||!workspace)return;
+    const saved=workspace.active_theses.find(item=>item.ticker===selectedTicker);
+    if(saved)selectThesis(saved);else startThesis(selectedTicker);
+  // Selection intentionally resets the editor to that security's saved state.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[selectedTicker,workspace]);
+
+  useEffect(()=>{
+    if(!selectedTicker)return;
+    let active=true;setIntelligenceLoading(true);setIntelligence({research:null,earnings:null,markets:[],warnings:[]});
+    void Promise.allSettled([
+      request(`/research/search?q=${encodeURIComponent(selectedTicker)}&limit=1`).then(readJson<{results?:SecurityResearch[]}>),
+      request(`/research/${selectedTicker}/earnings`).then(readJson<Record<string,unknown>>),
+      request(`/forecasting/securities/${selectedTicker}/markets`).then(readJson<{markets?:Array<Record<string,unknown>>;warnings?:string[]}>),
+    ]).then(results=>{if(!active)return;const research=results[0].status==="fulfilled"?results[0].value.results?.find(item=>item.ticker===selectedTicker)||null:null;const earnings=results[1].status==="fulfilled"?results[1].value:null;const marketPayload=results[2].status==="fulfilled"?results[2].value:null;const warnings=results.flatMap((item,index)=>item.status==="rejected"?[`${["Stored research","Earnings","Prediction markets"][index]}: ${item.reason instanceof Error?item.reason.message:"unavailable"}`]:[]);setIntelligence({research,earnings,markets:marketPayload?.markets||[],warnings:[...warnings,...(marketPayload?.warnings||[])]});}).finally(()=>{if(active)setIntelligenceLoading(false);});
+    return()=>{active=false};
+  },[request,selectedTicker]);
 
   useEffect(() => {
     const task = window.setTimeout(() => { void load(); }, 0);
@@ -138,7 +176,7 @@ export function DecisionsPage({
     catch (reason) { setError(reason instanceof Error ? reason.message : "Could not mark the thesis reviewed."); }
     finally { setSaving(false); }
   };
-  const updateInference=async(item:DecisionPersonalization["inferred"][number],action:"accept"|"edit"|"dismiss")=>{if(!personalization)return;let accepted={...personalization.accepted};let dismissed=[...personalization.dismissed];if(action==="dismiss")dismissed=Array.from(new Set([...dismissed,item.key]));else{const edited=action==="edit"?window.prompt("Edit this preference before accepting it",item.label):item.label;if(!edited)return;accepted[item.key]={...item,label:edited};}setSaving(true);try{const next=await readJson<DecisionPersonalization>(await request("/personalization",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({explicit:personalization.explicit,accepted,dismissed})}));setPersonalization(next);setNotice("Decision preference updated. Accepted preferences may reorder related evidence, with the reason shown in Today.");}catch(reason){setError(reason instanceof Error?reason.message:"Could not update the preference.");}finally{setSaving(false);}};
+  const updateInference=async(item:DecisionPersonalization["inferred"][number],action:"accept"|"edit"|"dismiss")=>{if(!personalization)return;const accepted={...personalization.accepted};let dismissed=[...personalization.dismissed];if(action==="dismiss")dismissed=Array.from(new Set([...dismissed,item.key]));else{const edited=action==="edit"?window.prompt("Edit this preference before accepting it",item.label):item.label;if(!edited)return;accepted[item.key]={...item,label:edited};}setSaving(true);try{const next=await readJson<DecisionPersonalization>(await request("/personalization",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({explicit:personalization.explicit,accepted,dismissed})}));setPersonalization(next);setNotice("Decision preference updated. Accepted preferences may reorder related evidence, with the reason shown in Today.");}catch(reason){setError(reason instanceof Error?reason.message:"Could not update the preference.");}finally{setSaving(false);}};
 
   const draft = async () => {
     if (!form.ticker.trim()) { setError("Enter a ticker before drafting from research."); return; }
@@ -222,6 +260,14 @@ export function DecisionsPage({
     BREAKER: form.factors.map((item, index) => ({ item, index })).filter(({ item }) => item.factor_type === "BREAKER"),
   };
 
+  const chooseSecurity=(ticker:string)=>{const normalized=ticker.trim().toUpperCase();if(!/^[A-Z][A-Z0-9.-]{0,9}$/.test(normalized)){setError("Enter a valid stock or ETF ticker.");return;}setError("");setSelectedTicker(normalized);setSecuritySearch("");setDecisionChat([]);setDecisionConversationId(null);window.history.replaceState({},"",`/decisions?ticker=${encodeURIComponent(normalized)}`);};
+  const askDecision=async(event:FormEvent)=>{event.preventDefault();const question=decisionQuestion.trim();if(!question||decisionChatBusy||!selectedTicker)return;setDecisionQuestion("");setDecisionChat(items=>[...items,{role:"user",content:question}]);setDecisionChatBusy(true);try{const result=await readJson<{conversation_id?:string;message?:{content?:string}}>(await request("/chat/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question,conversation_id:decisionConversationId,workspace:"research",page_context:{route:`/decisions?ticker=${selectedTicker}`,workspace:"research",entity_type:"security",ticker:selectedTicker,thesis_id:selectedId,enabled_context:["evidence","thesis","portfolio"]}})}));setDecisionConversationId(result.conversation_id||null);setDecisionChat(items=>[...items,{role:"assistant",content:result.message?.content||"No grounded explanation was returned."}]);}catch(reason){setDecisionChat(items=>[...items,{role:"assistant",content:reason instanceof Error?reason.message:"The security discussion is temporarily unavailable."}]);}finally{setDecisionChatBusy(false);}};
+  const research=intelligence.research;
+  const statistics=research?.market_statistics||{};
+  const fundamentals=research?.fundamental_statistics||{};
+  const scenarioText=caseTab==="bull"?form.bull_case:caseTab==="bear"?form.bear_case:form.base_case;
+  const relationshipLabel:Record<ThesisRelationship,string>={OWN:"I own it",CONSIDER:"I’m considering it",WATCH:"I’m watching it",AVOID:"I’m avoiding it"};
+
   return <section className="workspace decisions-workspace">
     <div className="section-intro decisions-intro">
       <div><span className="kicker">Persistent investment memory</span><h2>Remember the decision, the thesis, and what would invalidate it.</h2><p>Company quality and portfolio fit remain separate. Watching—or doing nothing—is a valid recorded decision.</p></div>
@@ -231,6 +277,38 @@ export function DecisionsPage({
     {loading && <div className="panel decisions-empty"><h3>Loading your decision memory…</h3></div>}
     {error && <div className="validation-list" role="alert"><span>{error}</span><button className="secondary" onClick={() => void load()}>Retry</button></div>}
     {notice && <div className="panel decision-notice" role="status"><p>{notice}</p></div>}
+
+    {!loading&&workspace&&<section className="security-decision-cockpit" aria-label="Security decision dashboard">
+      <aside className="panel security-picker">
+        <header><span>Choose a security</span><h3>Holdings and watchlist</h3><p>Select a saved name or search any supported ticker.</p></header>
+        <form onSubmit={event=>{event.preventDefault();chooseSecurity(securitySearch);}}><input aria-label="Search holdings or ticker" value={securitySearch} onChange={event=>setSecuritySearch(event.target.value.toUpperCase())} placeholder="Search AAPL or company ticker"/><button className="secondary">Open{securitySearch?` ${securitySearch}`:""}</button></form>
+        <div className="security-picker-list">{securityUniverse.length?securityUniverse.map(item=><button key={item.ticker} className={selectedTicker===item.ticker?"selected":""} onClick={()=>chooseSecurity(item.ticker)}><strong>{item.ticker}</strong><span>{item.source}</span><small>{workspace.contexts[item.ticker]?.has_open_thesis?"Saved thesis":workspace.contexts[item.ticker]?.latest_decision||"Needs review"}</small></button>):<p>No saved name matches. Press Open to research this ticker.</p>}</div>
+      </aside>
+
+      <div className="security-report">
+        <section className="panel security-report-hero"><div><span>{research?.sector||"Security decision report"}{research?.industry?` · ${research.industry}`:""}</span><h2>{selectedTicker||"Choose a security"} <small>{research?.company||""}</small></h2><p>{research?.bucket_explanation||"Stored evidence will appear here without creating an investment conclusion."}</p></div><div className="relationship-control"><span>How does it fit today?</span><div>{(["OWN","CONSIDER","WATCH","AVOID"] as ThesisRelationship[]).map(value=><button key={value} className={relationship===value?"active":""} onClick={()=>setRelationship(value)}>{relationshipLabel[value]}</button>)}</div></div></section>
+
+        {intelligenceLoading?<section className="panel report-loading"><span/>Loading the stored evidence report…</section>:<>
+          <div className="security-evidence-grid">
+            <article className="panel"><span>Stored research</span><strong>{research?.evidence_bucket||"No stored coverage"}</strong><p>{research?.portfolio_fit||"Portfolio fit has not been calculated for this security."}</p><small>{research?.freshness?.coverage||"Unknown"} coverage · {research?.freshness?.status||"unknown"} freshness</small></article>
+            <article className="panel"><span>Price and risk</span><strong>{typeof statistics.last_price==="number"?money(statistics.last_price):"Price unavailable"}</strong><p>{typeof statistics.return_1y==="number"?`${(statistics.return_1y*100).toFixed(1)}% one-year return`:"One-year return unavailable"} · {typeof statistics.annualized_volatility==="number"?`${(statistics.annualized_volatility*100).toFixed(1)}% volatility`:"volatility unavailable"}</p><small>{research?.freshness?.price_as_of?`Through ${dateLabel(research.freshness.price_as_of)}`:"No verified price date"}</small></article>
+            <article className="panel"><span>Reported fundamentals</span><strong>{typeof fundamentals.revenue==="number"?money(fundamentals.revenue):"Revenue unavailable"}</strong><p>{typeof fundamentals.net_margin==="number"?`${(fundamentals.net_margin*100).toFixed(1)}% net margin`:"Net margin unavailable"} · {typeof fundamentals.free_cash_flow==="number"?`${money(fundamentals.free_cash_flow)} FCF`:"FCF unavailable"}</p><small>{String(fundamentals.fiscal_period||"")} {String(fundamentals.period_end||research?.freshness?.fundamentals_as_of||"No verified period")}</small></article>
+            <article className="panel"><span>Earnings and expectations</span><strong>{String(intelligence.earnings?.status||"Unavailable").replaceAll("_"," ")}</strong><p>{intelligence.earnings&&typeof intelligence.earnings.actual_vs_expectations==="object"?"Reported results and provider-supplied expectations are stored.":"No provider-supplied consensus is stored for this period."}</p><small>Missing consensus is never inferred.</small></article>
+          </div>
+
+          <section className="panel forward-signals"><header><div><span>Forward-looking indicators</span><h3>Earnings events and prediction markets</h3></div><small>{intelligence.markets.length} linked market{intelligence.markets.length===1?"":"s"}</small></header>{intelligence.markets.length?<div>{intelligence.markets.slice(0,6).map((market,index)=>{const probability=(market.probability as Record<string,unknown>|undefined)?.probability;return <article key={String(market.market_id||index)}><strong>{String(market.title||"Linked prediction market")}</strong><span>{typeof probability==="number"?`${(probability*100).toFixed(0)}% market-implied probability`:"Probability unavailable"}</span><small>{String(market.provider||"Stored provider")} · market-implied, not an EagleEyes forecast</small></article>})}</div>:<p>No stored Polymarket, Kalshi, or other prediction market is reliably linked to {selectedTicker}. This remains missing evidence.</p>}</section>
+
+          <section className="panel scenario-report"><header><div><span>One-page thesis report</span><h3>Bull, base, and bear cases</h3></div>{!form.summary&&<button className="primary" disabled={drafting} onClick={()=>void draft()}>{drafting?"Building from stored evidence…":"Build evidence-assisted report"}</button>}</header><div className="scenario-tabs" role="tablist">{(["bear","base","bull"] as const).map(value=><button role="tab" aria-selected={caseTab===value} className={caseTab===value?"active":""} onClick={()=>setCaseTab(value)} key={value}>{value[0].toUpperCase()+value.slice(1)} case</button>)}</div><article className={`scenario-copy ${caseTab}`}><span>{caseTab} case</span><h4>{form.summary||`No reviewed ${selectedTicker} thesis has been saved.`}</h4><p>{scenarioText||"Build an evidence-assisted draft, then review and edit it before treating it as your belief."}</p><div><section><strong>Potential catalysts</strong>{factors.CATALYST.length?factors.CATALYST.slice(0,4).map(({item})=><small key={item.id||item.description}>{item.description}</small>):research?.catalysts?.slice(0,4).map(item=><small key={item.title}>{item.title}</small>)||<small>No supported catalyst stored.</small>}</section><section><strong>Risks and breakers</strong>{[...factors.RISK,...factors.BREAKER].length?[...factors.RISK,...factors.BREAKER].slice(0,4).map(({item})=><small key={item.id||item.description}>{item.description}</small>):research?.thesis_risks?.slice(0,4).map(item=><small key={item}>{item}</small>)||<small>No structured risk stored.</small>}</section></div></article>
+            <details className="report-editor"><summary>{form.summary?"Edit thesis and monitoring rules":"Create and review a thesis"}</summary><form onSubmit={save}><GuidedThesisEditor form={form} setForm={setForm} selected={Boolean(selectedId)} drafting={drafting} saving={saving} stage={guidedStage} setStage={setGuidedStage} relationship={relationship} setRelationship={setRelationship} personalReason={personalReason} setPersonalReason={setPersonalReason} reviewConfirmed={reviewConfirmed} setReviewConfirmed={setReviewConfirmed} onDraft={draft}/></form></details>
+          </section>
+
+          <form className="panel decision-capture" onSubmit={recordDecision}><header><div><span>Decision under review</span><h3>What are you considering for {selectedTicker}?</h3></div><small>Recording is optional and creates an immutable journal entry.</small></header><div className="decision-capture-actions">{(["WATCH","BUY","ADD","HOLD","REDUCE","SELL","AVOID"] as DecisionType[]).map(value=><button type="button" key={value} className={decisionType===value?"active":""} onClick={()=>setDecisionType(value)}>{value}</button>)}</div><div className="decision-capture-fields"><label>Expected outcome<textarea value={expectedOutcome} onChange={event=>setExpectedOutcome(event.target.value)} placeholder="What do you expect by the review date?"/></label><label>Reasoning now<textarea value={decisionNotes} onChange={event=>setDecisionNotes(event.target.value)} placeholder="Why this action—or no action—now?"/></label></div><footer><small>Append-only journal · Price unavailable remains disclosed when no observation exists.</small><button className="primary" disabled={saving}>{saving?"Recording…":`Record ${decisionType}`}</button></footer></form>
+
+          <section className="panel contextual-decision-chat"><header><div><span>Ask about this report</span><h3>Discuss {selectedTicker} with the evidence in view</h3></div><small>Uses stored evidence, saved thesis, and portfolio context</small></header><div className="decision-chat-thread">{decisionChat.length?decisionChat.map((message,index)=><article className={message.role} key={`${message.role}-${index}`}><span>{message.role==="user"?"You":"EagleEyes"}</span><p>{message.content}</p></article>):<div className="chat-prompts">{[`What would make the bear case more likely?`,`How do prediction markets affect this thesis?`,`What evidence is missing before I decide?`].map(question=><button key={question} onClick={()=>setDecisionQuestion(question)}>{question}</button>)}</div>}</div><form onSubmit={askDecision}><textarea value={decisionQuestion} onChange={event=>setDecisionQuestion(event.target.value)} placeholder={`Ask a question about ${selectedTicker}…`}/><button className="primary" disabled={decisionChatBusy||!decisionQuestion.trim()}>{decisionChatBusy?"Reviewing evidence…":"Ask EagleEyes"}</button></form></section>
+          {!!intelligence.warnings.length&&<div className="validation-list">{intelligence.warnings.map(item=><span key={item}>{item}</span>)}</div>}
+        </>}
+      </div>
+    </section>}
 
     {!loading && workspace && <>
       <div className="decision-memory-grid">
