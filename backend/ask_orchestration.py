@@ -17,6 +17,8 @@ class AskPlan:
     intent: str
     tools: tuple[str, ...]
     tickers: tuple[str, ...]
+    confidence: float
+    requires_portfolio: bool
     rationale: str
     limits: dict[str, int]
 
@@ -25,6 +27,20 @@ class AskPlan:
 
 
 _INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("OPPORTUNITY_RANKING", ("strongest opportunities", "opportunities in my portfolio", "best opportunities in my portfolio")),
+    ("THESIS_REPLACEMENT", ("weakest investment thesis", "weakest thesis", "replace it with", "replacement for")),
+    ("PORTFOLIO_CHANGE", ("materially changed in my portfolio", "portfolio since my last review", "portfolio changed since")),
+    ("VALUATION_RANKING", ("most overvalued", "overvalued relative to", "valuation relative to growth")),
+    ("HIDDEN_RISK", ("hidden concentration risk", "across sectors", "correlated companies", "theme concentration")),
+    ("MULTI_SCENARIO", ("what would happen to my portfolio", "interest rates rose", "ai spending slowed", "economy entered a recession")),
+    ("WATCHLIST_COMPARISON", ("watchlist stocks", "watchlist names", "stronger risk-adjusted case")),
+    ("PORTFOLIO_EVENTS", ("upcoming earnings reports", "economic events", "company catalysts", "upcoming catalysts")),
+    ("DATA_QUALITY", ("missing reliable data", "trust their rankings", "data coverage", "missing data")),
+    ("SCORE_ATTRIBUTION", ("score change", "score changed", "inputs contributed", "why did this company")),
+    ("THESIS_INVALIDATION", ("invalidate the thesis", "would invalidate", "largest positions")),
+    ("MULTIFACTOR_SCREEN", ("improving fundamentals", "reasonable valuation", "positive momentum")),
+    ("RECOMMENDATION_COUNTERCASE", ("arguments against", "top recommendation", "bear case against")),
+    ("CASH_ALLOCATION", ("invested new cash", "new cash today", "better than holding cash", "where should it go")),
     ("RETROSPECTIVE", ("why did i", "original decision", "decision journal", "retrospective", "mistakes repeat", "forecast calibration", "my decisions", "saved decisions", "decision history")),
     ("EARNINGS", ("earnings", "guidance", "estimate revision", "reported quarter", "beat estimates", "missed estimates")),
     ("CHANGE", ("what changed", "since last review", "different since", "new evidence", "material change")),
@@ -43,14 +59,18 @@ _INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 def _intent(question: str) -> str:
     lowered = " ".join(question.lower().split())
-    for intent, phrases in _INTENTS:
-        if any(phrase in lowered for phrase in phrases):
-            return intent
+    scored: list[tuple[int, int, str]] = []
+    for order, (intent, phrases) in enumerate(_INTENTS):
+        matched = [phrase for phrase in phrases if phrase in lowered]
+        if matched:
+            scored.append((sum(max(1, len(phrase.split()) - 1) for phrase in matched), -order, intent))
+    if scored:
+        return max(scored)[2]
     return "COMPANY_RESEARCH" if re.search(r"\b[A-Z]{1,5}\b", question) else "GENERAL"
 
 
 def _tickers(question: str, page_context: dict[str, Any] | None, previous: dict[str, Any] | None) -> tuple[str, ...]:
-    stop = {"AI", "ETF", "SEC", "CPI", "GDP", "FED", "USD", "CEO", "WHAT", "WHEN", "WHY", "HOW"}
+    stop = {"I", "A", "AN", "AI", "ETF", "ETFS", "SEC", "CPI", "GDP", "FED", "USD", "CEO", "THE", "WHAT", "WHEN", "WHY", "HOW"}
     found = [value for value in re.findall(r"\b[A-Z]{1,5}\b", question) if value not in stop]
     context_ticker = str((page_context or {}).get("ticker") or "").upper().strip()
     if context_ticker and context_ticker not in found:
@@ -65,6 +85,20 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
     intent = _intent(question)
     tickers = _tickers(question, page_context, previous_analysis)
     mappings = {
+        "OPPORTUNITY_RANKING": ("portfolio_overview",),
+        "THESIS_REPLACEMENT": ("thesis_replacement",),
+        "PORTFOLIO_CHANGE": ("portfolio_change",),
+        "VALUATION_RANKING": ("valuation_ranking",),
+        "HIDDEN_RISK": ("portfolio_intelligence",),
+        "MULTI_SCENARIO": ("portfolio_scenario",),
+        "WATCHLIST_COMPARISON": ("watchlist_comparison",),
+        "PORTFOLIO_EVENTS": ("portfolio_events",),
+        "DATA_QUALITY": ("data_quality",),
+        "SCORE_ATTRIBUTION": ("score_attribution",),
+        "THESIS_INVALIDATION": ("thesis_invalidation",),
+        "MULTIFACTOR_SCREEN": ("multifactor_screen",),
+        "RECOMMENDATION_COUNTERCASE": ("recommendation_countercase",),
+        "CASH_ALLOCATION": ("cash_allocation",),
         "RETROSPECTIVE": ("decision_journal",),
         # Earnings intelligence already joins the latest saved thesis-monitor
         # result for the requested ticker. Running thesis_monitor again only
@@ -92,17 +126,27 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
         tools.append("portfolio_intelligence")
     if intent in {"CHANGE", "EARNINGS", "COMPARISON", "COMPANY_RESEARCH"} and not tickers:
         tools = ["stored_evidence"]
+    portfolio_tools = {
+        "portfolio_overview", "thesis_replacement", "portfolio_change", "valuation_ranking",
+        "portfolio_intelligence", "portfolio_scenario", "watchlist_comparison", "portfolio_events",
+        "data_quality", "score_attribution", "multifactor_screen", "recommendation_countercase",
+        "cash_allocation", "thesis_invalidation", "portfolio_analysis", "portfolio_risk", "security_ranking", "benchmark_outlook",
+    }
     if "portfolio" not in enabled:
-        tools = [tool for tool in tools if tool not in {"portfolio_analysis", "portfolio_intelligence", "portfolio_scenario"}]
+        tools = [tool for tool in tools if tool not in portfolio_tools]
     if "thesis" not in enabled:
         tools = [tool for tool in tools if tool != "thesis_monitor"]
     if "evidence" not in enabled:
         tools = [tool for tool in tools if tool not in {"stored_evidence", "evidence_changes", "company_research", "company_comparison", "earnings_intelligence", "forecasting"}]
     tools = list(dict.fromkeys(tools))[:MAX_TOOL_CALLS]
+    requires_portfolio = bool(set(tools) & portfolio_tools)
+    confidence = 0.98 if intent != "GENERAL" else 0.35
     return AskPlan(
         intent=intent,
         tools=tuple(tools),
         tickers=tickers,
+        confidence=confidence,
+        requires_portfolio=requires_portfolio,
         rationale=f"Selected the smallest approved tool set for {intent.lower().replace('_', ' ')}.",
         limits={"max_tool_calls": MAX_TOOL_CALLS, "max_retries": MAX_RETRIES,
                 "max_replans": MAX_REPLANS, "overall_seconds": OVERALL_BUDGET_SECONDS},

@@ -293,6 +293,24 @@ def initialize() -> None:
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             UNIQUE(user_id, attention_item_id)
         )""",
+        """CREATE TABLE IF NOT EXISTS portfolio_health_snapshots (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, portfolio_id TEXT NOT NULL,
+            snapshot_date TEXT NOT NULL, trigger TEXT NOT NULL, input_hash TEXT NOT NULL,
+            health_score REAL NOT NULL, health_band TEXT NOT NULL, confidence TEXT NOT NULL,
+            coverage REAL NOT NULL, components_json TEXT NOT NULL, holding_metrics_json TEXT NOT NULL,
+            changes_json TEXT NOT NULL, warnings_json TEXT NOT NULL, result_json TEXT NOT NULL,
+            methodology_version TEXT NOT NULL, effective_at TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(user_id,portfolio_id,trigger,input_hash)
+        )""",
+        """CREATE TABLE IF NOT EXISTS portfolio_action_items (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, portfolio_id TEXT NOT NULL,
+            source_key TEXT NOT NULL, source TEXT NOT NULL, action_type TEXT NOT NULL,
+            title TEXT NOT NULL, reason TEXT NOT NULL, payload_json TEXT NOT NULL,
+            priority REAL NOT NULL, state TEXT NOT NULL, active INTEGER NOT NULL,
+            snoozed_until TEXT, note TEXT NOT NULL, first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(user_id,portfolio_id,source_key)
+        )""",
         """CREATE TABLE IF NOT EXISTS alert_preferences (
             user_id TEXT PRIMARY KEY, delivery_mode TEXT NOT NULL, threshold TEXT NOT NULL,
             categories TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -2507,6 +2525,171 @@ def delete_attention_state(user_id: str, attention_item_id: str) -> None:
         )
 
 
+def save_portfolio_health_snapshot(user_id: str, portfolio_id: str | int, result: dict[str, Any],
+                                   trigger: str, snapshot_hash: str) -> dict[str, Any]:
+    now = utc_now()
+    snapshot_id = str(uuid.uuid4())
+    health = result.get("health") or {}
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                """INSERT INTO public.portfolio_health_snapshots(
+                id,user_id,portfolio_id,snapshot_date,trigger,input_hash,health_score,health_band,
+                confidence,coverage,components,holding_metrics,changes,warnings,result,
+                methodology_version,effective_at,created_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(user_id,portfolio_id,trigger,input_hash) DO UPDATE SET
+                effective_at=excluded.effective_at,result=excluded.result,changes=excluded.changes,warnings=excluded.warnings
+                RETURNING id,result,effective_at,trigger,input_hash""",
+                (snapshot_id, user_id, portfolio_id, now[:10], trigger, snapshot_hash,
+                 health.get("score", 0), health.get("band", "Critical"), health.get("confidence", "Low"),
+                 health.get("coverage", 0), _jsonb(health.get("components", {})), _jsonb(result.get("holdings", [])),
+                 _jsonb(result.get("changes", [])), _jsonb(result.get("warnings", [])), _jsonb(result),
+                 result.get("version", "portfolio-health-v1"), result.get("as_of", now), now),
+            ).fetchone()
+        return {"id": str(row["id"]), "result": row["result"], "effective_at": _iso(row["effective_at"]),
+                "trigger": row["trigger"], "input_hash": row["input_hash"]}
+    with sqlite_connection() as conn:
+        conn.execute(
+            """INSERT INTO portfolio_health_snapshots(
+            id,user_id,portfolio_id,snapshot_date,trigger,input_hash,health_score,health_band,confidence,
+            coverage,components_json,holding_metrics_json,changes_json,warnings_json,result_json,
+            methodology_version,effective_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(user_id,portfolio_id,trigger,input_hash) DO UPDATE SET
+            effective_at=excluded.effective_at,result_json=excluded.result_json,
+            changes_json=excluded.changes_json,warnings_json=excluded.warnings_json""",
+            (snapshot_id, user_id, str(portfolio_id), now[:10], trigger, snapshot_hash,
+             health.get("score", 0), health.get("band", "Critical"), health.get("confidence", "Low"),
+             health.get("coverage", 0), json.dumps(health.get("components", {}), default=str),
+             json.dumps(result.get("holdings", []), default=str), json.dumps(result.get("changes", []), default=str),
+             json.dumps(result.get("warnings", []), default=str), json.dumps(result, default=str),
+             result.get("version", "portfolio-health-v1"), result.get("as_of", now), now),
+        )
+        row = conn.execute(
+            "SELECT * FROM portfolio_health_snapshots WHERE user_id=? AND portfolio_id=? AND trigger=? AND input_hash=?",
+            (user_id, str(portfolio_id), trigger, snapshot_hash),
+        ).fetchone()
+    return {"id": row["id"], "result": json.loads(row["result_json"]), "effective_at": row["effective_at"],
+            "trigger": row["trigger"], "input_hash": row["input_hash"]}
+
+
+def portfolio_health_history(user_id: str, portfolio_id: str | int, limit: int = 90,
+                             trigger: str | None = None) -> list[dict[str, Any]]:
+    limit = max(1, min(limit, 365))
+    if DATABASE_URL:
+        params: list[Any] = [user_id, portfolio_id]
+        clause = ""
+        if trigger:
+            clause = " AND trigger=%s"
+            params.append(trigger)
+        params.append(limit)
+        with postgres_connection() as conn:
+            rows = conn.execute(
+                f"""SELECT id,result,effective_at,trigger,input_hash FROM public.portfolio_health_snapshots
+                WHERE user_id=%s AND portfolio_id=%s{clause} ORDER BY effective_at DESC,created_at DESC LIMIT %s""",
+                tuple(params),
+            ).fetchall()
+        return [{"id": str(row["id"]), "result": row["result"], "effective_at": _iso(row["effective_at"]),
+                 "trigger": row["trigger"], "input_hash": row["input_hash"]} for row in rows]
+    params = [user_id, str(portfolio_id)]
+    clause = ""
+    if trigger:
+        clause = " AND trigger=?"
+        params.append(trigger)
+    params.append(limit)
+    with sqlite_connection() as conn:
+        rows = conn.execute(
+            f"""SELECT * FROM portfolio_health_snapshots WHERE user_id=? AND portfolio_id=?{clause}
+            ORDER BY effective_at DESC,created_at DESC LIMIT ?""", tuple(params),
+        ).fetchall()
+    return [{"id": row["id"], "result": json.loads(row["result_json"]), "effective_at": row["effective_at"],
+             "trigger": row["trigger"], "input_hash": row["input_hash"]} for row in rows]
+
+
+def latest_portfolio_health(user_id: str, portfolio_id: str | int) -> dict[str, Any] | None:
+    rows = portfolio_health_history(user_id, portfolio_id, 1)
+    return rows[0] if rows else None
+
+
+def sync_portfolio_actions(user_id: str, portfolio_id: str | int, actions: list[dict[str, Any]]) -> None:
+    now = utc_now()
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            conn.execute("UPDATE public.portfolio_action_items SET active=false,updated_at=%s WHERE user_id=%s AND portfolio_id=%s", (now, user_id, portfolio_id))
+            for item in actions:
+                conn.execute(
+                    """INSERT INTO public.portfolio_action_items(
+                    id,user_id,portfolio_id,source_key,source,action_type,title,reason,payload,priority,
+                    state,active,first_seen_at,last_seen_at,updated_at)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',true,%s,%s,%s)
+                    ON CONFLICT(user_id,portfolio_id,source_key) DO UPDATE SET source=excluded.source,
+                    action_type=excluded.action_type,title=excluded.title,reason=excluded.reason,payload=excluded.payload,
+                    priority=excluded.priority,active=true,last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at""",
+                    (str(uuid.uuid4()), user_id, portfolio_id, item["source_key"], item["source"], item["action"],
+                     item["title"], item["reason"], _jsonb(item), item["priority"], now, now, now),
+                )
+        return
+    with sqlite_connection() as conn:
+        conn.execute("UPDATE portfolio_action_items SET active=0,updated_at=? WHERE user_id=? AND portfolio_id=?", (now, user_id, str(portfolio_id)))
+        for item in actions:
+            conn.execute(
+                """INSERT INTO portfolio_action_items(
+                id,user_id,portfolio_id,source_key,source,action_type,title,reason,payload_json,priority,
+                state,active,snoozed_until,note,first_seen_at,last_seen_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,'OPEN',1,NULL,'',?,?,?)
+                ON CONFLICT(user_id,portfolio_id,source_key) DO UPDATE SET source=excluded.source,
+                action_type=excluded.action_type,title=excluded.title,reason=excluded.reason,payload_json=excluded.payload_json,
+                priority=excluded.priority,active=1,last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at""",
+                (str(uuid.uuid4()), user_id, str(portfolio_id), item["source_key"], item["source"], item["action"],
+                 item["title"], item["reason"], json.dumps(item, default=str), item["priority"], now, now, now),
+            )
+
+
+def portfolio_actions(user_id: str, portfolio_id: str | int, include_inactive: bool = False) -> list[dict[str, Any]]:
+    prefix, placeholder = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    active_clause = "" if include_inactive else " AND active=true" if DATABASE_URL else " AND active=1"
+    with connection() as conn:
+        rows = conn.execute(
+            f"""SELECT * FROM {prefix}portfolio_action_items WHERE user_id={placeholder}
+            AND portfolio_id={placeholder}{active_clause} ORDER BY priority DESC,last_seen_at DESC""",
+            (user_id, str(portfolio_id)),
+        ).fetchall()
+    output = []
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        item = dict(row)
+        payload = item.get("payload") if DATABASE_URL else json.loads(item.get("payload_json") or "{}")
+        snoozed = _iso(item.get("snoozed_until"))
+        state = item["state"]
+        if state == "SNOOZED" and snoozed:
+            try:
+                if datetime.fromisoformat(snoozed.replace("Z", "+00:00")) <= now:
+                    state = "OPEN"
+            except ValueError:
+                pass
+        output.append({**payload, "id": str(item["id"]), "state": state, "active": bool(item["active"]),
+                       "snoozed_until": snoozed, "note": item.get("note") or "",
+                       "first_seen_at": _iso(item["first_seen_at"]), "last_seen_at": _iso(item["last_seen_at"])})
+    return output
+
+
+def save_portfolio_action_state(user_id: str, action_id: str, state: str,
+                                snoozed_until: str | None = None, note: str = "") -> dict[str, Any]:
+    now = utc_now()
+    prefix, placeholder = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    with connection() as conn:
+        row = conn.execute(
+            f"""UPDATE {prefix}portfolio_action_items SET state={placeholder},snoozed_until={placeholder},
+            note={placeholder},updated_at={placeholder} WHERE id={placeholder} AND user_id={placeholder} RETURNING portfolio_id""",
+            (state, snoozed_until, note, now, action_id, user_id),
+        ).fetchone()
+    if row is None:
+        raise KeyError(action_id)
+    return next(item for item in portfolio_actions(user_id, str(row["portfolio_id"]), True) if item["id"] == action_id)
+
+
 def price_history(tickers: list[str], limit_per_ticker: int = 5000) -> list[dict[str, Any]]:
     normalized = sorted({
         ticker.strip().upper() for ticker in tickers
@@ -2589,6 +2772,26 @@ def load_simulation_run(user_id: str, run_id: str) -> dict[str, Any] | None:
         return dict(row["result_summary"]) if row else None
     with sqlite_connection() as conn:
         row = conn.execute("SELECT result_json FROM simulation_runs WHERE id=? AND user_id=?", (run_id, user_id)).fetchone()
+    return json.loads(row["result_json"]) if row else None
+
+
+def latest_simulation_run(user_id: str, portfolio_id: str) -> dict[str, Any] | None:
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                """SELECT result_summary FROM public.simulation_runs
+                   WHERE user_id=%s AND portfolio_id=%s AND status='complete'
+                   ORDER BY created_at DESC LIMIT 1""",
+                (user_id, portfolio_id),
+            ).fetchone()
+        return dict(row["result_summary"]) if row else None
+    with sqlite_connection() as conn:
+        row = conn.execute(
+            """SELECT result_json FROM simulation_runs
+               WHERE user_id=? AND portfolio_id=? AND status='complete'
+               ORDER BY created_at DESC LIMIT 1""",
+            (user_id, portfolio_id),
+        ).fetchone()
     return json.loads(row["result_json"]) if row else None
 
 
@@ -2874,41 +3077,43 @@ def create_conversation(user_id: str, title: str, portfolio_id: str | None = Non
         row = conn.execute(
             """INSERT INTO public.chat_conversations(user_id, portfolio_id, title, workspace)
             VALUES (%s,%s,%s,%s)
-            RETURNING id, title, workspace, summary, summary_message_count, created_at, updated_at""",
+            RETURNING id, portfolio_id, title, workspace, summary, summary_message_count, created_at, updated_at""",
             (user_id, portfolio_id, title[:120], workspace),
         ).fetchone()
     return {**dict(row), "id": str(row["id"]), "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"])}
 
 
-def list_conversations(user_id: str, workspace: str | None = None) -> list[dict[str, Any]]:
+def list_conversations(user_id: str, workspace: str | None = None,
+                       portfolio_id: str | None = None) -> list[dict[str, Any]]:
     workspace_clause = " AND c.workspace=%s" if workspace else ""
-    params: tuple[Any, ...] = (user_id, workspace) if workspace else (user_id,)
+    portfolio_clause = " AND c.portfolio_id=%s" if portfolio_id else ""
+    params: tuple[Any, ...] = tuple(value for value in (user_id, workspace, portfolio_id) if value is not None)
     with postgres_connection() as conn:
         rows = conn.execute(
-            f"""SELECT c.id, c.title, c.workspace, c.summary, c.summary_message_count,
+            f"""SELECT c.id, c.portfolio_id, c.title, c.workspace, c.summary, c.summary_message_count,
                       c.created_at, c.updated_at,
                       (SELECT count(*)::int FROM public.chat_messages m WHERE m.conversation_id=c.id) AS message_count,
                       (SELECT left(m.content, 180) FROM public.chat_messages m
                        WHERE m.conversation_id=c.id ORDER BY m.created_at DESC LIMIT 1) AS last_message_preview,
                       (SELECT count(*)::int FROM public.chat_artifact_links a WHERE a.conversation_id=c.id) AS artifact_count
                FROM public.chat_conversations c
-               WHERE c.user_id=%s{workspace_clause}
+               WHERE c.user_id=%s{workspace_clause}{portfolio_clause}
                ORDER BY c.updated_at DESC LIMIT 50""",
             params,
         ).fetchall()
-    return [{**dict(row), "id": str(row["id"]), "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"])} for row in rows]
+    return [{**dict(row), "id": str(row["id"]), "portfolio_id": str(row["portfolio_id"]) if row.get("portfolio_id") else None, "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"])} for row in rows]
 
 
 def get_conversation(user_id: str, conversation_id: str) -> dict[str, Any]:
     with postgres_connection() as conn:
         row = conn.execute(
-            """SELECT id,title,workspace,summary,summary_message_count,created_at,updated_at
+            """SELECT id,portfolio_id,title,workspace,summary,summary_message_count,created_at,updated_at
                FROM public.chat_conversations WHERE id=%s AND user_id=%s""",
             (conversation_id, user_id),
         ).fetchone()
     if not row:
         raise KeyError(conversation_id)
-    return {**dict(row), "id": str(row["id"]), "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"])}
+    return {**dict(row), "id": str(row["id"]), "portfolio_id": str(row["portfolio_id"]) if row.get("portfolio_id") else None, "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"])}
 
 
 def rename_conversation(user_id: str, conversation_id: str, title: str) -> dict[str, Any]:

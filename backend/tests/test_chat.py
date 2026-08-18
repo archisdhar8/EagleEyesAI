@@ -62,11 +62,18 @@ def test_chat_cleans_partial_answer_without_a_second_request(monkeypatch) -> Non
 
 def test_generic_chat_evidence_uses_bounded_price_history(monkeypatch) -> None:
     calls = []
-    monkeypatch.setattr("backend.chat.database.list_portfolios", lambda user_id: [{
-        "name": "Large", "updated_at": "2026-08-18", "holdings": [
-            {"ticker": f"S{index}"} for index in range(61)
-        ],
-    }])
+    portfolio = {
+            "id": "portfolio-61",
+            "name": "Large", "updated_at": "2026-08-18", "holdings": [
+                {"ticker": f"S{index}"} for index in range(61)
+            ],
+        }
+    monkeypatch.setattr("backend.chat.database.get_portfolio", lambda portfolio_id, user_id: portfolio)
+    monkeypatch.setattr("backend.chat.database.latest_portfolio_health", lambda user_id, portfolio_id: {
+        "result": {"as_of": "2026-08-18", "health": {"score": 68},
+                   "holdings": [{"ticker": f"S{index}"} for index in range(61)],
+                   "actions": [], "changes": [], "warnings": []},
+    })
     monkeypatch.setattr("backend.chat.database.load_profile", lambda user_id: {})
     monkeypatch.setattr("backend.chat.database.latest_scenario_snapshot", lambda: None)
     monkeypatch.setattr("backend.chat.database.latest_analysis", lambda user_id: None)
@@ -76,6 +83,8 @@ def test_generic_chat_evidence_uses_bounded_price_history(monkeypatch) -> None:
     monkeypatch.setattr("backend.chat.macro_factor_dashboard", lambda: {"factors": []})
     monkeypatch.setattr("backend.chat.latest_macro", lambda: {"as_of": "2026-08-18"})
 
-    retrieve_evidence("bounded-history-user", "Explain my portfolio")
+    evidence = retrieve_evidence("bounded-history-user", "Explain my portfolio", "portfolio-61")
 
     assert calls == [([f"S{index}" for index in range(12)], 260)]
+    overview = next(row for row in evidence if row["label"] == "Full cached portfolio intelligence")
+    assert len(overview["data"]["holdings"]) == 61

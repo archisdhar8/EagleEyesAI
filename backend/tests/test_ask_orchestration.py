@@ -106,3 +106,34 @@ def test_previous_analysis_context_reads_latest_structured_message():
         {"role": "assistant", "structured_content": {"analysis_context": {"tickers": ["MSFT", "AMZN"]}}},
     ]
     assert previous_analysis_context(messages)["tickers"] == ["MSFT", "AMZN"]
+
+
+def test_high_impact_portfolio_question_contracts_and_entity_safety():
+    cases = {
+        "What are the three strongest opportunities in my portfolio today, and what evidence supports each one?": "OPPORTUNITY_RANKING",
+        "Which holding has the weakest investment thesis, and what should I replace it with?": "THESIS_REPLACEMENT",
+        "What has materially changed in my portfolio since my last review?": "PORTFOLIO_CHANGE",
+        "Which positions are most overvalued relative to their growth and fundamentals?": "VALUATION_RANKING",
+        "Where am I taking hidden concentration risk across sectors, themes, and correlated companies?": "HIDDEN_RISK",
+        "What would happen to my portfolio if interest rates rose, the economy entered a recession, or AI spending slowed?": "MULTI_SCENARIO",
+        "Which watchlist stocks now have a stronger risk-adjusted case than my existing holdings?": "WATCHLIST_COMPARISON",
+        "What upcoming earnings reports, economic events, or company catalysts could materially affect my portfolio?": "PORTFOLIO_EVENTS",
+        "Which holdings are missing reliable data, and how much should I trust their rankings?": "DATA_QUALITY",
+        "Why did this company’s EagleEyes score change, and which inputs contributed most to the change?": "SCORE_ATTRIBUTION",
+        "What evidence would invalidate the thesis for each of my largest positions?": "THESIS_INVALIDATION",
+        "How should I rebalance the portfolio while minimizing unnecessary turnover, taxes, and trading costs?": "PORTFOLIO_ANALYSIS",
+        "Which companies combine improving fundamentals, reasonable valuation, and positive momentum?": "MULTIFACTOR_SCREEN",
+        "What are the strongest arguments against EagleEyes’ current top recommendation?": "RECOMMENDATION_COUNTERCASE",
+        "If I invested new cash today, where should it go—and why is that better than holding cash?": "CASH_ALLOCATION",
+    }
+    for question, expected_intent in cases.items():
+        plan = build_plan(question, "research", {"portfolio_id": "portfolio-61"})
+        assert plan.intent == expected_intent
+        assert plan.requires_portfolio
+        assert "I" not in plan.tickers
+        assert len(plan.tools) <= MAX_TOOL_CALLS
+
+
+def test_common_uppercase_words_are_not_tickers():
+    plan = build_plan("I use AI and ETF research, and THE SEC heading is visible", "research")
+    assert plan.tickers == ()

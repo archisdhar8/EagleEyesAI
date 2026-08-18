@@ -759,7 +759,7 @@ def test_earnings_fallback_formats_period_values_and_thesis_status() -> None:
     assert "{'fiscal_period'" not in answer
 
 
-def test_company_chat_refreshes_approved_research_and_returns_article_lineage(monkeypatch) -> None:
+def test_company_chat_uses_cached_research_and_returns_article_lineage(monkeypatch) -> None:
     monkeypatch.setattr("backend.main.database.DATABASE_URL", "postgresql://test")
     monkeypatch.setattr("backend.main.database.search_security_master", lambda query, limit=5: {
         "results": [{"ticker": "MU", "name": "Micron Technology, Inc."}] if query.upper() == "MU" else [],
@@ -787,12 +787,13 @@ def test_company_chat_refreshes_approved_research_and_returns_article_lineage(mo
 
     tools, evidence = _company_research_chat_tools("What is the latest outlook for MU and memory pricing?")
 
-    assert refreshed == [(["MU"], 90)]
+    assert refreshed == []
     assert tools[0]["tool_name"] == "company_research_refresh"
     assert tools[0]["status"] == "complete"
     assert tools[0]["summary"]["news"]["article_count"] == 1
     assert tools[0]["summary"]["revenue_growth"] == .18
-    assert evidence[0]["label"] == "MU refreshed company research"
+    assert tools[0]["input_summary"]["cache_only"] is True
+    assert evidence[0]["label"] == "MU cached company research"
     assert evidence[1]["url"] == "https://example.com/mu-outlook"
 
 

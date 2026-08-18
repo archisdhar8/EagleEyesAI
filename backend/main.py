@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import database, ask_orchestration, attention, decision_journal, earnings_intelligence, evidence, forecasting, model_portfolios, portfolio_intelligence, product_preferences, thesis_monitor, theses
+from . import database, ask_orchestration, ask_portfolio, attention, decision_journal, earnings_intelligence, evidence, forecasting, model_portfolios, portfolio_intelligence, portfolio_overview, product_preferences, thesis_monitor, theses
 from .analysis import latest_macro, macro_factor_dashboard, run_analysis, security_research
 from .auth import AuthenticatedUser, optional_user, require_user
 from .chat import ask_gemini, retrieve_evidence
@@ -79,6 +79,7 @@ from .learning import (
 LOGGER = logging.getLogger("eagleeyes.startup")
 _STORAGE_INITIALIZATION: dict[str, str] = {"status": "pending"}
 _HOME_REFRESH_LOCK = threading.Lock()
+ASK_ROUTER_V2_ENABLED = os.getenv("ASK_ROUTER_V2", "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
 def _initialize_remote_storage() -> None:
@@ -181,6 +182,7 @@ class ChatPageContext(BaseModel):
     ticker: str | None = Field(default=None, max_length=10, pattern=r"^[A-Za-z][A-Za-z0-9.-]{0,9}$")
     decision_id: str | None = Field(default=None, max_length=80)
     thesis_id: str | None = Field(default=None, max_length=80)
+    portfolio_id: str | None = Field(default=None, max_length=80)
     enabled_context: list[Literal["evidence", "thesis", "portfolio"]] = Field(
         default_factory=lambda: ["evidence", "thesis", "portfolio"], max_length=3
     )
@@ -220,6 +222,12 @@ class AttentionStateRequest(BaseModel):
     note: str = Field(default="", max_length=500)
 
 
+class PortfolioActionStateRequest(BaseModel):
+    state: Literal["OPEN", "INVESTIGATING", "ACCEPTED", "SNOOZED", "COMPLETED", "DISMISSED"]
+    snoozed_until: datetime | None = None
+    note: str = Field(default="", max_length=1000)
+
+
 class AlertPreferencesRequest(BaseModel):
     delivery_mode: Literal["IN_APP_ONLY"] = "IN_APP_ONLY"
     threshold: Literal["MATERIAL", "CRITICAL_ONLY"] = "MATERIAL"
@@ -251,6 +259,7 @@ def _evidence_type_filter(value: str | None) -> list[evidence.EvidenceType] | No
 class ConversationCreate(BaseModel):
     workspace: Literal["research", "portfolio"]
     title: str = Field(default="New conversation", min_length=1, max_length=120)
+    portfolio_id: str | None = Field(default=None, max_length=80)
 
 
 class ConversationUpdate(BaseModel):
@@ -369,7 +378,8 @@ def overview(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
 
 @app.get("/api/home/briefing")
 @app.get("/api/today/briefing")
-def home_briefing(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+def home_briefing(background_tasks: BackgroundTasks,
+                  user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     # Reuse the compact security bundle loaded below instead of making a
     # second, long-history research query for every saved holding.
     payload = _overview(user, include_research=False)
@@ -470,6 +480,13 @@ def home_briefing(user: AuthenticatedUser = Depends(require_user)) -> dict[str, 
     payload["briefing"] = briefing
     if briefing.get("evidence_state") == "current":
         database.save_briefing_snapshot(user.id, briefing)
+        portfolio_id = (payload.get("portfolio") or {}).get("id")
+        if portfolio_id:
+            nightly = database.portfolio_health_history(user.id, portfolio_id, 1, "NIGHTLY")
+            if not nightly or str(nightly[0].get("effective_at", ""))[:10] != datetime.now(timezone.utc).date().isoformat():
+                background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio_id, "NIGHTLY")
+            elif any(str(item.get("materiality")) in {"CRITICAL", "HIGH"} for item in composed.get("items", [])):
+                background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio_id, "MATERIAL_EVENT")
     return payload
 
 
@@ -638,14 +655,20 @@ def portfolios(user: AuthenticatedUser = Depends(require_user)) -> list[dict[str
 
 
 @app.post("/api/portfolios")
-def create_portfolio(payload: PortfolioPayload, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    return database.save_portfolio(payload.name, [item.model_dump(mode="json") for item in payload.holdings], user_id=user.id)
+def create_portfolio(payload: PortfolioPayload, background_tasks: BackgroundTasks,
+                     user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    portfolio = database.save_portfolio(payload.name, [item.model_dump(mode="json") for item in payload.holdings], user_id=user.id)
+    background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio["id"], "PORTFOLIO_CHANGE")
+    return portfolio
 
 
 @app.put("/api/portfolios/{portfolio_id}")
-def update_portfolio(portfolio_id: str, payload: PortfolioPayload, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+def update_portfolio(portfolio_id: str, payload: PortfolioPayload, background_tasks: BackgroundTasks,
+                     user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     try:
-        return database.save_portfolio(payload.name, [item.model_dump(mode="json") for item in payload.holdings], portfolio_id, user.id)
+        portfolio = database.save_portfolio(payload.name, [item.model_dump(mode="json") for item in payload.holdings], portfolio_id, user.id)
+        background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio_id, "PORTFOLIO_CHANGE")
+        return portfolio
     except KeyError as exc:
         raise HTTPException(404, "Portfolio not found") from exc
 
@@ -659,13 +682,15 @@ def activate_portfolio(portfolio_id: str, user: AuthenticatedUser = Depends(requ
 
 
 @app.post("/api/portfolios/import")
-def import_portfolio(payload: CsvImport, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+def import_portfolio(payload: CsvImport, background_tasks: BackgroundTasks,
+                     user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     try:
         result = parse_portfolio_csv(payload.csv_text, payload.name)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     holdings = result["holdings"]
     portfolio = database.save_portfolio(payload.name, holdings, user_id=user.id)
+    background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio["id"], "PORTFOLIO_CHANGE")
     return {
         "portfolio": portfolio,
         "validated_rows": len(holdings),
@@ -711,6 +736,129 @@ def portfolio_diagnostics(
     user: AuthenticatedUser = Depends(require_user),
 ) -> dict[str, Any]:
     return _portfolio_intelligence_payload(user.id, portfolio_id)
+
+
+def _portfolio_overview_response(user_id: str, portfolio_id: str | int, snapshot: dict[str, Any]) -> dict[str, Any]:
+    result = dict(snapshot.get("result") or {})
+    result["snapshot_id"] = snapshot.get("id")
+    result["actions"] = database.portfolio_actions(user_id, portfolio_id)
+    history = database.portfolio_health_history(user_id, portfolio_id, 90)
+    result["history"] = [{
+        "id": row["id"], "effective_at": row["effective_at"], "trigger": row["trigger"],
+        "score": (row.get("result") or {}).get("health", {}).get("score"),
+        "band": (row.get("result") or {}).get("health", {}).get("band"),
+        "changes": (row.get("result") or {}).get("changes", []),
+    } for row in history]
+    return result
+
+
+def _calculate_portfolio_overview(user_id: str, portfolio_id: str | int,
+                                  trigger: str = "MANUAL") -> dict[str, Any]:
+    portfolio = database.get_portfolio(portfolio_id, user_id)
+    holdings = portfolio.get("holdings", [])
+    tickers = [str(row.get("ticker") or "").upper() for row in holdings if str(row.get("ticker") or "").upper() != "CASH"]
+    security_bundle = database.security_data(tickers, price_limit=1300) if tickers else {"securities": [], "fundamentals": [], "prices": [], "news": [], "company_markets": []}
+    research = security_research(tickers, price_limit=1300, stored=security_bundle)
+    thesis_workspace = theses.workspace(user_id, holdings, [])
+    active_theses = thesis_workspace.get("active_theses", [])
+    monitors = thesis_monitor.latest_results(user_id, [str(row["id"]) for row in active_theses])
+    diagnostics = build_portfolio_diagnostics(holdings, security_bundle, {"funds": [], "holdings": []}) if holdings else {
+        "sector_exposure": [], "industry_exposure": [], "marginal_risk": {"status": "unavailable", "positions": []},
+        "performance_label": "Unavailable without saved holdings", "warnings": [],
+    }
+    diagnostics["intelligence"] = portfolio_intelligence.build_portfolio_intelligence(
+        holdings=holdings, security_data=security_bundle, diagnostics=diagnostics, theses=active_theses,
+        monitor_results=monitors, forecasting={"markets": []}, events=[], scenario_outcomes=[],
+    )
+    profile = database.load_profile(user_id) or InvestorProfile().model_dump(mode="json")
+    policy = database.load_investment_policy(user_id) or InvestmentPolicy().model_dump(mode="json")
+    goals = database.list_goals(user_id)
+    guidance = build_guidance(
+        holdings, goals, policy, research, database.provider_data_status(), [],
+        database.latest_monitoring_run(), profile,
+    )
+    portfolios = database.list_portfolios(user_id)
+    latest_briefing = database.latest_briefing_snapshot(user_id) if portfolios and str(portfolios[0].get("id")) == str(portfolio_id) else None
+    attention_items = (latest_briefing or {}).get("attention", [])
+    previous_nightly_rows = database.portfolio_health_history(user_id, portfolio_id, 1, "NIGHTLY")
+    previous_nightly = (previous_nightly_rows[0].get("result") if previous_nightly_rows else None)
+    input_payload = {
+        "portfolio": portfolio, "research": research, "diagnostics": diagnostics,
+        "theses": active_theses, "monitors": monitors, "guidance": guidance,
+        "attention": [{key: row.get(key) for key in ("id", "group_key", "materiality", "urgency", "affected", "occurred_at")} for row in attention_items],
+        "version": portfolio_overview.VERSION,
+    }
+    result = portfolio_overview.build_portfolio_overview(
+        portfolio=portfolio, diagnostics=diagnostics, research=research, theses=active_theses,
+        monitors=monitors, decisions=thesis_workspace.get("recent_decisions", []), attention_items=attention_items,
+        guidance=guidance, previous_nightly=previous_nightly, trigger=trigger,
+    )
+    watchlist = list(dict.fromkeys(str(value).upper() for value in profile.get("watchlist", []) if value))[:40]
+    watchlist_bundle = database.security_data(watchlist, price_limit=260) if watchlist else {"securities": [], "fundamentals": [], "prices": [], "news": [], "company_markets": []}
+    watchlist_research = security_research(watchlist, price_limit=260, stored=watchlist_bundle) if watchlist else []
+    latest_simulation = database.latest_simulation_run(user_id, str(portfolio_id))
+    latest_optimizer = database.latest_analysis(user_id, portfolio_id)
+    result["ask_cache"] = {
+        "watchlist_research": watchlist_research,
+        "latest_simulation": latest_simulation,
+        "latest_optimizer": latest_optimizer,
+        "events": list((latest_briefing or {}).get("upcoming_events") or [])[:30],
+        "scenarios": list((latest_briefing or {}).get("scenarios") or [])[:12],
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    snapshot = database.save_portfolio_health_snapshot(
+        user_id, portfolio_id, result, trigger, portfolio_overview.input_hash(input_payload),
+    )
+    database.sync_portfolio_actions(user_id, portfolio_id, result.get("actions", []))
+    return _portfolio_overview_response(user_id, portfolio_id, snapshot)
+
+
+def _recalculate_portfolio_overview_safely(user_id: str, portfolio_id: str | int, trigger: str) -> None:
+    try:
+        _calculate_portfolio_overview(user_id, portfolio_id, trigger)
+    except Exception as exc:
+        record_metric("portfolio.overview.refresh.failure", tags={"error_type": type(exc).__name__, "trigger": trigger})
+        LOGGER.warning("Portfolio overview refresh failed for %s: %s", portfolio_id, type(exc).__name__)
+
+
+@app.get("/api/portfolios/{portfolio_id}/overview")
+def get_portfolio_overview(portfolio_id: str, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        database.get_portfolio(portfolio_id, user.id)
+    except KeyError as exc:
+        raise HTTPException(404, "Portfolio not found") from exc
+    cached = database.latest_portfolio_health(user.id, portfolio_id)
+    return _portfolio_overview_response(user.id, portfolio_id, cached) if cached else _calculate_portfolio_overview(user.id, portfolio_id, "MANUAL")
+
+
+@app.post("/api/portfolios/{portfolio_id}/overview/recalculate")
+def recalculate_portfolio_overview(portfolio_id: str, background_tasks: BackgroundTasks,
+                                   user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    try:
+        database.get_portfolio(portfolio_id, user.id)
+    except KeyError as exc:
+        raise HTTPException(404, "Portfolio not found") from exc
+    cached = database.latest_portfolio_health(user.id, portfolio_id)
+    if cached:
+        background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio_id, "MANUAL")
+        response = _portfolio_overview_response(user.id, portfolio_id, cached)
+        response["refresh_queued"] = True
+        return response
+    return _calculate_portfolio_overview(user.id, portfolio_id, "MANUAL")
+
+
+@app.put("/api/portfolio-actions/{action_id}/state")
+def update_portfolio_action_state(action_id: str, payload: PortfolioActionStateRequest,
+                                  user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    if payload.state == "SNOOZED" and payload.snoozed_until is None:
+        raise HTTPException(422, "snoozed_until is required when snoozing an action")
+    try:
+        return database.save_portfolio_action_state(
+            user.id, action_id, payload.state,
+            payload.snoozed_until.isoformat() if payload.snoozed_until else None, payload.note,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, "Portfolio action not found") from exc
 
 
 @app.get("/api/research/{ticker}/earnings")
@@ -2155,15 +2303,21 @@ def macro_factors(_: AuthenticatedUser = Depends(require_user)) -> dict[str, Any
 
 @app.get("/api/chat/conversations")
 def conversations(workspace: Literal["research", "portfolio"] | None = None,
+                  portfolio_id: str | None = None,
                   user: AuthenticatedUser = Depends(require_user)) -> list[dict[str, Any]]:
-    return database.list_conversations(user.id, workspace)
+    return (database.list_conversations(user.id, workspace, portfolio_id) if portfolio_id
+            else database.list_conversations(user.id, workspace))
 
 
 @app.post("/api/chat/conversations", status_code=201)
 def create_chat_conversation(payload: ConversationCreate,
                              user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    portfolio = (database.list_portfolios(user.id) or [{}])[0]
-    return database.create_conversation(user.id, payload.title, portfolio.get("id"), payload.workspace)
+    if payload.portfolio_id:
+        try:
+            database.get_portfolio(payload.portfolio_id, user.id)
+        except KeyError as exc:
+            raise HTTPException(404, "Portfolio not found") from exc
+    return database.create_conversation(user.id, payload.title, payload.portfolio_id, payload.workspace)
 
 
 @app.get("/api/chat/conversations/{conversation_id}")
@@ -2317,19 +2471,12 @@ def _company_research_chat_tools(question: str) -> tuple[list[dict[str, Any]], l
         from .operational_monitoring import record_metric
         record_metric("chat.company_research_cache_hit")
         return cached
-    before = {row["ticker"]: row for row in security_research(tickers)}
-    refresh_tickers = [
-        ticker for ticker in tickers
-        if before.get(ticker, {}).get("price") is None
-        or (_evidence_age_days(before.get(ticker, {}).get("price_as_of")) or 999) > 3
-        or before.get(ticker, {}).get("fundamentals_as_of") is None
-        or before.get(ticker, {}).get("latest_news") is None
-    ]
-    refresh_result = {"providers": {}, "warnings": []}
-    if refresh_tickers:
-        refresh_result = refresh_security_evidence(refresh_tickers, news_lookback_days=90)
-    rows = {row["ticker"]: row for row in security_research(tickers)}
-    raw = database.security_data(tickers, price_limit=10) if database.DATABASE_URL else {"news": []}
+    raw = database.security_data(tickers, price_limit=260) if database.DATABASE_URL else {"news": []}
+    try:
+        stored_rows = security_research(tickers, price_limit=260, stored=raw)
+    except TypeError:  # Compatibility for injected/test research adapters.
+        stored_rows = security_research(tickers)
+    rows = {row["ticker"]: row for row in stored_rows}
     news_by_ticker: dict[str, list[dict[str, Any]]] = {}
     for item in raw.get("news", []):
         news_by_ticker.setdefault(str(item.get("ticker", "")).upper(), []).append(item)
@@ -2347,24 +2494,24 @@ def _company_research_chat_tools(question: str) -> tuple[list[dict[str, Any]], l
         ) if row.get(key) is None]
         if not articles:
             missing.append("recent company news")
-        warnings = [*refresh_result.get("warnings", [])]
+        warnings = []
         if missing:
             warnings.append(f"Missing: {', '.join(missing)}.")
         tool = {
             "tool_name": "company_research_refresh", "status": "partial" if warnings else "complete", "title": f"{ticker} company evidence", "ticker": ticker,
-            "input_summary": {"news_lookback_days": 90, "refresh_performed": ticker in refresh_tickers},
+            "input_summary": {"news_lookback_days": 90, "cache_only": True, "refresh_queued": bool(missing)},
             "summary": {
                 "company": row.get("company") or ticker, "price": row.get("price"), "price_as_of": row.get("price_as_of"),
                 "fundamentals_as_of": row.get("fundamentals_as_of"), "revenue_growth": row.get("revenue_growth"),
                 "net_margin": row.get("net_margin"), "valuation": row.get("valuation_evidence") or {},
                 "market_statistics": row.get("market_statistics") or {}, "component_coverage": row.get("component_coverage") or {},
                 "news": {"article_count": len(articles), "articles": article_summaries},
-                "warnings": warnings, "model_version": "company-chat-research-v1",
+                "warnings": warnings, "model_version": "company-chat-research-v2-cached",
             },
         }
         tools.append(tool)
         evidence.append({
-            "label": f"{ticker} refreshed company research", "as_of": row.get("price_as_of") or row.get("fundamentals_as_of"),
+            "label": f"{ticker} cached company research", "as_of": row.get("price_as_of") or row.get("fundamentals_as_of"),
             "url": row.get("fundamental_statistics", {}).get("source") or row.get("source"),
             "data": {key: row.get(key) for key in (
                 "ticker", "company", "sector", "industry", "price", "price_as_of", "fundamentals_as_of", "revenue_growth",
@@ -2408,26 +2555,27 @@ def _simulation_scenario_from_question(question: str) -> dict[str, Any]:
     return {"economic_state": economic, "inflation_state": inflation, "rate_state": rates, "shocks": shocks}
 
 
-def _portfolio_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _portfolio_chat_tools(user_id: str, question: str, portfolio_id: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Route portfolio questions to a small allowlist of deterministic, read-only tools."""
     lowered = question.lower()
     tool_results: list[dict[str, Any]] = []
     tool_evidence: list[dict[str, Any]] = []
     portfolios = database.list_portfolios(user_id)
-    active_portfolio = portfolios[0] if portfolios else None
+    active_portfolio = (database.get_portfolio(portfolio_id, user_id) if portfolio_id
+                        else next(iter(database.list_portfolios(user_id)), None))
     analysis: dict[str, Any] | None = None
     simulation_requested = any(term in lowered for term in (
         "simulate", "simulation", "what if", "stress test", "market falls", "market fell",
         "drawdown scenario", "recession scenario", "oil shock", "credit shock",
     ))
     if simulation_requested:
-        if not portfolios or not portfolios[0].get("holdings"):
+        if not active_portfolio or not active_portfolio.get("holdings"):
             tool_results.append({
                 "tool_name": "portfolio_decision_lab", "status": "failed", "title": "Portfolio simulation",
                 "error": "Save at least one supported holding before running a portfolio simulation.",
             })
         else:
-            portfolio = portfolios[0]
+            portfolio = active_portfolio
             try:
                 simulation_input = SimulationRunInput.model_validate({
                     "portfolio_id": portfolio.get("id"),
@@ -2565,10 +2713,11 @@ def _portfolio_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, A
     return tool_results, tool_evidence
 
 
-def _security_ranking_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _security_ranking_chat_tools(user_id: str, question: str, portfolio_id: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Rank only the user's disclosed holdings using deterministic stored research evidence."""
-    portfolios = database.list_portfolios(user_id)
-    holdings = portfolios[0].get("holdings", []) if portfolios else []
+    portfolio = (database.get_portfolio(portfolio_id, user_id) if portfolio_id
+                 else next(iter(database.list_portfolios(user_id)), None))
+    holdings = portfolio.get("holdings", []) if portfolio else []
     tickers = list(dict.fromkeys(
         str(item.get("ticker", "")).upper() for item in holdings
         if item.get("ticker") and str(item.get("ticker", "")).upper() != "CASH"
@@ -2615,10 +2764,11 @@ def _security_ranking_chat_tools(user_id: str, question: str) -> tuple[list[dict
     return [tool], [evidence_row]
 
 
-def _benchmark_outlook_chat_tools(user_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _benchmark_outlook_chat_tools(user_id: str, portfolio_id: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Compare saved holdings with SPY using the existing bounded research model."""
-    portfolios = database.list_portfolios(user_id)
-    holdings = list((portfolios[0] if portfolios else {}).get("holdings") or [])
+    portfolio = (database.get_portfolio(portfolio_id, user_id) if portfolio_id
+                 else next(iter(database.list_portfolios(user_id)), None))
+    holdings = list((portfolio or {}).get("holdings") or [])
     tickers = list(dict.fromkeys(
         str(item.get("ticker") or "").upper() for item in holdings
         if item.get("ticker") and str(item.get("ticker") or "").upper() not in {"CASH", "SPY"}
@@ -2662,10 +2812,10 @@ def _benchmark_outlook_chat_tools(user_id: str) -> tuple[list[dict[str, Any]], l
     return [result], [evidence]
 
 
-def _portfolio_risk_chat_tools(user_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Summarize saved position-size risks without provider or market-data latency."""
-    portfolios = database.list_portfolios(user_id)
-    portfolio = portfolios[0] if portfolios else None
+    portfolio = (database.get_portfolio(portfolio_id, user_id) if portfolio_id
+                 else next(iter(database.list_portfolios(user_id)), None))
     holdings = list((portfolio or {}).get("holdings") or [])
     if not holdings:
         return [{"tool_name": "portfolio_risk", "status": "unavailable", "title": "Saved portfolio risks",
@@ -3208,7 +3358,9 @@ def _comparison_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, 
     ]
 
 
-def _execute_ask_tool(tool: str, user_id: str, question: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _execute_ask_tool(tool: str, user_id: str, question: str,
+                      portfolio_id: str | None = None,
+                      tickers: tuple[str, ...] = ()) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     triggers = {
         "company_research": "",
         "evidence_changes": " what changed",
@@ -3221,8 +3373,17 @@ def _execute_ask_tool(tool: str, user_id: str, question: str) -> tuple[list[dict
         "decision_journal": " decision journal retrospective",
     }
     routed_question = question + triggers.get(tool, "")
+    cached_portfolio_tools = {
+        "portfolio_overview", "thesis_replacement", "portfolio_change", "valuation_ranking",
+        "portfolio_intelligence", "portfolio_scenario", "watchlist_comparison", "portfolio_events",
+        "data_quality", "score_attribution", "multifactor_screen", "recommendation_countercase",
+        "cash_allocation", "thesis_invalidation",
+    }
+    if tool in cached_portfolio_tools:
+        return ask_portfolio.run("thesis_monitor" if tool == "thesis_invalidation" else tool, user_id, portfolio_id, question, tickers)
     if tool == "stored_evidence":
-        return [{"tool_name": tool, "status": "complete", "title": "Stored evidence"}], retrieve_evidence(user_id, question)
+        stored = retrieve_evidence(user_id, question, portfolio_id) if portfolio_id else retrieve_evidence(user_id, question)
+        return [{"tool_name": tool, "status": "complete", "title": "Stored evidence"}], stored
     if tool == "company_research":
         return _company_research_chat_tools(routed_question)
     if tool == "evidence_changes":
@@ -3238,26 +3399,28 @@ def _execute_ask_tool(tool: str, user_id: str, question: str) -> tuple[list[dict
         wanted = "earnings_intelligence" if tool == "earnings_intelligence" else "portfolio_intelligence"
         return [item for item in tools if item.get("tool_name") == wanted], grounded
     if tool == "portfolio_scenario":
-        return _portfolio_chat_tools(user_id, routed_question)
+        return _portfolio_chat_tools(user_id, routed_question, portfolio_id)
     if tool == "portfolio_analysis":
-        return _portfolio_chat_tools(user_id, routed_question)
+        return _portfolio_chat_tools(user_id, routed_question, portfolio_id)
     if tool == "portfolio_risk":
-        return _portfolio_risk_chat_tools(user_id)
+        return _portfolio_risk_chat_tools(user_id, portfolio_id)
     if tool == "decision_journal":
         return _decision_journal_chat_tools(user_id, routed_question)
     if tool == "company_comparison":
         return _comparison_chat_tools(user_id, routed_question)
     if tool == "security_ranking":
-        return _security_ranking_chat_tools(user_id, routed_question)
+        return _security_ranking_chat_tools(user_id, routed_question, portfolio_id)
     if tool == "benchmark_outlook":
-        return _benchmark_outlook_chat_tools(user_id)
+        return _benchmark_outlook_chat_tools(user_id, portfolio_id)
     return [{"tool_name": tool, "status": "unavailable", "title": tool.replace("_", " ").title()}], []
 
 
-def _instrumented_ask_tool(tool: str, user_id: str, question: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _instrumented_ask_tool(tool: str, user_id: str, question: str,
+                           portfolio_id: str | None = None,
+                           tickers: tuple[str, ...] = ()) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     started=time.monotonic()
     try:
-        result=_execute_ask_tool(tool,user_id,question)
+        result=_execute_ask_tool(tool,user_id,question,portfolio_id,tickers)
         record_metric("ask.tool.success", tags={"tool":tool})
         return result
     except Exception:
@@ -3269,6 +3432,7 @@ def _instrumented_ask_tool(tool: str, user_id: str, question: str) -> tuple[list
 
 def _execute_chat_plan_tools(
     tools: tuple[str, ...], user_id: str, question: str, started: float,
+    portfolio_id: str | None = None, tickers: tuple[str, ...] = (),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Execute a chat plan without orphaned background analysis threads.
 
@@ -3305,7 +3469,10 @@ def _execute_chat_plan_tools(
                 execution_steps.append({"tool_name": tool, "state": "FAILED"})
                 continue
             try:
-                results, grounded = _instrumented_ask_tool(tool, user_id, question)
+                if portfolio_id or tickers:
+                    results, grounded = _instrumented_ask_tool(tool, user_id, question, portfolio_id, tickers)
+                else:
+                    results, grounded = _instrumented_ask_tool(tool, user_id, question)
                 if not results:
                     results = [{
                         "tool_name": tool, "status": "unavailable",
@@ -3385,31 +3552,58 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
     if not database.DATABASE_URL:
         raise HTTPException(503, "Chat history requires Supabase storage")
     conversation_id = payload.conversation_id
-    if conversation_id is None:
-        portfolio = (database.list_portfolios(user.id) or [{}])[0]
-        workspace = payload.workspace if payload.workspace in {"research", "portfolio"} else "research"
-        created = database.create_conversation(user.id, payload.question[:72], portfolio.get("id"), workspace)
-        conversation_id = created["id"]
-    try:
-        conversation_meta = database.get_conversation(user.id, conversation_id)
-    except KeyError as exc:
-        raise HTTPException(404, "Conversation not found") from exc
-    if payload.workspace in {"research", "portfolio"} and conversation_meta.get("workspace") != payload.workspace:
-        raise HTTPException(409, "This conversation belongs to a different workspace")
-    history = database.conversation_messages(user.id, conversation_id)
-    if not history and str(conversation_meta.get("title", "")).lower().startswith("new conversation"):
-        conversation_meta = database.rename_conversation(user.id, conversation_id, payload.question[:72])
     page_context = payload.page_context.model_dump(mode="json", exclude_none=True) if payload.page_context else {}
+    requested_portfolio_id = str(page_context.get("portfolio_id") or "").strip() or None
+    conversation_meta: dict[str, Any] | None = None
+    history: list[dict[str, Any]] = []
+    if conversation_id is not None:
+        try:
+            conversation_meta = database.get_conversation(user.id, conversation_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Conversation not found") from exc
+        if payload.workspace in {"research", "portfolio"} and conversation_meta.get("workspace") != payload.workspace:
+            raise HTTPException(409, "This conversation belongs to a different workspace")
+        bound_portfolio_id = conversation_meta.get("portfolio_id")
+        if requested_portfolio_id and bound_portfolio_id and requested_portfolio_id != bound_portfolio_id:
+            raise HTTPException(409, "This conversation belongs to a different portfolio. Start or restore that portfolio's conversation.")
+        requested_portfolio_id = requested_portfolio_id or bound_portfolio_id
+        history = database.conversation_messages(user.id, conversation_id)
     previous_context = ask_orchestration.previous_analysis_context(history)
     plan = ask_orchestration.build_plan(payload.question, payload.workspace, page_context, previous_context)
-    record_metric("ask.intent", tags={"intent": plan.intent, "tool_count": len(plan.tools)})
-    routed_question = " ".join([payload.question, *plan.tickers]).strip()
+    if not ASK_ROUTER_V2_ENABLED and plan.intent in {
+        "OPPORTUNITY_RANKING", "THESIS_REPLACEMENT", "PORTFOLIO_CHANGE", "VALUATION_RANKING",
+        "HIDDEN_RISK", "MULTI_SCENARIO", "WATCHLIST_COMPARISON", "PORTFOLIO_EVENTS",
+        "DATA_QUALITY", "SCORE_ATTRIBUTION", "THESIS_INVALIDATION", "MULTIFACTOR_SCREEN",
+        "RECOMMENDATION_COUNTERCASE", "CASH_ALLOCATION",
+    }:
+        plan = ask_orchestration.build_plan("general portfolio evidence", payload.workspace, page_context, previous_context)
+    if plan.requires_portfolio and not requested_portfolio_id:
+        raise HTTPException(422, "Select a portfolio before asking a portfolio-specific question.")
+    if requested_portfolio_id:
+        try:
+            database.get_portfolio(requested_portfolio_id, user.id)
+        except KeyError as exc:
+            raise HTTPException(404, "Selected portfolio not found") from exc
+    if conversation_id is None:
+        workspace = payload.workspace if payload.workspace in {"research", "portfolio"} else "research"
+        conversation_meta = database.create_conversation(
+            user.id, payload.question[:72], requested_portfolio_id, workspace,
+        )
+        conversation_id = str(conversation_meta["id"])
+    assert conversation_meta is not None
+    if not history and str(conversation_meta.get("title", "")).lower().startswith("new conversation"):
+        conversation_meta = database.rename_conversation(user.id, conversation_id, payload.question[:72])
+    page_context["portfolio_id"] = requested_portfolio_id
+    record_metric("ask.intent", tags={"intent": plan.intent, "tool_count": len(plan.tools),
+                                       "confidence": plan.confidence, "portfolio_id": requested_portfolio_id or "none"})
+    routed_question = payload.question
     database.save_chat_message(user.id, conversation_id, "user", payload.question,
-                               {"page_context": page_context, "planned_intent": plan.intent})
+                               {"page_context": page_context, "planned_intent": plan.intent,
+                                "route_confidence": plan.confidence})
     started = time.monotonic()
     tool_started = started
     tool_results, evidence_rows, execution_steps = _execute_chat_plan_tools(
-        plan.tools, user.id, routed_question, started,
+        plan.tools, user.id, routed_question, started, requested_portfolio_id, plan.tickers,
     )
     tools_elapsed = time.monotonic() - tool_started
     # Keep the grounded prompt bounded even when several securities each have
@@ -3438,7 +3632,7 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
     if any(step["state"] in {"PARTIAL","FAILED"} for step in execution_steps):
         record_metric("ask.partial", tags={"intent":plan.intent})
     narration_started = time.monotonic()
-    deterministic_answer = _deterministic_chat_answer(plan.intent, tool_results)
+    deterministic_answer = ask_portfolio.compose(plan.intent, tool_results) or _deterministic_chat_answer(plan.intent, tool_results)
     # Earnings questions ask for interpretation ("what changed" and thesis
     # impact), not merely a dump of stored fields. Use Gemini when configured,
     # while retaining the polished deterministic answer as a zero-latency and
@@ -3466,7 +3660,11 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
                                        "total_seconds": round(time.monotonic() - started, 3)}},
         "page_context": page_context,
         "analysis_context": {"intent": plan.intent, "tickers": list(plan.tickers),
-                             "tool_names": [item.get("tool_name") for item in tool_results]},
+                             "portfolio_id": requested_portfolio_id, "route_confidence": plan.confidence,
+                             "tool_names": [item.get("tool_name") for item in tool_results],
+                             "cache_hit": True, "evidence_coverage": len(evidence),
+                             "answer_complete": deterministic_answer is not None,
+                             "router_version": "v2" if ASK_ROUTER_V2_ENABLED else "v1"},
         "actions": ask_orchestration.actions_for(plan, page_context),
         "grounding": {"categories": ["VERIFIED_FACT", "MODEL_OUTPUT", "MARKET_IMPLIED", "USER_BELIEF", "AI_INTERPRETATION"],
                       "tool_claim_types": {item.get("tool_name"): claim_types.get(str(item.get("tool_name")), "VERIFIED_FACT") for item in tool_results}},

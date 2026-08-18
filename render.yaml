@@ -21,6 +21,8 @@ services:
         sync: false
       - key: CHAT_ANALYSIS_CONCURRENCY
         value: "1"
+      - key: ASK_ROUTER_V2
+        value: "1"
       - key: OPENBLAS_NUM_THREADS
         value: "1"
       - key: OMP_NUM_THREADS

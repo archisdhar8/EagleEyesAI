@@ -88,6 +88,8 @@ EXPECTED_TABLES = {
     "briefing_snapshots",
     "user_attention_dismissals",
     "attention_item_states",
+    "portfolio_health_snapshots",
+    "portfolio_action_items",
     "alert_preferences",
     "alert_events",
     "decision_preferences",

@@ -26,15 +26,15 @@ def _ticker_candidates(question: str, available: list[str]) -> list[str]:
     return selected or available[:12]
 
 
-def retrieve_evidence(user_id: str, question: str) -> list[dict[str, Any]]:
-    cache_key = f"{user_id}:{' '.join(question.lower().split())[:300]}"
+def retrieve_evidence(user_id: str, question: str, portfolio_id: str | None = None) -> list[dict[str, Any]]:
+    cache_key = f"{user_id}:{portfolio_id or 'general'}:{' '.join(question.lower().split())[:300]}"
     cached = _EVIDENCE_CACHE.get(cache_key)
     if cached is not None:
         record_metric("chat.evidence_cache_hit")
         return cached
     portfolios = database.list_portfolios(user_id)
     profile = database.load_profile(user_id) or {}
-    portfolio = portfolios[0] if portfolios else {"holdings": []}
+    portfolio = database.get_portfolio(portfolio_id, user_id) if portfolio_id else {"holdings": []}
     universe = list(dict.fromkeys(
         [item["ticker"] for item in portfolio.get("holdings", [])]
         + profile.get("watchlist", [])
@@ -55,6 +55,19 @@ def retrieve_evidence(user_id: str, question: str) -> list[dict[str, Any]]:
         {"label": "Prediction-market scenario snapshot", "as_of": scenarios.get("fetched_at"),
          "url": None, "data": scenarios.get("scenarios", [])},
     ]
+    if portfolio_id:
+        try:
+            snapshot = database.latest_portfolio_health(user_id, portfolio_id)
+        except Exception:
+            snapshot = None
+        if snapshot:
+            overview = dict(snapshot.get("result") or {})
+            evidence.append({"label": "Full cached portfolio intelligence", "as_of": overview.get("as_of"),
+                             "url": None, "data": {
+                                 "health": overview.get("health"), "holdings": overview.get("holdings"),
+                                 "actions": overview.get("actions"), "changes": overview.get("changes"),
+                                 "warnings": overview.get("warnings"),
+                             }, "claim_type": "MODEL_OUTPUT"})
     for row in research:
         sources = [row.get("source"), row.get("latest_news", {}).get("source_url") if row.get("latest_news") else None]
         evidence.append({"label": f"{row['ticker']} validated research", "as_of": row.get("price_as_of") or row.get("fundamentals_as_of"),
