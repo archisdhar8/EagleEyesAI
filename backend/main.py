@@ -2350,7 +2350,10 @@ def _portfolio_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, A
                     "profile": database.load_profile(user_id) or {},
                     "goals": database.list_goals(user_id),
                     "scenario": _simulation_scenario_from_question(question),
-                    "paths": 1000,
+                    # Keep interactive portfolio chat within the free Render
+                    # instance's memory envelope; the full Decision Lab still
+                    # supports larger user-requested runs.
+                    "paths": 500,
                     "seed": 90210,
                 })
                 result = run_simulation(simulation_input)
@@ -2382,7 +2385,7 @@ def _portfolio_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, A
                     "tool_name": "portfolio_decision_lab", "status": "failed", "title": "Portfolio simulation",
                     "error": str(exc),
                 })
-    if any(term in lowered for term in ("rebalance", "alternative", "optimizer", "allocation", "concentration", "risk")):
+    if any(term in lowered for term in ("rebalance", "alternative", "optimizer", "allocation", "concentration", "risk", "diversification", "constraints")):
         analysis = database.latest_analysis(user_id, (active_portfolio or {}).get("id"))
         if analysis:
             alternatives = list(analysis.get("alternatives") or [])
@@ -2456,8 +2459,71 @@ def _security_ranking_chat_tools(user_id: str, question: str) -> tuple[list[dict
     return [tool], [evidence_row]
 
 
+def _portfolio_risk_chat_tools(user_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Summarize saved position-size risks without provider or market-data latency."""
+    portfolios = database.list_portfolios(user_id)
+    portfolio = portfolios[0] if portfolios else None
+    holdings = list((portfolio or {}).get("holdings") or [])
+    if not holdings:
+        return [{"tool_name": "portfolio_risk", "status": "unavailable", "title": "Saved portfolio risks",
+                 "summary": {"message": "Save at least one holding before reviewing portfolio risks."}}], []
+    market_values = [max(0.0, float(item.get("market_value") or 0)) for item in holdings]
+    raw_weights = market_values if sum(market_values) > 0 else [max(0.0, float(item.get("weight") or 0)) for item in holdings]
+    total = sum(raw_weights)
+    positions = sorted([
+        {"ticker": str(item.get("ticker") or "").upper(), "weight": value / total,
+         "account_type": item.get("account_type") or "unknown"}
+        for item, value in zip(holdings, raw_weights) if value > 0
+    ], key=lambda item: item["weight"], reverse=True) if total > 0 else []
+    account_weights: dict[str, float] = {}
+    for item in positions:
+        account = str(item["account_type"])
+        account_weights[account] = account_weights.get(account, 0.0) + float(item["weight"])
+    summary = {
+        "portfolio_id": (portfolio or {}).get("id"), "portfolio_name": (portfolio or {}).get("name"),
+        "holding_count": len(holdings), "weighted_position_count": len(positions), "positions": positions,
+        "largest_position": positions[0] if positions else None,
+        "top_five_weight": sum(float(item["weight"]) for item in positions[:5]),
+        "effective_holdings": (1 / sum(float(item["weight"]) ** 2 for item in positions)) if positions else None,
+        "account_weights": [{"account_type": key, "weight": value} for key, value in sorted(account_weights.items(), key=lambda item: item[1], reverse=True)],
+        "sizing_basis": "market_value" if sum(market_values) > 0 else "saved_weight",
+        "unweighted_holdings": len(holdings) - len(positions),
+        "limitations": "This fast path identifies position-size and account concentration from saved holdings. Correlation, sector, ETF look-through, and covariance risk require their linked stored analysis.",
+    }
+    tool = {"tool_name": "portfolio_risk", "status": "complete", "title": "Saved portfolio risks", "summary": summary}
+    evidence = {"label": "Saved portfolio position-size risk summary", "as_of": (portfolio or {}).get("updated_at"),
+                "url": None, "data": summary, "claim_type": "MODEL_OUTPUT"}
+    return [tool], [evidence]
+
+
 def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]]) -> str | None:
     """Answer exact quantitative requests without paying an LLM latency or truncation penalty."""
+    if intent == "PORTFOLIO_RISK":
+        result = next((item for item in tool_results if item.get("tool_name") == "portfolio_risk"
+                       and item.get("status") == "complete"), None)
+        summary = (result or {}).get("summary") or {}
+        positions = list(summary.get("positions") or [])
+        if not positions:
+            return None
+        largest = positions[0]
+        top_positions = "\n".join(
+            f"- **{item['ticker']}**: {float(item['weight']):.1%} of the saved portfolio [S1]"
+            for item in positions[:5]
+        )
+        account = (summary.get("account_weights") or [{}])[0]
+        account_text = (f" The largest account-type bucket is **{str(account.get('account_type', 'unknown')).replace('_', ' ')}** "
+                        f"at **{float(account.get('weight') or 0):.1%}** [S1].") if account else ""
+        return (
+            f"The clearest saved-holdings risk is **position concentration**: **{largest['ticker']}** is "
+            f"**{float(largest['weight']):.1%}**, and the five largest positions together are "
+            f"**{float(summary.get('top_five_weight') or 0):.1%}** [S1]. The portfolio has "
+            f"**{int(summary.get('holding_count') or 0)} holdings**, but its position-size concentration is equivalent to about "
+            f"**{float(summary.get('effective_holdings') or 0):.1f} equally weighted holdings** [S1].{account_text}\n\n"
+            f"Largest saved positions:\n{top_positions}\n\n"
+            "These are position-size risks from the saved portfolio—not a claim that the largest holdings are bad investments. "
+            f"{summary.get('limitations')}\n\n"
+            "**What to verify:** open Portfolio analysis for correlation clusters, sector exposure, ETF overlap, tax constraints, and marginal covariance risk before acting."
+        )
     if intent == "PORTFOLIO_ANALYSIS":
         result = next((item for item in tool_results if item.get("tool_name") == "latest_portfolio_analysis"
                        and item.get("status") == "complete"), None)
@@ -2766,6 +2832,8 @@ def _execute_ask_tool(tool: str, user_id: str, question: str) -> tuple[list[dict
         return _portfolio_chat_tools(user_id, routed_question)
     if tool == "portfolio_analysis":
         return _portfolio_chat_tools(user_id, routed_question)
+    if tool == "portfolio_risk":
+        return _portfolio_risk_chat_tools(user_id)
     if tool == "decision_journal":
         return _decision_journal_chat_tools(user_id, routed_question)
     if tool == "company_comparison":
@@ -2902,7 +2970,7 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
                          "url": None, "data": preference_context, "claim_type": "USER_BELIEF"})
     claim_types = {
         "prediction_market_intelligence": "MARKET_IMPLIED", "user_market_probability_comparison": "USER_BELIEF",
-        "portfolio_decision_lab": "MODEL_OUTPUT", "portfolio_intelligence": "MODEL_OUTPUT",
+        "portfolio_decision_lab": "MODEL_OUTPUT", "portfolio_intelligence": "MODEL_OUTPUT", "portfolio_risk": "MODEL_OUTPUT",
         "security_ranking": "MODEL_OUTPUT",
         "company_research_refresh": "VERIFIED_FACT", "earnings_intelligence": "VERIFIED_FACT",
         "evidence_changes": "VERIFIED_FACT", "thesis_monitor": "MODEL_OUTPUT",

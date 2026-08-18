@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 
 from backend.main import (
     _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
-    _cors_allowed_origins, _portfolio_chat_tools, _security_ranking_chat_tools, app,
+    _cors_allowed_origins, _portfolio_chat_tools, _portfolio_risk_chat_tools, _security_ranking_chat_tools, app,
 )
 
 
@@ -105,6 +105,25 @@ def test_balanced_rebalance_answer_uses_latest_saved_allocations(monkeypatch) ->
     assert answer is not None
     assert "AAPL" in answer and "60.0%" in answer and "45.0%" in answer
     assert "SPY" in answer and "15.0%" in answer
+
+
+def test_saved_portfolio_risk_answer_never_needs_provider_calls(monkeypatch) -> None:
+    monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{
+        "id": "portfolio-61", "name": "61 holdings", "updated_at": "2026-08-17T18:00:00+00:00",
+        "holdings": [
+            {"ticker": "AAPL", "weight": .30, "account_type": "taxable"},
+            {"ticker": "MSFT", "weight": .25, "account_type": "taxable"},
+            {"ticker": "SPY", "weight": .20, "account_type": "roth_ira"},
+            {"ticker": "BND", "weight": .15, "account_type": "traditional_ira"},
+            {"ticker": "CASH", "weight": .10, "account_type": "taxable"},
+        ],
+    }])
+    tools, evidence = _portfolio_risk_chat_tools("user-1")
+    answer = _deterministic_chat_answer("PORTFOLIO_RISK", tools)
+    assert tools[0]["status"] == "complete"
+    assert tools[0]["summary"]["largest_position"] == {"ticker": "AAPL", "weight": .30, "account_type": "taxable"}
+    assert evidence[0]["claim_type"] == "MODEL_OUTPUT"
+    assert answer is not None and "AAPL" in answer and "30.0%" in answer
 
 
 def test_research_coverage_returns_explicit_missing_history_in_sqlite_mode() -> None:

@@ -53,6 +53,19 @@ def test_balanced_rebalance_question_uses_saved_portfolio_analysis():
     assert "stored_evidence" not in plan.tools
 
 
+def test_every_portfolio_starter_prompt_uses_a_bounded_specialized_tool():
+    cases = {
+        "What are the biggest risks in my saved portfolio?": ("PORTFOLIO_RISK", ("portfolio_risk",)),
+        "Simulate a recession with accelerating inflation and compare the portfolio paths.": ("SCENARIO", ("portfolio_scenario",)),
+        "Which holdings have the strongest and weakest research evidence?": ("RESEARCH_RANKING", ("security_ranking",)),
+        "What changes could improve diversification without silently changing my constraints?": ("PORTFOLIO_ANALYSIS", ("portfolio_analysis",)),
+    }
+    for prompt, expected in cases.items():
+        plan = build_plan(prompt, "portfolio")
+        assert (plan.intent, plan.tools) == expected
+        assert "stored_evidence" not in plan.tools
+
+
 def test_explicit_execution_states_and_deep_link_actions():
     assert execution_state("complete") == "SUCCESS"
     assert execution_state("partial") == "PARTIAL"
