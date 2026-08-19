@@ -123,13 +123,21 @@ def _candidate(payload: dict[str, Any]) -> tuple[str, str]:
 
 
 def _bounded_value(value: Any, depth: int = 0) -> Any:
-    """Keep grounding useful while preventing oversized prompts from dominating latency."""
-    if depth >= 4:
-        return str(value)[:240]
+    """Bound prompt size without destroying the structure of portfolio rows.
+
+    Portfolio evidence is commonly nested four or five levels deep.  The old
+    depth-four cutoff converted each holding into a clipped Python string,
+    which made otherwise complete evidence look like a broken list to the
+    narrator.  Keep dictionaries/lists structured through the useful levels
+    and bound their breadth instead.
+    """
+    if depth >= 7:
+        return str(value)[:600]
     if isinstance(value, dict):
-        return {str(key): _bounded_value(item, depth + 1) for key, item in list(value.items())[:24]}
+        return {str(key): _bounded_value(item, depth + 1) for key, item in list(value.items())[:36]}
     if isinstance(value, list):
-        return [_bounded_value(item, depth + 1) for item in value[:8]]
+        limit = 16 if depth <= 3 else 10
+        return [_bounded_value(item, depth + 1) for item in value[:limit]]
     if isinstance(value, str):
         return value[:600]
     return value
@@ -141,7 +149,7 @@ def _clean_partial_answer(answer: str) -> str:
     boundary = max(cleaned.rfind("."), cleaned.rfind("!"), cleaned.rfind("?"))
     if boundary >= 20:
         cleaned = cleaned[:boundary + 1]
-    return cleaned + "\n\nThe response was shortened to the completed evidence-backed points. Ask a focused follow-up for another detail."
+    return cleaned + "\n\n**Answer status:** The explanation provider stopped early. The completed statements above are grounded, but this answer is incomplete; retrying the same question should produce the full synthesis."
 
 
 def ask_gemini(question: str, evidence: list[dict[str, Any]], history: list[dict[str, Any]],
@@ -170,8 +178,10 @@ Earlier conversation summary: {conversation_summary or 'No earlier summary yet.'
 Evidence: {json.dumps(indexed, default=str)}
 Question: {question}
 
-Lead with a direct answer. Use only the evidence needed for this exact question; ignore unrelated optimizer, thesis, macro, or portfolio facts.
-Then explain what matters, portfolio or thesis implications, uncertainty, and concrete next steps. When the question asks for a ranking or rebalance, provide the requested names in a readable numbered list and explain each one. Aim for 300–600 words when the evidence supports that depth; use concise headings and do not pad missing evidence.
+Produce a decision-quality synthesis, not a field dump or a sequence of disconnected facts. Lead with a short direct conclusion.
+Then group the supporting evidence into a few coherent themes and explain why each fact matters to the user's decision. For concentration questions, synthesize position size, sector/theme overlap, correlation or shared economic dependencies, and modeled risk contribution when those fields exist. Do not substitute a list of holdings for a concentration analysis.
+When the question asks for a ranking or rebalance, provide the requested names in a readable numbered list, explain the case for each one, and compare the important tradeoffs. Aim for 300–600 words when the evidence supports that depth; use concise Markdown headings and complete paragraphs. Never emit a fragment, a dangling list number, a raw Python object, or an internal planning note.
+State the evidence date and material coverage gaps. If the supplied evidence cannot fully answer one dimension, give the supported conclusion first and identify that specific limitation without letting it dominate the response.
 End with one short 'What to verify' sentence. Finish sentences before adding more detail.
 Do not add a sources list; the application manages source metadata separately."""
     contents: list[dict[str, Any]] = [{"role": "user", "parts": [{"text": prompt}]}]
@@ -179,10 +189,10 @@ Do not add a sources list; the application manages source metadata separately.""
     finish_reason = "UNKNOWN"
     # Gemini can return useful partial text with MAX_TOKENS. Continue it instead
     # of silently presenting the partial response as a finished answer.
-    max_continuations = max(0, min(1, int(os.getenv("GEMINI_MAX_CONTINUATIONS", "0"))))
-    first_budget = max(800, min(2200, int(os.getenv("GEMINI_CHAT_MAX_OUTPUT_TOKENS", "1600"))))
+    max_continuations = max(0, min(2, int(os.getenv("GEMINI_MAX_CONTINUATIONS", "1"))))
+    first_budget = max(1200, min(5000, int(os.getenv("GEMINI_CHAT_MAX_OUTPUT_TOKENS", "3200"))))
     for attempt in range(1 + max_continuations):
-        payload = _gemini_request(api_key, model, contents, first_budget if attempt == 0 else 600)
+        payload = _gemini_request(api_key, model, contents, first_budget if attempt == 0 else 1200)
         text, finish_reason = _candidate(payload)
         answer_parts.append(text)
         if finish_reason != "MAX_TOKENS":

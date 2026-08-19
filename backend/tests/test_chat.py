@@ -1,4 +1,4 @@
-from backend.chat import ask_gemini, retrieve_evidence
+from backend.chat import _bounded_value, ask_gemini, retrieve_evidence
 
 
 class _Response:
@@ -36,8 +36,8 @@ def test_chat_continues_a_max_tokens_response(monkeypatch) -> None:
     assert "The first part ends here" in answer
     assert "and this completes the answer" in answer
     assert len(calls) == 2
-    assert calls[0]["generationConfig"]["maxOutputTokens"] == 1600
-    assert calls[1]["generationConfig"]["maxOutputTokens"] == 600
+    assert calls[0]["generationConfig"]["maxOutputTokens"] == 3200
+    assert calls[1]["generationConfig"]["maxOutputTokens"] == 1200
     assert calls[1]["contents"][-1]["role"] == "user"
     assert model
 
@@ -57,7 +57,21 @@ def test_chat_cleans_partial_answer_without_a_second_request(monkeypatch) -> Non
     assert len(calls) == 1
     assert answer.startswith("A completed evidence-backed sentence.")
     assert "unfinished fragment" not in answer
-    assert "response was shortened" in answer.lower()
+    assert "answer is incomplete" in answer.lower()
+
+
+def test_prompt_bounding_preserves_nested_holding_records() -> None:
+    evidence = {"data": {"summary": {"positions": [
+        {"ticker": "BLK", "weight": .0118, "market_value": 39438.41, "sector": "Financials"},
+        {"ticker": "COST", "weight": .021, "sector": "Consumer Staples"},
+    ]}}}
+
+    bounded = _bounded_value(evidence)
+
+    positions = bounded["data"]["summary"]["positions"]
+    assert positions[0]["ticker"] == "BLK"
+    assert positions[0]["market_value"] == 39438.41
+    assert isinstance(positions[0], dict)
 
 
 def test_generic_chat_evidence_uses_bounded_price_history(monkeypatch) -> None:

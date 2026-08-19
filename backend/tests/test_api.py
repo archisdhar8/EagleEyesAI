@@ -212,10 +212,20 @@ def test_saved_portfolio_risk_answer_never_needs_provider_calls(monkeypatch) -> 
             {"ticker": "CASH", "weight": .10, "account_type": "taxable"},
         ],
     }])
+    monkeypatch.setattr("backend.main.database.latest_portfolio_health", lambda user_id, portfolio_id: {"result": {
+        "ask_cache": {"portfolio_intelligence": {
+            "concentration": {"sector": [{"sector": "Technology", "weight": .55}]},
+            "correlation": {"status": "available", "clusters": [{"holdings": ["AAPL", "MSFT"], "portfolio_weight": .55}]},
+            "economic_dependencies": [{"factor": "Enterprise technology spending", "mapped_portfolio_weight": .55}],
+            "coverage": {"classification_weight": .9},
+        }}
+    }})
     tools, evidence = _portfolio_risk_chat_tools("user-1")
     answer = _deterministic_chat_answer("PORTFOLIO_RISK", tools)
     assert tools[0]["status"] == "complete"
     assert tools[0]["summary"]["largest_position"] == {"ticker": "AAPL", "weight": .30, "account_type": "taxable"}
+    assert tools[0]["summary"]["sector_and_industry"]["sector"][0]["sector"] == "Technology"
+    assert tools[0]["summary"]["correlation"]["clusters"][0]["holdings"] == ["AAPL", "MSFT"]
     assert evidence[0]["claim_type"] == "MODEL_OUTPUT"
     assert answer is not None and "AAPL" in answer and "30.0%" in answer
 

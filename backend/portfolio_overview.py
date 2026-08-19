@@ -229,6 +229,17 @@ def build_portfolio_overview(*, portfolio: dict[str, Any], diagnostics: dict[str
             + _number(confidence, MISSING_SCORE) * .15
         )
         prior = previous_holdings.get(ticker, {})
+        component_pairs = {
+            "fundamentals": (research_row.get("fundamental_score"), prior.get("fundamental_score")),
+            "valuation": (research_row.get("valuation_score"), prior.get("valuation_score")),
+            "momentum": (research_row.get("technical_score"), prior.get("momentum_score")),
+            "risk_contribution": (risk_contribution, prior.get("risk_contribution")),
+        }
+        component_changes = {
+            key: round(_number(current) - _number(previous), 4 if key == "risk_contribution" else 1)
+            for key, (current, previous) in component_pairs.items()
+            if prior and current is not None and previous is not None
+        }
         monitor = monitor_by_ticker.get(ticker, {})
         decision = latest_decision.get(ticker, {})
         stats = research_row.get("market_statistics") or {}
@@ -244,6 +255,7 @@ def build_portfolio_overview(*, portfolio: dict[str, Any], diagnostics: dict[str
             "conviction": decision.get("user_confidence"), "data_confidence": _confidence((_number(confidence) / 100) if confidence is not None else 0),
             "data_quality": research_row.get("data_quality") or "low", "evidence_date": research_row.get("fundamentals_as_of") or research_row.get("price_as_of"),
             "change": round(holding_health - _number(prior.get("health_score"), holding_health), 1), "active_action_count": 0,
+            "component_changes": component_changes,
         })
     holding_rows.sort(key=lambda row: (-row["weight"], row["ticker"]))
     actions = _build_actions(score=score, coverage=coverage, weights=weights, holdings=holdings, monitors=monitors or [],
