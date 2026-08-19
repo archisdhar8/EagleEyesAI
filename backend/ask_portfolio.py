@@ -125,16 +125,22 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
             return _evidence(tool, portfolio, {"status": "unavailable", "title": "Company context is required",
                 "message": "Name a holding or open its research page before asking why its score changed."}, as_of)
         summary = {"title": f"{selected['ticker']} score attribution", "holding": selected,
-                   "method": "The cached holding-health calculation combines fundamentals, valuation, momentum, modeled risk, and data confidence. The change compares the previous nightly snapshot."}
+                   "component_changes": selected.get("component_changes") or {},
+                   "method": "The cached holding-health calculation combines fundamentals, valuation, momentum, modeled risk, and data confidence. Component changes and the total change compare the current record with the previous nightly snapshot."}
         return _evidence(tool, portfolio, summary, as_of)
 
     if tool in {"portfolio_intelligence", "recommendation_countercase"}:
         risk_ranked = sorted(holdings, key=lambda row: _number(row.get("risk_contribution")), reverse=True)
         concentration = [row for row in overview.get("actions") or [] if "concentration" in str(row.get("reason", "")).lower()]
+        intelligence = ask_cache.get("portfolio_intelligence") or {}
         summary = {"title": "Hidden portfolio risk" if tool == "portfolio_intelligence" else "Countercase to the leading portfolio opportunity",
                    "health": health, "highest_risk_holdings": risk_ranked[:10], "concentration_actions": concentration,
+                   "concentration": intelligence.get("concentration") or {},
+                   "correlation": intelligence.get("correlation") or {},
+                   "economic_dependencies": intelligence.get("economic_dependencies") or [],
+                   "coverage": intelligence.get("coverage") or {},
                    "warnings": overview.get("warnings") or [], "top_candidate": _factor_rank(holdings, ("health_score",))[:1],
-                   "method": "Cached portfolio-health, modeled risk contribution, concentration actions, and evidence warnings."}
+                   "method": "Cached position, sector and industry concentration; return-correlation clusters; mapped economic dependencies; modeled risk contribution; and evidence warnings."}
         return _evidence(tool, portfolio, summary, as_of)
 
     if tool == "portfolio_events":

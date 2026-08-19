@@ -545,7 +545,11 @@ function WidgetData({ type, data, presentation }: { type: string; data: unknown;
 
 function NarrativeText({ text }: { text: string }) {
   const lines=text.split(/\r?\n/).map(line=>line.trim()).filter(Boolean);
-  const inline=(line:string)=>line.split(/(\*\*[^*]+\*\*)/g).map((part,index)=>part.startsWith("**")&&part.endsWith("**")?<strong key={index}>{part.slice(2,-2)}</strong>:part.replace(/\[([^\]]+)\]\([^)]+\)/g,"$1"));
+  const inline=(line:string)=>line.split(/(\*\*[^*]+\*\*|\[S\d+\])/g).map((part,index)=>{
+    if(part.startsWith("**")&&part.endsWith("**"))return <strong key={index}>{part.slice(2,-2)}</strong>;
+    if(/^\[S\d+\]$/.test(part))return <sup className="evidence-citation" key={index}>{part.slice(1,-1)}</sup>;
+    return part.replace(/\[([^\]]+)\]\([^)]+\)/g,"$1");
+  });
   return <div className="narrative-text">{lines.map((line,index)=>{
     const heading=line.match(/^#{1,6}\s*(.+)$/);
     if (heading) return <h5 key={index}>{inline(heading[1])}</h5>;
@@ -567,6 +571,7 @@ function AskResponseDetails({message}:{message:ChatMessage}) {
   const structured=message.structured_content;
   if(!structured)return null;
   return <>
+    {structured.sources?.length?<details className="ask-answer-sources"><summary>Evidence used ({structured.sources.length})</summary><ol>{structured.sources.map(source=><li key={source.id}><b>{source.id}</b><span>{source.url?<a href={source.url} target="_blank" rel="noreferrer">{source.label}</a>:source.label}{source.as_of?<small>As of {dateLabel(source.as_of)}</small>:null}</span></li>)}</ol></details>:null}
     {structured.actions?.length?<div className="ask-next-actions"><span>Continue in EagleEyes</span>{structured.actions.map(action=><a key={`${action.kind}-${action.href}`} href={action.href}>{action.label} →</a>)}</div>:null}
   </>;
 }

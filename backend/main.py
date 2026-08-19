@@ -800,6 +800,7 @@ def _calculate_portfolio_overview(user_id: str, portfolio_id: str | int,
     latest_simulation = database.latest_simulation_run(user_id, str(portfolio_id))
     latest_optimizer = database.latest_analysis(user_id, portfolio_id)
     result["ask_cache"] = {
+        "portfolio_intelligence": diagnostics.get("intelligence") or {},
         "watchlist_research": watchlist_research,
         "latest_simulation": latest_simulation,
         "latest_optimizer": latest_optimizer,
@@ -2823,7 +2824,7 @@ def _benchmark_outlook_chat_tools(user_id: str, portfolio_id: str | None = None)
 
 
 def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Summarize saved position-size risks without provider or market-data latency."""
+    """Summarize saved concentration using holdings and cached intelligence."""
     portfolio = (database.get_portfolio(portfolio_id, user_id) if portfolio_id
                  else next(iter(database.list_portfolios(user_id)), None))
     holdings = list((portfolio or {}).get("holdings") or [])
@@ -2842,6 +2843,14 @@ def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None) ->
     for item in positions:
         account = str(item["account_type"])
         account_weights[account] = account_weights.get(account, 0.0) + float(item["weight"])
+    intelligence: dict[str, Any] = {}
+    if portfolio and portfolio.get("id"):
+        try:
+            snapshot = database.latest_portfolio_health(user_id, str(portfolio["id"]))
+            cached = dict((snapshot or {}).get("result") or {})
+            intelligence = dict((cached.get("ask_cache") or {}).get("portfolio_intelligence") or {})
+        except Exception:
+            intelligence = {}
     summary = {
         "portfolio_id": (portfolio or {}).get("id"), "portfolio_name": (portfolio or {}).get("name"),
         "holding_count": len(holdings), "weighted_position_count": len(positions), "positions": positions,
@@ -2851,7 +2860,12 @@ def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None) ->
         "account_weights": [{"account_type": key, "weight": value} for key, value in sorted(account_weights.items(), key=lambda item: item[1], reverse=True)],
         "sizing_basis": "market_value" if sum(market_values) > 0 else "saved_weight",
         "unweighted_holdings": len(holdings) - len(positions),
-        "limitations": "This fast path identifies position-size and account concentration from saved holdings. Correlation, sector, ETF look-through, and covariance risk require their linked stored analysis.",
+        "sector_and_industry": (intelligence.get("concentration") or {}),
+        "correlation": intelligence.get("correlation") or {},
+        "economic_dependencies": intelligence.get("economic_dependencies") or [],
+        "risk_contribution": intelligence.get("risk_contribution") or {},
+        "coverage": intelligence.get("coverage") or {},
+        "limitations": "Position and account weights come directly from saved holdings. Sector, industry, correlation, shared-dependency, and covariance fields are included only when a cached portfolio-intelligence snapshot is available; ETF look-through is not inferred.",
     }
     tool = {"tool_name": "portfolio_risk", "status": "complete", "title": "Saved portfolio risks", "summary": summary}
     evidence = {"label": "Saved portfolio position-size risk summary", "as_of": (portfolio or {}).get("updated_at"),
@@ -3669,7 +3683,15 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
     # impact), not merely a dump of stored fields. Use Gemini when configured,
     # while retaining the polished deterministic answer as a zero-latency and
     # outage-safe fallback.
-    interpret_with_gemini = plan.intent == "EARNINGS" and bool(os.getenv("GEMINI_API_KEY", "").strip())
+    synthesis_intents = {
+        "OPPORTUNITY_RANKING", "THESIS_REPLACEMENT", "PORTFOLIO_CHANGE", "VALUATION_RANKING",
+        "HIDDEN_RISK", "MULTI_SCENARIO", "WATCHLIST_COMPARISON", "PORTFOLIO_EVENTS",
+        "DATA_QUALITY", "SCORE_ATTRIBUTION", "THESIS_INVALIDATION", "PORTFOLIO_ANALYSIS", "PORTFOLIO_RISK",
+        "MULTIFACTOR_SCREEN", "RECOMMENDATION_COUNTERCASE", "CASH_ALLOCATION",
+    }
+    interpret_with_gemini = plan.intent in {"EARNINGS", *synthesis_intents} and bool(
+        os.getenv("GEMINI_API_KEY", "").strip()
+    )
     if deterministic_answer is not None and not interpret_with_gemini:
         answer = deterministic_answer
         model = "deterministic-chat-composer-v1"
@@ -3695,7 +3717,7 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
                              "portfolio_id": requested_portfolio_id, "route_confidence": plan.confidence,
                              "tool_names": [item.get("tool_name") for item in tool_results],
                              "cache_hit": True, "evidence_coverage": len(evidence),
-                             "answer_complete": deterministic_answer is not None,
+                             "answer_complete": "answer is incomplete" not in answer.lower(),
                              "router_version": "v2" if ASK_ROUTER_V2_ENABLED else "v1"},
         "actions": ask_orchestration.actions_for(plan, page_context),
         "grounding": {"categories": ["VERIFIED_FACT", "MODEL_OUTPUT", "MARKET_IMPLIED", "USER_BELIEF", "AI_INTERPRETATION"],
