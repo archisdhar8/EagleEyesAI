@@ -3,7 +3,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from backend import database
+from backend import ask_portfolio, database
 from backend.main import (
     _benchmark_outlook_chat_tools, _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
     _cors_allowed_origins, _decision_workspace_inputs, _execute_chat_plan_tools, _portfolio_chat_tools, _portfolio_risk_chat_tools,
@@ -228,6 +228,41 @@ def test_saved_portfolio_risk_answer_never_needs_provider_calls(monkeypatch) -> 
     assert tools[0]["summary"]["correlation"]["clusters"][0]["holdings"] == ["AAPL", "MSFT"]
     assert evidence[0]["claim_type"] == "MODEL_OUTPUT"
     assert answer is not None and "AAPL" in answer and "30.0%" in answer
+
+
+def test_hidden_risk_cached_answer_synthesizes_all_concentration_dimensions() -> None:
+    tools = [{
+        "tool_name": "portfolio_intelligence", "status": "complete", "summary": {
+            "concentration": {
+                "positions": [{"ticker": "SPY", "weight": .25}, {"ticker": "MSFT", "weight": .18}],
+                "effective_holdings": 9.4,
+                "sector": [{"sector": "Technology", "weight": .48}],
+                "industry": [{"industry": "Software", "weight": .29}],
+            },
+            "correlation": {"status": "AVAILABLE", "clusters": [{
+                "holdings": ["MSFT", "GOOGL"], "portfolio_weight": .31,
+                "strongest_pair": {"correlation": .79},
+            }]},
+            "economic_dependencies": [{
+                "factor": "AI_INFRASTRUCTURE_DEMAND", "mapped_portfolio_weight": .42,
+                "holdings": ["MSFT", "GOOGL", "AVGO"], "mechanism": "AI and data-center spending",
+            }],
+            "highest_risk_holdings": [{
+                "ticker": "MSFT", "risk_contribution": .21, "weight": .18, "health_score": 73,
+            }],
+            "coverage": {"classification_weight": .91},
+        },
+    }]
+
+    answer = ask_portfolio.compose("HIDDEN_RISK", tools)
+
+    assert answer is not None
+    assert "SPY at 25.0%" in answer
+    assert "9.4 equally sized holdings" in answer
+    assert "Technology" in answer and "Software" in answer
+    assert "MSFT, GOOGL" in answer and "0.79" in answer
+    assert "AI Infrastructure Demand" in answer and "42.0%" in answer
+    assert "ETF holdings are shown at the fund level" in answer
 
 
 def test_research_coverage_returns_explicit_missing_history_in_sqlite_mode() -> None:
