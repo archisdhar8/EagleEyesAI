@@ -5,6 +5,7 @@ from typing import Any
 
 from . import database, theses
 from .analysis import security_research
+from .ask_runtime import PortfolioContext, attach_coverage, classify_candidate, parse_scenario_factors
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -37,7 +38,8 @@ def _briefing(user_id: str) -> dict[str, Any]:
 
 def _evidence(tool: str, portfolio: dict[str, Any], summary: dict[str, Any], as_of: str | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     status = "complete" if summary.get("status") != "unavailable" else "unavailable"
-    result = {"tool_name": tool, "status": status, "title": summary.get("title") or tool.replace("_", " ").title(), "summary": summary}
+    result = {"tool_name": tool, "status": status, "title": summary.get("title") or tool.replace("_", " ").title(),
+              "summary": summary, "as_of": as_of or portfolio.get("updated_at")}
     grounded = [] if status == "unavailable" else [{
         "label": summary.get("title") or result["title"], "as_of": as_of or portfolio.get("updated_at"),
         "url": None, "data": summary, "claim_type": "MODEL_OUTPUT",
@@ -67,9 +69,9 @@ def _stored_watchlist_research(user_id: str, profile: dict[str, Any]) -> list[di
 
 
 def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
-        tickers: tuple[str, ...] = ()) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        tickers: tuple[str, ...] = (), context: PortfolioContext | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     try:
-        portfolio = _selected_portfolio(user_id, portfolio_id)
+        portfolio = context.portfolio_payload() if context else _selected_portfolio(user_id, portfolio_id)
     except (KeyError, ValueError) as exc:
         empty = {"status": "unavailable", "title": "Portfolio context is required", "message": str(exc)}
         return _evidence(tool, {"updated_at": None}, empty, None)
@@ -78,7 +80,18 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
     if required:
         return required
     assert overview is not None
-    holdings = list(overview.get("holdings") or [])
+    allowed = set(context.symbols) if context else None
+    holdings = [row for row in list(overview.get("holdings") or [])
+                if allowed is None or str(row.get("ticker") or "").upper() in allowed]
+    if context:
+        by_ticker = {str(row.get("ticker") or "").upper(): row for row in holdings}
+        # The request context owns portfolio weights. Cached analytical fields
+        # may enrich it, but a stale snapshot may not restore removed assets or
+        # overwrite an in-memory renormalization.
+        holdings = [{**by_ticker.get(row["ticker"], {}), **dict(row),
+                     "ticker": row["ticker"], "weight": row.get("weight")}
+                    for row in context.positions]
+        overview = {**overview, "holdings": holdings}
     holding_tickers = {str(row.get("ticker") or "").upper() for row in holdings}
     as_of = overview.get("as_of") or portfolio.get("updated_at")
     health = overview.get("health") or {}
@@ -89,19 +102,23 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
         candidates = [row for row in _factor_rank(holdings, ("health_score",)) if row.get("ticker") != "CASH"][:3]
         summary = {"title": "Strongest portfolio opportunities", "health": health, "candidates": candidates,
                    "method": "Highest cached holding-health scores with factor, risk, coverage, and action context; this is a research ranking, not a return forecast."}
-        return _evidence(tool, portfolio, summary, as_of)
+        return _covered_evidence(tool, portfolio, summary, as_of, context)
 
     if tool == "portfolio_change":
         summary = {"title": "Material portfolio changes", "health": health, "changes": overview.get("changes") or [],
                    "history": overview.get("history") or [], "warnings": overview.get("warnings") or []}
-        return _evidence(tool, portfolio, summary, as_of)
+        summary["historical_snapshot"] = {
+            "exists": bool(summary["history"]),
+            "available_dates": [row.get("as_of") or row.get("created_at") for row in summary["history"] if row.get("as_of") or row.get("created_at")],
+        }
+        return _covered_evidence(tool, portfolio, summary, as_of, context)
 
     if tool == "valuation_ranking":
         ranked = sorted([row for row in holdings if row.get("valuation_score") is not None],
                         key=lambda row: (_number(row.get("valuation_score")), -_number(row.get("fundamental_score"))))
         summary = {"title": "Valuation relative to stored fundamentals", "positions": ranked[:10],
                    "method": "Lowest valuation score first, with growth/fundamental support shown separately. Missing valuation is excluded and disclosed."}
-        return _evidence(tool, portfolio, summary, as_of)
+        return _covered_evidence(tool, portfolio, summary, as_of, context)
 
     if tool == "data_quality":
         confidence_order = {"Low": 0, "Medium": 1, "High": 2}
@@ -109,13 +126,13 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
         summary = {"title": "Portfolio data-quality review", "positions": ranked,
                    "coverage": health.get("coverage"), "warnings": overview.get("warnings") or [],
                    "method": "Low-confidence and incomplete factor records appear first; missing data is never treated as neutral."}
-        return _evidence(tool, portfolio, summary, as_of)
+        return _covered_evidence(tool, portfolio, summary, as_of, context)
 
     if tool == "multifactor_screen":
         ranked = _factor_rank(holdings, ("fundamental_score", "valuation_score", "momentum_score"))
         summary = {"title": "Fundamentals, valuation, and momentum screen", "positions": ranked[:15],
                    "method": "Equal-weighted ordering of the three cached component scores among holdings with all three components."}
-        return _evidence(tool, portfolio, summary, as_of)
+        return _covered_evidence(tool, portfolio, summary, as_of, context)
 
     if tool == "score_attribution":
         selected = None
@@ -127,7 +144,7 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
         summary = {"title": f"{selected['ticker']} score attribution", "holding": selected,
                    "component_changes": selected.get("component_changes") or {},
                    "method": "The cached holding-health calculation combines fundamentals, valuation, momentum, modeled risk, and data confidence. Component changes and the total change compare the current record with the previous nightly snapshot."}
-        return _evidence(tool, portfolio, summary, as_of)
+        return _covered_evidence(tool, portfolio, summary, as_of, context)
 
     if tool in {"portfolio_intelligence", "recommendation_countercase"}:
         risk_ranked = sorted(holdings, key=lambda row: _number(row.get("risk_contribution")), reverse=True)
@@ -141,20 +158,34 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
                    "coverage": intelligence.get("coverage") or {},
                    "warnings": overview.get("warnings") or [], "top_candidate": _factor_rank(holdings, ("health_score",))[:1],
                    "method": "Cached position, sector and industry concentration; return-correlation clusters; mapped economic dependencies; modeled risk contribution; and evidence warnings."}
-        return _evidence(tool, portfolio, summary, as_of)
+        return _covered_evidence(tool, portfolio, summary, as_of, context)
 
     if tool == "portfolio_events":
         summary = {"title": "Upcoming portfolio events", "events": list(ask_cache.get("events") or [])[:20],
                    "method": "Stored portfolio-relevant earnings, economic, regulatory, and company events."}
-        return _evidence(tool, portfolio, summary, ask_cache.get("generated_at") or as_of)
+        return _covered_evidence(tool, portfolio, summary, ask_cache.get("generated_at") or as_of, context)
 
     if tool in {"watchlist_comparison", "thesis_replacement", "cash_allocation"}:
         watchlist = list(ask_cache.get("watchlist_research") or [])
+        # A watchlist entry already owned is an add-to-existing candidate, not
+        # a new position or replacement. Preserve it only with that explicit
+        # classification.
+        for row in watchlist:
+            action = "REPLACEMENT" if tool == "thesis_replacement" else "ADD"
+            row["candidate_type"] = str(classify_candidate(
+                str(row.get("ticker") or ""), action,
+                context,
+            )) if context else ("ADD_TO_EXISTING" if str(row.get("ticker") or "").upper() in holding_tickers else "NEW_POSITION")
         watchlist_rows = sorted(watchlist, key=lambda row: (
             _number(row.get("fundamental_score")) + _number(row.get("valuation_score"))
             + _number(row.get("technical_score")) + _number(row.get("confidence"))
         ), reverse=True)
+        add_to_existing = [row for row in watchlist_rows if row.get("candidate_type") == "ADD_TO_EXISTING"]
+        if tool == "watchlist_comparison":
+            watchlist_rows = [row for row in watchlist_rows if row.get("candidate_type") == "NEW_POSITION"]
         weak = sorted(holdings, key=lambda row: _number(row.get("health_score")))[:5]
+        if tool == "thesis_replacement":
+            watchlist_rows = [row for row in watchlist_rows if row.get("candidate_type") == "REPLACEMENT"]
         active_theses = [row for row in theses.list_theses(user_id)
                          if str(row.get("ticker") or "").upper() in holding_tickers]
         if tool == "thesis_replacement" and not active_theses:
@@ -164,18 +195,21 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
         else:
             summary = {"title": "Watchlist and portfolio comparison" if tool == "watchlist_comparison" else "New-cash research queue" if tool == "cash_allocation" else "Thesis and replacement review",
                        "watchlist_candidates": watchlist_rows[:10], "weakest_holdings": weak,
+                       "add_to_existing_candidates": add_to_existing[:10],
                        "saved_theses": active_theses[:30],
+                       "thesis": {"exists": bool(active_theses), "count": len(active_theses)},
                        "method": "Stored component evidence and confidence only. Portfolio fit, taxes, overlap, and user constraints can override the ordering."}
-        return _evidence(tool, portfolio, summary, as_of)
+        return _covered_evidence(tool, portfolio, summary, as_of, context)
 
     if tool == "thesis_monitor":
         active_theses = [row for row in theses.list_theses(user_id)
                          if str(row.get("ticker") or "").upper() in holding_tickers]
         summary = {"title": "Thesis invalidation review", "saved_theses": active_theses[:30],
-                   "largest_positions": sorted(holdings, key=lambda row: _number(row.get("weight")), reverse=True)[:10]}
+                   "largest_positions": sorted(holdings, key=lambda row: _number(row.get("weight")), reverse=True)[:10],
+                   "thesis": {"exists": bool(active_theses), "count": len(active_theses)}}
         if not active_theses:
             summary.update({"status": "unavailable", "message": "No saved thesis exists. EagleEyes can show evidence risks, but it cannot invent the user's thesis or its invalidation conditions."})
-        return _evidence(tool, portfolio, summary, as_of)
+        return _covered_evidence(tool, portfolio, summary, as_of, context)
 
     if tool == "portfolio_scenario":
         simulation = ask_cache.get("latest_simulation")
@@ -185,9 +219,33 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
                    "method": "Latest cached portfolio simulation and stored scenario probabilities; no simulation or provider refresh runs inside chat."}
         if not simulation:
             summary.update({"status": "unavailable", "message": "No cached portfolio simulation exists yet. Queue the canonical scenario refresh before relying on this comparison."})
-        return _evidence(tool, portfolio, summary, as_of)
+        summary["scenario_factors"] = [row.__dict__ for row in parse_scenario_factors(question)]
+        scenario_input = ((simulation or {}).get("input") or {}).get("scenario") or {}
+        supported: list[dict[str, str]] = []
+        if scenario_input.get("rate_state") == "tightening":
+            supported.append({"factor": "interest_rates", "direction": "increase"})
+        elif scenario_input.get("rate_state") == "easing":
+            supported.append({"factor": "interest_rates", "direction": "decrease"})
+        if scenario_input.get("economic_state") == "recession":
+            supported.append({"factor": "economic_growth", "direction": "decrease"})
+        elif scenario_input.get("economic_state") == "expansion":
+            supported.append({"factor": "economic_growth", "direction": "increase"})
+        if scenario_input.get("inflation_state") == "accelerating":
+            supported.append({"factor": "inflation", "direction": "increase"})
+        elif scenario_input.get("inflation_state") == "cooling":
+            supported.append({"factor": "inflation", "direction": "decrease"})
+        summary["supported_scenario_factors"] = supported
+        return _covered_evidence(tool, portfolio, summary, as_of, context)
 
     return _evidence(tool, portfolio, {"status": "unavailable", "title": tool.replace("_", " ").title(), "message": "No cached portfolio aggregator is registered for this question."}, as_of)
+
+
+def _covered_evidence(tool: str, portfolio: dict[str, Any], summary: dict[str, Any],
+                      as_of: str | None, context: PortfolioContext | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    results, grounded = _evidence(tool, portfolio, summary, as_of)
+    for row in results:
+        attach_coverage(row, context)
+    return results, grounded
 
 
 def _rows(items: list[dict[str, Any]], formatter, limit: int = 5) -> str:
@@ -339,13 +397,26 @@ def compose(intent: str, tool_results: list[dict[str, Any]]) -> str | None:
         return f"The strongest arguments against the current leading opportunity are its weakest factor, modeled risk contribution, concentration role, and any coverage warning.\n\n{body}\n\nThis cached view does not invent sector or correlation evidence that is absent from the snapshot.\n\n**What to verify:** inspect sector, theme, correlation, ETF look-through, and covariance diagnostics before changing exposure."
     if intent in {"WATCHLIST_COMPARISON", "THESIS_REPLACEMENT", "CASH_ALLOCATION"}:
         rows = summary.get("watchlist_candidates") or []
-        body = _rows(rows, lambda row: f"**{row.get('ticker')}** — fundamentals {_number(row.get('fundamental_score')):.0f}, valuation {_number(row.get('valuation_score')):.0f}, momentum {_number(row.get('technical_score')):.0f}, confidence {_number(row.get('confidence')):.0f}/100 [S1]", 8)
+        body = _rows(rows, lambda row: f"**{row.get('ticker')}** ({str(row.get('candidate_type') or 'research candidate').replace('_', ' ').lower()}) — fundamentals {_number(row.get('fundamental_score')):.0f}, valuation {_number(row.get('valuation_score')):.0f}, momentum {_number(row.get('technical_score')):.0f}, confidence {_number(row.get('confidence')):.0f}/100 [S1]", 8)
         label = "The strongest stored watchlist research candidates are" if intent != "CASH_ALLOCATION" else "For new cash, these are the first research candidates to compare with holding cash"
-        return f"{label}:\n\n{body or 'No eligible watchlist candidate has sufficient stored evidence.'}\n\nThis is a research queue, not a buy instruction. Portfolio overlap, valuation, risk budget, and user constraints can override the order. Rebalancing remains explicitly tax-blind without tax-lot data.\n\n**What to verify:** compare each candidate with the weakest existing holding and with the role of cash before recording an ADD or HOLD decision."
+        weak = summary.get("weakest_holdings") or []
+        weak_text = _rows(weak, lambda row: f"**{row.get('ticker')}** — holding health {_number(row.get('health_score')):.0f}/100, weight {_number(row.get('weight')):.1%} [S1]", 5)
+        comparison = f"\n\n**Existing holdings used for comparison**\n\n{weak_text}" if weak_text else ""
+        return f"{label}:\n\n{body or 'No eligible watchlist candidate has sufficient stored evidence.'}{comparison}\n\nExisting holdings are never labeled as new positions or replacements; adding to one is an **ADD TO EXISTING** action. This is a research queue, not a buy instruction. Portfolio overlap, valuation, risk budget, and user constraints can override the order. Rebalancing remains explicitly tax-blind without tax-lot data.\n\n**What to verify:** compare each candidate with the weakest existing holding and with the role of cash before recording an ADD or HOLD decision."
     if intent == "THESIS_INVALIDATION":
         theses_rows = summary.get("saved_theses") or []
         return f"There are **{len(theses_rows)} saved theses** available for invalidation review [S1]. " + ("Open each largest-position thesis to review its explicit assumptions and breakers." if theses_rows else "EagleEyes cannot invent invalidation conditions for positions without a user-saved thesis.") + "\n\n**What to verify:** save the thesis assumptions and breakers you actually intend to monitor."
     if intent == "MULTI_SCENARIO":
         simulation = summary.get("latest_simulation") or {}
-        return f"The latest cached portfolio simulation is available under model **{simulation.get('model_version') or 'unknown'}** [S1]. The requested rates, recession, and AI-spending conditions must be compared as separate named cases; no live simulation was run inside chat.\n\n**What to verify:** open the cached scenario run and confirm each scenario's conditioning, date, paths, and assumptions."
+        factors = summary.get("scenario_factors") or []
+        factor_text = ", ".join(
+            f"**{_factor_label(row.get('factor'))} {row.get('direction')}**" for row in factors
+        ) or "no supported factors"
+        return (
+            f"The request contains these independent scenario factors: {factor_text} [S1]. "
+            f"The latest cached portfolio simulation uses model **{simulation.get('model_version') or 'unknown'}** [S1]. "
+            "EagleEyes preserves each factor separately; it will not silently collapse a rates, growth, and AI-capex question into a recession-only case. "
+            "No live provider refresh or new simulation ran inside chat.\n\n"
+            "**What to verify:** open the cached scenario matrix and confirm that every named factor has a mapped portfolio sensitivity before relying on a combined-case conclusion."
+        )
     return None

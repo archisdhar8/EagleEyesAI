@@ -13,6 +13,7 @@ __pycache__/
 test-results/
 playwright-report/
 .playwright/
+/artifacts/
 FinLearnAI/
 .env
 .env.*

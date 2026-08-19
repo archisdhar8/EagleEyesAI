@@ -652,7 +652,7 @@ def test_chat_returns_tool_fallback_instead_of_502_when_gemini_times_out(monkeyp
     monkeypatch.setattr("backend.main.database.conversation_messages", lambda user_id, conversation_id: [])
     monkeypatch.setattr("backend.main.database.save_chat_message", lambda user_id, conversation_id, role, content, structured=None, model=None: {"id": "message-1", "role": role, "content": content, "model": model, "structured_content": structured or {}})
     monkeypatch.setattr("backend.main.retrieve_evidence", lambda user_id, question: [{"label": "Portfolio", "url": None, "as_of": "2026-08-09", "data": {}}])
-    monkeypatch.setattr("backend.main.ask_gemini", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("timeout")))
+    monkeypatch.setattr("backend.main.ask_gemini", lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("timeout")))
     with TestClient(app) as client:
         response = client.post("/api/chat/messages", json={"question": "Explain the available stored evidence."})
     assert response.status_code == 200

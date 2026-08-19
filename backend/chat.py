@@ -136,7 +136,11 @@ def _bounded_value(value: Any, depth: int = 0) -> Any:
     if isinstance(value, dict):
         return {str(key): _bounded_value(item, depth + 1) for key, item in list(value.items())[:36]}
     if isinstance(value, list):
-        limit = 16 if depth <= 3 else 10
+        # A portfolio-wide verified result may legitimately contain dozens of
+        # compact holding rows. Never silently turn a 57-position conclusion
+        # into a 16-position narration. Breadth is controlled upstream by the
+        # verified AnalysisResult; nested article/detail lists stay bounded.
+        limit = 64
         return [_bounded_value(item, depth + 1) for item in value[:limit]]
     if isinstance(value, str):
         return value[:600]
@@ -212,6 +216,8 @@ Do not add a sources list; the application manages source metadata separately.""
         # exhaustion like any other optional-narrator failure so callers can
         # use that cached fallback instead of publishing a cut-off paragraph.
         raise IncompleteNarrationError("Gemini exhausted its output budget before completing the answer")
+    if len(answer) < 60 or answer[:1] in {"]", "}"} or "what to verify" not in answer.lower():
+        raise IncompleteNarrationError("Gemini returned malformed or incomplete narration")
     return answer, model
 
 

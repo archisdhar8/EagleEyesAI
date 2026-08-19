@@ -24,6 +24,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import database, ask_orchestration, ask_portfolio, attention, decision_journal, earnings_intelligence, evidence, forecasting, model_portfolios, portfolio_intelligence, portfolio_overview, product_preferences, thesis_monitor, theses
+from .ask_runtime import (
+    PortfolioContext, attach_coverage as attach_ask_coverage, build_portfolio_context, parse_scenario_factors,
+    scenario_payload, verified_analysis_result, verify_results,
+)
 from .analysis import latest_macro, macro_factor_dashboard, run_analysis, security_research
 from .auth import AuthenticatedUser, optional_user, require_user
 from .chat import ask_gemini, retrieve_evidence
@@ -2541,38 +2545,16 @@ def _company_research_chat_tools(question: str) -> tuple[list[dict[str, Any]], l
 
 
 def _simulation_scenario_from_question(question: str) -> dict[str, Any]:
-    lowered = question.lower()
-    if "recession" in lowered or "market falls" in lowered or "market fell" in lowered:
-        economic = "recession"
-    elif "slowdown" in lowered:
-        economic = "slowdown"
-    elif "expansion" in lowered:
-        economic = "expansion"
-    else:
-        economic = "unconditioned"
-    if "accelerating inflation" in lowered or "higher inflation" in lowered or "inflation rises" in lowered:
-        inflation = "accelerating"
-    elif "cooling inflation" in lowered or "lower inflation" in lowered:
-        inflation = "cooling"
-    else:
-        inflation = "unconditioned"
-    if "rate hike" in lowered or "higher rates" in lowered or "tightening" in lowered:
-        rates = "tightening"
-    elif "rate cut" in lowered or "lower rates" in lowered or "easing" in lowered:
-        rates = "easing"
-    else:
-        rates = "unconditioned"
-    shocks = [shock for shock in ("oil", "credit", "geopolitical") if shock in lowered]
-    return {"economic_state": economic, "inflation_state": inflation, "rate_state": rates, "shocks": shocks}
+    return scenario_payload(question)
 
 
-def _portfolio_chat_tools(user_id: str, question: str, portfolio_id: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _portfolio_chat_tools(user_id: str, question: str, portfolio_id: str | None = None,
+                          context: PortfolioContext | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Route portfolio questions to a small allowlist of deterministic, read-only tools."""
     lowered = question.lower()
     tool_results: list[dict[str, Any]] = []
     tool_evidence: list[dict[str, Any]] = []
-    portfolios = database.list_portfolios(user_id)
-    active_portfolio = (database.get_portfolio(portfolio_id, user_id) if portfolio_id
+    active_portfolio = (context.portfolio_payload() if context else database.get_portfolio(portfolio_id, user_id) if portfolio_id
                         else next(iter(database.list_portfolios(user_id)), None))
     analysis: dict[str, Any] | None = None
     simulation_requested = any(term in lowered for term in (
@@ -2633,15 +2615,25 @@ def _portfolio_chat_tools(user_id: str, question: str, portfolio_id: str | None 
         analysis = database.latest_analysis(user_id, (active_portfolio or {}).get("id"))
         if analysis:
             alternatives = list(analysis.get("alternatives") or [])
+            analysis_diagnostics_text = json.dumps({
+                "warnings": analysis.get("warnings") or [],
+                "model_diagnostics": analysis.get("model_diagnostics") or {},
+            }, default=str).lower()
+            analysis_feasible = not any(term in analysis_diagnostics_text for term in (
+                "infeasible", "constraints incompatible", "constraint violation",
+            ))
             requested_name = next(
                 (name for name in ("Risk-Controlled", "Balanced", "Goal-Tilted") if name.lower() in lowered),
                 "Balanced",
             )
-            selected = next((item for item in alternatives if item.get("name") == requested_name), None)
+            selected = next((item for item in alternatives if item.get("name") == requested_name), None) if analysis_feasible else None
             tool_results.append({
                 "tool_name": "latest_portfolio_analysis", "status": "complete",
                 "title": "Latest portfolio analysis", "run_id": analysis.get("id"),
-                "summary": {"selected_alternative": selected, "created_at": analysis.get("created_at")},
+                "summary": {"selected_alternative": selected, "created_at": analysis.get("created_at"),
+                            "model_diagnostics": analysis.get("model_diagnostics"),
+                            "warnings": analysis.get("warnings") or [],
+                            "optimizer": {"status": "FEASIBLE" if analysis_feasible else "INFEASIBLE"}},
             })
             tool_evidence.append({
                 "label": "Latest saved portfolio analysis",
@@ -2673,7 +2665,10 @@ def _portfolio_chat_tools(user_id: str, question: str, portfolio_id: str | None 
             values = {str(item.get("ticker") or "").upper(): float(item.get("market_value") or 0) for item in holdings}
             total_value = sum(values.values())
             weights = {ticker: value / total_value for ticker, value in values.items()} if total_value > 0 else weights
-        selected = next((item for item in list((analysis or {}).get("alternatives") or []) if item.get("name") == "Balanced"), None)
+        diagnostics_text = json.dumps({"warnings": (analysis or {}).get("warnings") or [],
+                                       "diagnostics": (analysis or {}).get("model_diagnostics") or {}}, default=str).lower()
+        optimizer_feasible = "infeasible" not in diagnostics_text
+        selected = next((item for item in list((analysis or {}).get("alternatives") or []) if item.get("name") == "Balanced"), None) if optimizer_feasible else None
         allocation_map = {str(item.get("ticker") or "").upper(): item for item in list((selected or {}).get("allocations") or [])}
         candidates = []
         for row in payload.get("results", []):
@@ -2708,11 +2703,14 @@ def _portfolio_chat_tools(user_id: str, question: str, portfolio_id: str | None 
             "portfolio_id": active_portfolio.get("id"), "portfolio_name": active_portfolio.get("name"),
             "holding_count": len(tickers), "requested_count": requested_count, "candidates": review,
             "basis": "Balanced-model reductions first when a current saved analysis exists, then weakest comparative stored evidence.",
-            "has_saved_balanced_analysis": selected is not None,
+            "has_saved_balanced_analysis": selected is not None, "optimizer": {
+                "status": "FEASIBLE" if optimizer_feasible and selected else "INFEASIBLE" if analysis else "FAILED",
+                "violated_constraints": (analysis or {}).get("model_diagnostics") or {},
+            },
             "limitations": "This is a rebalance review list, not an automatic liquidation instruction. Taxes, lots, account location, diversification benefit, and user constraints can override the ordering.",
         }
         tool_results.append({
-            "tool_name": "portfolio_rebalance_review", "status": "complete" if review else "unavailable",
+            "tool_name": "portfolio_rebalance_review", "status": "complete" if review and optimizer_feasible else "partial" if review else "unavailable",
             "title": "Portfolio rebalance review", "summary": summary,
         })
         tool_evidence.append({
@@ -2724,9 +2722,10 @@ def _portfolio_chat_tools(user_id: str, question: str, portfolio_id: str | None 
     return tool_results, tool_evidence
 
 
-def _security_ranking_chat_tools(user_id: str, question: str, portfolio_id: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _security_ranking_chat_tools(user_id: str, question: str, portfolio_id: str | None = None,
+                                 context: PortfolioContext | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Rank only the user's disclosed holdings using deterministic stored research evidence."""
-    portfolio = (database.get_portfolio(portfolio_id, user_id) if portfolio_id
+    portfolio = (context.portfolio_payload() if context else database.get_portfolio(portfolio_id, user_id) if portfolio_id
                  else next(iter(database.list_portfolios(user_id)), None))
     holdings = portfolio.get("holdings", []) if portfolio else []
     tickers = list(dict.fromkeys(
@@ -2768,6 +2767,7 @@ def _security_ranking_chat_tools(user_id: str, question: str, portfolio_id: str 
         "note": "The stored composite orders eligible evidence; qualitative buckets are the user-facing conclusion.",
     }
     tool = {"tool_name": "security_ranking", "status": status, "title": "Holdings research ranking", "summary": summary}
+    attach_ask_coverage(tool, context, covered)
     evidence_row = {
         "label": "Deterministic holdings research ranking", "as_of": datetime.now(timezone.utc).isoformat(),
         "url": None, "data": summary, "claim_type": "MODEL_OUTPUT",
@@ -2775,9 +2775,10 @@ def _security_ranking_chat_tools(user_id: str, question: str, portfolio_id: str 
     return [tool], [evidence_row]
 
 
-def _benchmark_outlook_chat_tools(user_id: str, portfolio_id: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _benchmark_outlook_chat_tools(user_id: str, portfolio_id: str | None = None,
+                                  context: PortfolioContext | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Compare saved holdings with SPY using the existing bounded research model."""
-    portfolio = (database.get_portfolio(portfolio_id, user_id) if portfolio_id
+    portfolio = (context.portfolio_payload() if context else database.get_portfolio(portfolio_id, user_id) if portfolio_id
                  else next(iter(database.list_portfolios(user_id)), None))
     holdings = list((portfolio or {}).get("holdings") or [])
     tickers = list(dict.fromkeys(
@@ -2799,14 +2800,14 @@ def _benchmark_outlook_chat_tools(user_id: str, portfolio_id: str | None = None)
         if not row:
             continue
         modeled_return = float(row.get("expected_return") or 0)
-        context = contexts.get(ticker) or {}
+        decision_context = contexts.get(ticker) or {}
         comparisons.append({
             "ticker": ticker, "company": row.get("company"), "modeled_return": modeled_return,
             "spy_modeled_return": benchmark_return, "modeled_excess_return": modeled_return - benchmark_return,
             "confidence": row.get("confidence"), "data_quality": row.get("data_quality"),
             "fundamentals_as_of": row.get("fundamentals_as_of"), "price_as_of": row.get("price_as_of"),
             "risk_flags": row.get("risk_flags") or [], "prediction_market_count": len(row.get("prediction_markets") or []),
-            "thesis_status": context.get("thesis_status"), "latest_decision": context.get("latest_decision"),
+            "thesis_status": decision_context.get("thesis_status"), "latest_decision": decision_context.get("latest_decision"),
         })
     comparisons.sort(key=lambda item: float(item["modeled_excess_return"]), reverse=True)
     summary = {
@@ -2818,14 +2819,16 @@ def _benchmark_outlook_chat_tools(user_id: str, portfolio_id: str | None = None)
     }
     result = {"tool_name": "benchmark_outlook", "status": "complete" if comparisons else "unavailable",
               "title": "Holdings versus SPY", "summary": summary}
+    attach_ask_coverage(result, context, {row["ticker"] for row in comparisons})
     evidence = {"label": "Modeled saved-holdings outlook versus SPY", "as_of": datetime.now(timezone.utc).isoformat(),
                 "url": None, "data": summary, "claim_type": "MODEL_OUTPUT"}
     return [result], [evidence]
 
 
-def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None,
+                               context: PortfolioContext | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Summarize saved concentration using holdings and cached intelligence."""
-    portfolio = (database.get_portfolio(portfolio_id, user_id) if portfolio_id
+    portfolio = (context.portfolio_payload() if context else database.get_portfolio(portfolio_id, user_id) if portfolio_id
                  else next(iter(database.list_portfolios(user_id)), None))
     holdings = list((portfolio or {}).get("holdings") or [])
     if not holdings:
@@ -2868,6 +2871,7 @@ def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None) ->
         "limitations": "Position and account weights come directly from saved holdings. Sector, industry, correlation, shared-dependency, and covariance fields are included only when a cached portfolio-intelligence snapshot is available; ETF look-through is not inferred.",
     }
     tool = {"tool_name": "portfolio_risk", "status": "complete", "title": "Saved portfolio risks", "summary": summary}
+    attach_ask_coverage(tool, context, {row["ticker"] for row in positions})
     evidence = {"label": "Saved portfolio position-size risk summary", "as_of": (portfolio or {}).get("updated_at"),
                 "url": None, "data": summary, "claim_type": "MODEL_OUTPUT"}
     return [tool], [evidence]
@@ -3213,7 +3217,7 @@ def _chat_narration_fallback(tool_results: list[dict[str, Any]]) -> str:
             + "\n\n**What to verify:** inspect the tool status, evidence dates, warnings, and linked calculations below."
         )
     return (
-        "No approved evidence tool completed in time, and the AI interpretation service was also unavailable. No financial conclusion was generated.\n\n"
+        "No approved evidence tool completed in time, and the AI interpretation service did not respond within the interactive deadline. No financial conclusion was generated.\n\n"
         "**What to verify:** check Provider health and retry after the affected service recovers."
     )
 
@@ -3384,7 +3388,8 @@ def _comparison_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, 
 
 def _execute_ask_tool(tool: str, user_id: str, question: str,
                       portfolio_id: str | None = None,
-                      tickers: tuple[str, ...] = ()) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                      tickers: tuple[str, ...] = (),
+                      context: PortfolioContext | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     triggers = {
         "company_research": "",
         "evidence_changes": " what changed",
@@ -3404,7 +3409,7 @@ def _execute_ask_tool(tool: str, user_id: str, question: str,
         "cash_allocation", "thesis_invalidation",
     }
     if tool in cached_portfolio_tools:
-        return ask_portfolio.run("thesis_monitor" if tool == "thesis_invalidation" else tool, user_id, portfolio_id, question, tickers)
+        return ask_portfolio.run("thesis_monitor" if tool == "thesis_invalidation" else tool, user_id, portfolio_id, question, tickers, context)
     if tool == "stored_evidence":
         stored = retrieve_evidence(user_id, question, portfolio_id) if portfolio_id else retrieve_evidence(user_id, question)
         return [{"tool_name": tool, "status": "complete", "title": "Stored evidence"}], stored
@@ -3423,28 +3428,29 @@ def _execute_ask_tool(tool: str, user_id: str, question: str,
         wanted = "earnings_intelligence" if tool == "earnings_intelligence" else "portfolio_intelligence"
         return [item for item in tools if item.get("tool_name") == wanted], grounded
     if tool == "portfolio_scenario":
-        return _portfolio_chat_tools(user_id, routed_question, portfolio_id)
+        return _portfolio_chat_tools(user_id, routed_question, portfolio_id, context)
     if tool == "portfolio_analysis":
-        return _portfolio_chat_tools(user_id, routed_question, portfolio_id)
+        return _portfolio_chat_tools(user_id, routed_question, portfolio_id, context)
     if tool == "portfolio_risk":
-        return _portfolio_risk_chat_tools(user_id, portfolio_id)
+        return _portfolio_risk_chat_tools(user_id, portfolio_id, context)
     if tool == "decision_journal":
         return _decision_journal_chat_tools(user_id, routed_question)
     if tool == "company_comparison":
         return _comparison_chat_tools(user_id, routed_question)
     if tool == "security_ranking":
-        return _security_ranking_chat_tools(user_id, routed_question, portfolio_id)
+        return _security_ranking_chat_tools(user_id, routed_question, portfolio_id, context)
     if tool == "benchmark_outlook":
-        return _benchmark_outlook_chat_tools(user_id, portfolio_id)
+        return _benchmark_outlook_chat_tools(user_id, portfolio_id, context)
     return [{"tool_name": tool, "status": "unavailable", "title": tool.replace("_", " ").title()}], []
 
 
 def _instrumented_ask_tool(tool: str, user_id: str, question: str,
                            portfolio_id: str | None = None,
-                           tickers: tuple[str, ...] = ()) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                           tickers: tuple[str, ...] = (),
+                           context: PortfolioContext | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     started=time.monotonic()
     try:
-        result=_execute_ask_tool(tool,user_id,question,portfolio_id,tickers)
+        result=_execute_ask_tool(tool,user_id,question,portfolio_id,tickers,context)
         record_metric("ask.tool.success", tags={"tool":tool})
         return result
     except Exception:
@@ -3457,6 +3463,7 @@ def _instrumented_ask_tool(tool: str, user_id: str, question: str,
 def _execute_chat_plan_tools(
     tools: tuple[str, ...], user_id: str, question: str, started: float,
     portfolio_id: str | None = None, tickers: tuple[str, ...] = (),
+    context: PortfolioContext | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Execute a chat plan without orphaned background analysis threads.
 
@@ -3494,7 +3501,7 @@ def _execute_chat_plan_tools(
                 continue
             try:
                 if portfolio_id or tickers:
-                    results, grounded = _instrumented_ask_tool(tool, user_id, question, portfolio_id, tickers)
+                    results, grounded = _instrumented_ask_tool(tool, user_id, question, portfolio_id, tickers, context)
                 else:
                     results, grounded = _instrumented_ask_tool(tool, user_id, question)
                 if not results:
@@ -3504,6 +3511,8 @@ def _execute_chat_plan_tools(
                         "summary": {"message": "No matching stored evidence was available."},
                     }]
                 for result in results:
+                    if not isinstance(result.get("coverage"), dict):
+                        attach_ask_coverage(result, context)
                     result["execution_state"] = ask_orchestration.execution_state(
                         str(result.get("status", "partial"))
                     )
@@ -3573,6 +3582,7 @@ def _persist_chat_tool_links(user_id: str, conversation_id: str, message_id: str
 
 @app.post("/api/chat/messages")
 def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    request_id = str(uuid.uuid4())
     if not database.DATABASE_URL:
         raise HTTPException(503, "Chat history requires Supabase storage")
     conversation_id = payload.conversation_id
@@ -3625,9 +3635,10 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
         plan = ask_orchestration.build_plan("general portfolio evidence", payload.workspace, page_context, previous_context)
     if plan.requires_portfolio and not requested_portfolio_id:
         raise HTTPException(422, "Select a portfolio before asking a portfolio-specific question.")
+    portfolio_context: PortfolioContext | None = None
     if requested_portfolio_id:
         try:
-            database.get_portfolio(requested_portfolio_id, user.id)
+            portfolio_context = build_portfolio_context(database.get_portfolio(requested_portfolio_id, user.id))
         except KeyError as exc:
             raise HTTPException(404, "Selected portfolio not found") from exc
     if conversation_id is None:
@@ -3641,7 +3652,10 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
         conversation_meta = database.rename_conversation(user.id, conversation_id, payload.question[:72])
     page_context["portfolio_id"] = requested_portfolio_id
     record_metric("ask.intent", tags={"intent": plan.intent, "tool_count": len(plan.tools),
-                                       "confidence": plan.confidence, "portfolio_id": requested_portfolio_id or "none"})
+                                       "confidence": plan.confidence, "portfolio_id": requested_portfolio_id or "none",
+                                       "request_id": request_id,
+                                       "portfolio_position_count": portfolio_context.total_positions if portfolio_context else 0,
+                                       "portfolio_context_version": portfolio_context.version if portfolio_context else "none"})
     routed_question = payload.question
     database.save_chat_message(user.id, conversation_id, "user", payload.question,
                                {"page_context": page_context, "planned_intent": plan.intent,
@@ -3649,13 +3663,21 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
     started = time.monotonic()
     tool_started = started
     tool_results, evidence_rows, execution_steps = _execute_chat_plan_tools(
-        plan.tools, user.id, routed_question, started, requested_portfolio_id, plan.tickers,
+        plan.tools, user.id, routed_question, started, requested_portfolio_id, plan.tickers, portfolio_context,
     )
     tools_elapsed = time.monotonic() - tool_started
+    scenario_factors = parse_scenario_factors(payload.question)
+    verification = verify_results(plan.intent, portfolio_context, scenario_factors, tool_results)
+    analysis_result = verified_analysis_result(
+        plan.intent, portfolio_context, scenario_factors, tool_results, verification,
+    )
     # Keep the grounded prompt bounded even when several securities each have
     # multiple articles. On-demand company evidence is ordered first so the
     # tool the user explicitly requested cannot be crowded out by older context.
-    evidence = evidence_rows[:36]
+    # Both renderers consume this one verified contract. Raw tool evidence is
+    # retained for source metadata but cannot bypass the verification gates.
+    evidence = [{"label": "Verified Ask analysis", "as_of": datetime.now(timezone.utc).isoformat(),
+                 "url": None, "data": analysis_result, "claim_type": "MODEL_OUTPUT"}]
     try:
         preference_context = product_preferences.ask_context(user.id)
     except Exception as exc:
@@ -3679,6 +3701,34 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
         record_metric("ask.partial", tags={"intent":plan.intent})
     narration_started = time.monotonic()
     deterministic_answer = ask_portfolio.compose(plan.intent, tool_results) or _deterministic_chat_answer(plan.intent, tool_results)
+    if not verification.answer_allowed:
+        deterministic_answer = (
+            f"I evaluated **{verification.coverage['evaluated']} of {verification.coverage['requested']} holdings** "
+            f"(**{verification.coverage['percent']:.1f}% coverage**), so I cannot reliably characterize the whole portfolio. "
+            "No portfolio-wide conclusion or recommendation was generated.\n\n"
+            + "\n".join(f"- {message}" for message in verification.failures + verification.warnings)
+            + "\n\n**What to verify:** refresh missing holding evidence and rerun the analysis."
+        )
+    elif not verification.recommendation_allowed and plan.intent in {
+        "PORTFOLIO_ANALYSIS", "THESIS_REPLACEMENT", "WATCHLIST_COMPARISON", "CASH_ALLOCATION"
+    }:
+        deterministic_answer = (
+            "A valid actionable portfolio recommendation could not be produced. The verified diagnostics are still available, "
+            "but attempted optimizer weights and trades have been withheld.\n\n"
+            + "\n".join(f"- {message}" for message in verification.failures + verification.warnings)
+            + "\n\n**What to verify:** resolve the listed coverage, constraint, or portfolio-state issue before using a rebalance."
+        )
+    elif verification.status == "PARTIAL" and deterministic_answer:
+        if verification.coverage["percent"] < 90.0:
+            disclosure = (
+                f"> **Partial portfolio coverage:** {verification.coverage['evaluated']} of "
+                f"{verification.coverage['requested']} holdings ({verification.coverage['percent']:.1f}%) were evaluated. "
+                "Treat portfolio-wide conclusions as provisional."
+            )
+        else:
+            limitations = verification.failures + verification.warnings
+            disclosure = "> **Verification limitation:** " + " ".join(limitations)
+        deterministic_answer = disclosure + "\n\n" + deterministic_answer
     # Earnings questions ask for interpretation ("what changed" and thesis
     # impact), not merely a dump of stored fields. Use Gemini when configured,
     # while retaining the polished deterministic answer as a zero-latency and
@@ -3689,17 +3739,21 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
         "DATA_QUALITY", "SCORE_ATTRIBUTION", "THESIS_INVALIDATION", "PORTFOLIO_ANALYSIS", "PORTFOLIO_RISK",
         "MULTIFACTOR_SCREEN", "RECOMMENDATION_COUNTERCASE", "CASH_ALLOCATION",
     }
-    interpret_with_gemini = plan.intent in {"EARNINGS", *synthesis_intents} and bool(
-        os.getenv("GEMINI_API_KEY", "").strip()
+    # Gemini is an optional renderer, never the request's correctness or
+    # availability boundary. Deterministic answers are the default fast path;
+    # deployments may opt into synchronous prose enrichment explicitly.
+    enrichment_enabled = os.getenv("ASK_GEMINI_ENRICHMENT", "0").strip().lower() in {"1", "true", "on", "yes"}
+    interpret_with_gemini = verification.status == "SUCCESS" and bool(os.getenv("GEMINI_API_KEY", "").strip()) and (
+        deterministic_answer is None or (enrichment_enabled and plan.intent in {"EARNINGS", *synthesis_intents})
     )
-    if deterministic_answer is not None and not interpret_with_gemini:
-        answer = deterministic_answer
+    if not interpret_with_gemini:
+        answer = deterministic_answer or _chat_narration_fallback(tool_results)
         model = "deterministic-chat-composer-v1"
         record_metric("ask.narration.fast_path", tags={"intent": plan.intent})
     else:
         try:
             answer, model = ask_gemini(payload.question, evidence, history, conversation_meta.get("summary") or "")
-        except RuntimeError as exc:
+        except Exception as exc:
             record_metric("ask.narration.fallback", tags={"intent": plan.intent, "error_type": type(exc).__name__})
             answer = deterministic_answer or _chat_narration_fallback(tool_results)
             model = "deterministic-timeout-fallback-v1"
@@ -3716,9 +3770,18 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
         "analysis_context": {"intent": plan.intent, "tickers": list(plan.tickers),
                              "portfolio_id": requested_portfolio_id, "route_confidence": plan.confidence,
                              "tool_names": [item.get("tool_name") for item in tool_results],
-                             "cache_hit": True, "evidence_coverage": len(evidence),
+                             "request_id": request_id,
+                             "portfolio_context_version": portfolio_context.version if portfolio_context else None,
+                             "portfolio_position_count": portfolio_context.total_positions if portfolio_context else 0,
+                             "cache_hit": True, "evidence_coverage": verification.coverage,
+                             "verification_status": verification.status,
+                             "recommendation_allowed": verification.recommendation_allowed,
+                             "gemini_started": interpret_with_gemini,
+                             "gemini_completed": not str(model).startswith("deterministic"),
+                             "fallback_used": model == "deterministic-timeout-fallback-v1",
                              "answer_complete": "answer is incomplete" not in answer.lower(),
                              "router_version": "v2" if ASK_ROUTER_V2_ENABLED else "v1"},
+        "analysis_result": analysis_result,
         "actions": ask_orchestration.actions_for(plan, page_context),
         "grounding": {"categories": ["VERIFIED_FACT", "MODEL_OUTPUT", "MARKET_IMPLIED", "USER_BELIEF", "AI_INTERPRETATION"],
                       "tool_claim_types": {item.get("tool_name"): claim_types.get(str(item.get("tool_name")), "VERIFIED_FACT") for item in tool_results}},
@@ -3734,6 +3797,18 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
             len(updated_history),
         )
     record_metric("ask.total.latency_ms",(time.monotonic()-started)*1000,tags={"intent":plan.intent,"status":"complete"})
+    LOGGER.info(
+        "ask_request request_id=%s intent=%s positions=%s context_version=%s tools=%s statuses=%s "
+        "coverage=%s verification=%s recommendation_allowed=%s gemini_started=%s gemini_completed=%s "
+        "fallback_used=%s tools_ms=%s narration_ms=%s total_ms=%s",
+        request_id, plan.intent, portfolio_context.total_positions if portfolio_context else 0,
+        portfolio_context.version if portfolio_context else "none", ",".join(plan.tools),
+        ",".join(str(row.get("execution_state") or row.get("status")) for row in tool_results),
+        verification.coverage, verification.status, verification.recommendation_allowed,
+        interpret_with_gemini, not str(model).startswith("deterministic"),
+        model == "deterministic-timeout-fallback-v1", round(tools_elapsed * 1000),
+        round(narration_elapsed * 1000), round((time.monotonic() - started) * 1000),
+    )
     return {"conversation_id": conversation_id, "message": message, "sources": sources, "tool_results": tool_results}
 
 

@@ -60,6 +60,18 @@ def test_chat_rejects_partial_answer_without_a_second_request(monkeypatch) -> No
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("malformed", [
+    "] orphaned continuation text. What to verify: rerun.",
+    "This looks complete but omits the required verification guidance.",
+])
+def test_chat_rejects_malformed_or_unverifiable_narration(monkeypatch, malformed: str) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr("backend.chat.requests.post", lambda *args, **kwargs: _Response(malformed, "STOP"))
+
+    with pytest.raises(IncompleteNarrationError):
+        ask_gemini("What changed?", [], [])
+
+
 def test_prompt_bounding_preserves_nested_holding_records() -> None:
     evidence = {"data": {"summary": {"positions": [
         {"ticker": "BLK", "weight": .0118, "market_value": 39438.41, "sector": "Financials"},
