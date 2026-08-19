@@ -1,4 +1,6 @@
-from backend.chat import _bounded_value, ask_gemini, retrieve_evidence
+import pytest
+
+from backend.chat import IncompleteNarrationError, _bounded_value, ask_gemini, retrieve_evidence
 
 
 class _Response:
@@ -42,7 +44,7 @@ def test_chat_continues_a_max_tokens_response(monkeypatch) -> None:
     assert model
 
 
-def test_chat_cleans_partial_answer_without_a_second_request(monkeypatch) -> None:
+def test_chat_rejects_partial_answer_without_a_second_request(monkeypatch) -> None:
     calls = []
 
     def fake_post(*args, **kwargs):
@@ -52,12 +54,10 @@ def test_chat_cleans_partial_answer_without_a_second_request(monkeypatch) -> Non
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setenv("GEMINI_MAX_CONTINUATIONS", "0")
     monkeypatch.setattr("backend.chat.requests.post", fake_post)
-    answer, _ = ask_gemini("What changed?", [], [])
+    with pytest.raises(IncompleteNarrationError):
+        ask_gemini("What changed?", [], [])
 
     assert len(calls) == 1
-    assert answer.startswith("A completed evidence-backed sentence.")
-    assert "unfinished fragment" not in answer
-    assert "answer is incomplete" in answer.lower()
 
 
 def test_prompt_bounding_preserves_nested_holding_records() -> None:

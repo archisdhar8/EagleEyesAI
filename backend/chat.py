@@ -152,6 +152,10 @@ def _clean_partial_answer(answer: str) -> str:
     return cleaned + "\n\n**Answer status:** The explanation provider stopped early. The completed statements above are grounded, but this answer is incomplete; retrying the same question should produce the full synthesis."
 
 
+class IncompleteNarrationError(RuntimeError):
+    """Raised when the optional narrator cannot finish a complete answer."""
+
+
 def ask_gemini(question: str, evidence: list[dict[str, Any]], history: list[dict[str, Any]],
                conversation_summary: str = "") -> tuple[str, str]:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -203,7 +207,11 @@ Do not add a sources list; the application manages source metadata separately.""
         ])
     answer = "\n\n".join(part for part in answer_parts if part).strip()
     if finish_reason == "MAX_TOKENS":
-        answer = _clean_partial_answer(answer)
+        # A partial narrator response is worse than the complete deterministic
+        # portfolio answer already available to the API layer.  Treat output
+        # exhaustion like any other optional-narrator failure so callers can
+        # use that cached fallback instead of publishing a cut-off paragraph.
+        raise IncompleteNarrationError("Gemini exhausted its output budget before completing the answer")
     return answer, model
 
 

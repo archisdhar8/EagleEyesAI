@@ -194,6 +194,109 @@ def _rows(items: list[dict[str, Any]], formatter, limit: int = 5) -> str:
     return "\n".join(f"{index}. {formatter(row)}" for index, row in enumerate(items[:limit], 1))
 
 
+def _weight_rows(items: list[dict[str, Any]], label_key: str, limit: int = 5) -> str:
+    eligible = [row for row in items if row.get(label_key) and row.get("weight") is not None]
+    eligible.sort(key=lambda row: _number(row.get("weight")), reverse=True)
+    return _rows(
+        eligible,
+        lambda row: f"**{row.get(label_key)}** — {_number(row.get('weight')):.1%}",
+        limit,
+    )
+
+
+def _factor_label(value: Any) -> str:
+    acronyms = {"ai": "AI", "cpi": "CPI", "gdp": "GDP"}
+    return " ".join(acronyms.get(word.lower(), word.title()) for word in str(value or "").replace("_", " ").split())
+
+
+def _hidden_risk_answer(summary: dict[str, Any]) -> str:
+    concentration = summary.get("concentration") or {}
+    positions = list(concentration.get("positions") or [])
+    sectors = list(concentration.get("sector") or [])
+    industries = list(concentration.get("industry") or [])
+    correlation = summary.get("correlation") or {}
+    clusters = list(correlation.get("clusters") or [])
+    dependencies = list(summary.get("economic_dependencies") or [])
+    risk = list(summary.get("highest_risk_holdings") or [])
+    coverage = summary.get("coverage") or {}
+
+    position_text = _rows(
+        positions,
+        lambda row: f"**{row.get('ticker')}** — {_number(row.get('weight')):.1%} of portfolio value",
+        6,
+    )
+    sector_text = _weight_rows(sectors, "sector", 5)
+    industry_text = _weight_rows(industries, "industry", 4)
+    cluster_text = _rows(
+        clusters,
+        lambda row: (
+            f"**{', '.join(row.get('holdings') or [])}** — {_number(row.get('portfolio_weight')):.1%} combined weight"
+            + (f"; strongest measured pair correlation {_number((row.get('strongest_pair') or {}).get('correlation')):.2f}"
+               if row.get("strongest_pair") else "")
+        ),
+        3,
+    )
+    dependency_text = _rows(
+        dependencies,
+        lambda row: (
+            f"**{_factor_label(row.get('factor'))}** — "
+            f"{_number(row.get('mapped_portfolio_weight')):.1%} mapped exposure across "
+            f"{', '.join((row.get('holdings') or [])[:8]) or 'covered holdings'}; {row.get('mechanism') or 'shared economic driver'}"
+        ),
+        4,
+    )
+    risk_text = _rows(
+        risk,
+        lambda row: (
+            f"**{row.get('ticker')}** — modeled risk contribution {_number(row.get('risk_contribution')):.1%}, "
+            f"portfolio weight {_number(row.get('weight')):.1%}, health {_number(row.get('health_score')):.0f}/100"
+        ),
+        8,
+    )
+    effective = concentration.get("effective_holdings")
+    largest = positions[0] if positions else None
+    headline = (
+        f"The portfolio's visible concentration starts with **{largest.get('ticker')} at {_number(largest.get('weight')):.1%}**"
+        if largest else "The cached snapshot does not contain position weights"
+    )
+    if effective is not None:
+        headline += f", and its weights are equivalent to roughly **{_number(effective):.1f} equally sized holdings**"
+    headline += ". The more important risk concentration is the overlap between the largest positions, correlated clusters, and shared economic drivers below [S1]."
+
+    sections = [f"## Conclusion\n\n{headline}"]
+    if position_text:
+        sections.append(f"## Capital concentration\n\n{position_text}")
+    if sector_text or industry_text:
+        classification = ""
+        if sector_text:
+            classification += f"**Largest classified sectors**\n\n{sector_text}"
+        if industry_text:
+            classification += ("\n\n" if classification else "") + f"**Largest classified industries**\n\n{industry_text}"
+        sections.append(f"## Sector and industry overlap\n\n{classification}")
+    shared = ""
+    if cluster_text:
+        shared += f"**Return-correlation clusters**\n\n{cluster_text}"
+    elif str(correlation.get("status") or "").upper() == "UNAVAILABLE":
+        shared += f"Return-correlation evidence is unavailable: {correlation.get('reason') or 'stored price history was insufficient.'}"
+    if dependency_text:
+        shared += ("\n\n" if shared else "") + f"**Shared economic dependencies**\n\n{dependency_text}"
+    if shared:
+        sections.append(f"## Hidden shared-risk concentration\n\n{shared}")
+    if risk_text:
+        sections.append(f"## Largest modeled risk contributors\n\n{risk_text}")
+
+    classification_coverage = coverage.get("classification_weight")
+    coverage_note = (
+        f"Sector and dependency classifications cover **{_number(classification_coverage):.1%}** of portfolio weight. "
+        if classification_coverage is not None else
+        "The snapshot does not report classification coverage. "
+    )
+    coverage_note += "ETF holdings are shown at the fund level unless look-through constituent data is explicitly present, so direct holdings may overlap with an index fund more than these totals reveal."
+    sections.append(f"## Coverage limits\n\n{coverage_note}")
+    sections.append("**What to verify:** inspect ETF look-through, the covariance date and sample size, and whether the largest shared economic dependencies match how you understand the businesses.")
+    return "\n\n".join(sections)
+
+
 def compose(intent: str, tool_results: list[dict[str, Any]]) -> str | None:
     result = next((row for row in tool_results if row.get("status") == "complete"), None)
     summary = (result or {}).get("summary") or {}
@@ -228,11 +331,12 @@ def compose(intent: str, tool_results: list[dict[str, Any]]) -> str | None:
     if intent == "PORTFOLIO_EVENTS":
         body = _rows(summary.get("events") or [], lambda row: f"**{row.get('title') or row.get('name') or row.get('event')}** — {row.get('date') or row.get('starts_at') or row.get('occurred_at') or 'date unavailable'}; affected: {', '.join(row.get('affected_holdings') or row.get('tickers') or []) or 'not mapped'} [S1]", 12)
         return f"The stored event calendar contains these upcoming portfolio-relevant events:\n\n{body or 'No covered upcoming event is stored.'}\n\n**What to verify:** confirm event dates and coverage before assuming silence means no catalyst exists."
-    if intent in {"HIDDEN_RISK", "RECOMMENDATION_COUNTERCASE"}:
+    if intent == "HIDDEN_RISK":
+        return _hidden_risk_answer(summary)
+    if intent == "RECOMMENDATION_COUNTERCASE":
         risk = summary.get("highest_risk_holdings") or []
         body = _rows(risk, lambda row: f"**{row.get('ticker')}** — modeled risk contribution {_number(row.get('risk_contribution')):.1%}, weight {_number(row.get('weight')):.1%}, health {_number(row.get('health_score')):.0f}/100 [S1]", 8)
-        prefix = "The strongest arguments against the current leading opportunity are its weakest factor, modeled risk contribution, concentration role, and any coverage warning." if intent == "RECOMMENDATION_COUNTERCASE" else "The largest cached hidden-risk contributors are:"
-        return f"{prefix}\n\n{body}\n\nThis cached view does not invent sector or correlation evidence that is absent from the snapshot.\n\n**What to verify:** inspect sector, theme, correlation, ETF look-through, and covariance diagnostics before changing exposure."
+        return f"The strongest arguments against the current leading opportunity are its weakest factor, modeled risk contribution, concentration role, and any coverage warning.\n\n{body}\n\nThis cached view does not invent sector or correlation evidence that is absent from the snapshot.\n\n**What to verify:** inspect sector, theme, correlation, ETF look-through, and covariance diagnostics before changing exposure."
     if intent in {"WATCHLIST_COMPARISON", "THESIS_REPLACEMENT", "CASH_ALLOCATION"}:
         rows = summary.get("watchlist_candidates") or []
         body = _rows(rows, lambda row: f"**{row.get('ticker')}** — fundamentals {_number(row.get('fundamental_score')):.0f}, valuation {_number(row.get('valuation_score')):.0f}, momentum {_number(row.get('technical_score')):.0f}, confidence {_number(row.get('confidence')):.0f}/100 [S1]", 8)
