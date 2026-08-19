@@ -37,7 +37,7 @@ function dateLabel(value?: string | null) {
   return new Date(/^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T12:00:00` : value).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
-export function MarketClimatePage({ macro, factors, scenarios, regimeHistory, request, onRefresh, onAsk }: {
+export function MarketClimatePage({ macro, factors, regimeHistory, request, onRefresh, onAsk }: {
   macro: Macro;
   factors: MacroFactor[];
   scenarios: Scenario[];
@@ -49,7 +49,12 @@ export function MarketClimatePage({ macro, factors, scenarios, regimeHistory, re
   const [payload, setPayload] = useState<MarketPayload>({ markets: [], disagreements: [], as_of: "" });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const climate = climateLabel(macro.regime);
+  const fallbackClimate = climateLabel(macro.regime);
+  const climate = {
+    name: macro.climate_label || fallbackClimate.name,
+    summary: macro.climate_summary || fallbackClimate.summary,
+    tone: macro.score >= 60 ? "supportive" : macro.score < 45 ? "risk" : "mixed",
+  };
 
   async function load() {
     setLoading(true); setError("");
@@ -72,17 +77,18 @@ export function MarketClimatePage({ macro, factors, scenarios, regimeHistory, re
   const markets = useMemo(() => [...payload.markets].sort((a, b) => b.relevance_score - a.relevance_score), [payload.markets]);
   const portfolioMarkets = markets.filter(item => item.affected_holdings.length || item.affected_theses.length).slice(0, 6);
   const macroMarkets = markets.filter(item => item.category === "MACRO" || item.category === "POLICY").slice(0, 8);
-  const confidence = macro.score >= 70 ? "High conviction" : macro.score >= 55 ? "Moderate conviction" : "Low conviction";
+  const scale = macro.climate_scale || ["Economic stress", "Slowing growth", "Mixed conditions", "Steady growth", "Strong expansion"];
+  const activeScale = Math.max(0, Math.min(4, macro.score >= 75 ? 4 : macro.score >= 60 ? 3 : macro.score >= 45 ? 2 : macro.score >= 30 ? 1 : 0));
 
   return <section className="workspace market-climate-workspace">
     <header className={`market-climate-hero ${climate.tone}`}>
-      <div><span className="kicker">Market Climate</span><h2>{climate.name}</h2><p>{climate.summary}</p><div><span>{confidence}</span><span>Evidence through {dateLabel(macro.as_of)}</span><span>{regimeHistory.total_samples} historical months classified</span></div></div>
-      <aside><span>Current EagleEyes state</span><strong>{climate.name}</strong><small>FRED macro evidence, historical regimes, and market-implied expectations remain separate inputs.</small><button className="primary" onClick={() => { onRefresh(); void load(); }}>Refresh climate</button></aside>
+      <div><span className="kicker">Market Climate</span><h2>{climate.name}</h2><p>{climate.summary}</p><div><span>Climate score {macro.score.toFixed(0)}/100</span><span>Evidence through {dateLabel(macro.as_of)}</span><span>{regimeHistory.total_samples} historical months classified</span></div></div>
+      <aside><span>Current EagleEyes state</span><strong>{climate.name}</strong><small>{macro.score_methodology || "Current macro evidence is combined into one deterministic five-state climate."}</small><button className="primary" onClick={() => { onRefresh(); void load(); }}>Refresh climate</button></aside>
     </header>
 
     <section className="market-climate-section"><div className="section-heading"><div><span className="kicker">What is driving it</span><h2>Five forces shaping the current state</h2><p>Clear direction labels first; raw series and methodology remain available inside each card.</p></div></div><div className="market-driver-grid">{factors.map(factor => { const change = factor.evidence[0]?.change; const direction = change == null ? "Awaiting trend" : Math.abs(change) < .01 ? "Broadly stable" : change > 0 ? "Rising" : "Falling"; return <article className="panel" key={factor.key}><span>{factor.label}</span><h3>{direction}</h3><p>{factor.why_it_matters}</p><details><summary>Evidence</summary>{factor.evidence.map(row => <div key={row.series_id}><b>{row.series_id}</b><span>{row.value.toFixed(2)} · {dateLabel(row.date)}</span></div>)}</details></article>; })}</div></section>
 
-    <section className="market-climate-section"><div className="section-heading"><div><span className="kicker">Scenario map</span><h2>What could happen next</h2><p>These conditions can overlap, so they are not forced to total 100%.</p></div><button className="secondary" onClick={() => onAsk("Explain the current macro state and which scenario changes would matter most to my portfolio.")}>Ask about this climate →</button></div><div className="climate-scenario-grid">{scenarios.slice(0, 9).map(item => <article className="panel" key={item.key}><span>{item.dimension || "Scenario"}</span><h3>{item.label}</h3><strong>{pct(item.probability)}</strong><small>{item.evidence_basis?.replaceAll("_", " ") || "disclosed evidence"} · confidence {pct(item.confidence)}</small></article>)}</div></section>
+    <section className="market-climate-section"><div className="section-heading"><div><span className="kicker">Five-state scale</span><h2>One readable view of current conditions</h2><p>The score combines the macro inputs above into one present-tense climate. It does not claim that several overlapping scenarios are simultaneously “the market.”</p></div><button className="secondary" onClick={() => onAsk("Explain the current market climate score and how it affects my portfolio.")}>Ask about this climate →</button></div><div className="climate-state-scale">{scale.map((label,index)=><article className={`panel ${index===activeScale?"active":""}`} key={label}><span>{index===activeScale?"Current climate":"Possible state"}</span><h3>{label}</h3>{index===activeScale&&<strong>{macro.score.toFixed(0)}/100</strong>}</article>)}</div></section>
 
     <section className="market-climate-section"><div className="section-heading"><div><span className="kicker">Prediction markets</span><h2>What markets are pricing now</h2><p>Kalshi and Polymarket probabilities are forward-looking evidence—not truth and not an EagleEyes forecast.</p></div><small>{loading ? "Loading market expectations…" : `Snapshot ${dateLabel(payload.as_of)}`}</small></div>{error && <div className="warning-strip"><span>△ {error}</span><button onClick={() => void load()}>Retry</button></div>}{payload.disagreements.length > 0 && <div className="warning-strip"><span>△ Providers materially disagree on {payload.disagreements.length} tracked event{payload.disagreements.length === 1 ? "" : "s"}; their probabilities are not averaged.</span></div>}
       {portfolioMarkets.length > 0 && <><h3 className="market-group-title">Most relevant to your holdings and theses</h3><div className="climate-market-grid">{portfolioMarkets.map(MarketCard)}</div></>}

@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from backend.main import app
+from backend import main
 
 
 def _result(run_id: str) -> dict:
@@ -18,6 +19,28 @@ def _result(run_id: str) -> dict:
         "warnings": [],
         "data_lineage": {},
     }
+
+
+def test_exact_research_detail_reuses_shared_stored_evidence_without_user_context(monkeypatch) -> None:
+    calls = {"research": 0, "reference": 0}
+    main._RESEARCH_DETAIL_CACHE.clear()
+
+    def fake_research(tickers, price_limit=260):
+        calls["research"] += 1
+        return [{"ticker": tickers[0], "company": "Example"}]
+
+    def fake_reference(tickers):
+        calls["reference"] += 1
+        return {"events": [{"ticker": tickers[0]}]}
+
+    monkeypatch.setattr(main, "security_research", fake_research)
+    monkeypatch.setattr(main.database, "research_reference_data", fake_reference)
+    first = main._cached_research_detail("AAPL")
+    first[0][0]["company"] = "mutated by caller"
+    second = main._cached_research_detail("AAPL")
+
+    assert calls == {"research": 1, "reference": 1}
+    assert second[0][0]["company"] == "Example"
 
 
 def test_analysis_reuses_same_market_session_and_restores_latest(monkeypatch) -> None:

@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from backend.analysis import (
-    _optimize, _price_coverage_diagnostics, _projection, _tax_estimate, _walk_forward,
+    _optimize, _price_coverage_diagnostics, _projection, _tax_estimate, _walk_forward, market_climate,
 )
 from backend.models import InvestorProfile
 from backend.quant import REGIME_KEYS, dynamic_covariance, empirical_regime_returns
@@ -16,6 +16,17 @@ def test_projection_is_reproducible_and_ordered() -> None:
     assert first == second
     assert first["nominal_p10"] < first["nominal_p50"] < first["nominal_p90"]
     assert 0 <= first["goal_probability"] <= 1
+
+
+@pytest.mark.parametrize(
+    ("score", "state"),
+    [(0, "economic_stress"), (30, "slowing_growth"), (45, "mixed_conditions"),
+     (60, "steady_growth"), (75, "strong_expansion"), (100, "strong_expansion")],
+)
+def test_market_climate_has_one_deterministic_five_state_bucket(score: float, state: str) -> None:
+    result = market_climate(score)
+    assert result["climate_state"] == state
+    assert len(result["climate_scale"]) == 5
 
 
 def test_tax_estimate_reports_missing_cost_basis() -> None:

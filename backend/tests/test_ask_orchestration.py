@@ -53,6 +53,13 @@ def test_worst_stock_holding_uses_saved_holdings_research_ranking():
     assert "stored_evidence" not in plan.tools
 
 
+def test_plain_language_concentration_question_uses_full_cached_intelligence():
+    plan = build_plan("Where is my portfolio actually concentrated?", "portfolio")
+    assert plan.intent == "HIDDEN_RISK"
+    assert plan.tools == ("portfolio_intelligence",)
+    assert "stored_evidence" not in plan.tools
+
+
 def test_balanced_rebalance_question_uses_saved_portfolio_analysis():
     plan = build_plan("Why does the Balanced alternative rebalance these holdings?", "portfolio")
     assert plan.intent == "PORTFOLIO_ANALYSIS"

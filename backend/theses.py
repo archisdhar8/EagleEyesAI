@@ -414,6 +414,10 @@ def decision_contexts(user_id: str, tickers: list[str]) -> dict[str, dict[str, A
     normalized = sorted({ticker.upper() for ticker in tickers if ticker and ticker.upper() != "CASH"})
     theses = list_theses(user_id)
     decisions = list_decisions(user_id)
+    return _decision_contexts_from_rows(normalized, theses, decisions)
+
+
+def _decision_contexts_from_rows(normalized: list[str], theses: list[dict[str, Any]], decisions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for ticker in normalized:
         active = next((item for item in theses if item["ticker"] == ticker and item["status"] in OPEN_STATUSES), None)
@@ -447,7 +451,7 @@ def workspace(user_id: str, holdings: list[dict[str, Any]], watchlist: list[str]
         "recent_decisions": decisions[:30],
         "needs_thesis": needs,
         "review_dates": reviews,
-        "contexts": decision_contexts(user_id, held + watched),
+        "contexts": _decision_contexts_from_rows(sorted(set(held + watched)), theses, decisions),
         "monitor_statuses": monitor_statuses,
     }
 

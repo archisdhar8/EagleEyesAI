@@ -10,6 +10,7 @@ import re
 import threading
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -1144,12 +1145,13 @@ def research(tickers: str = Query(default=""), _: AuthenticatedUser = Depends(re
 
 
 def _decision_workspace_inputs(user_id: str, portfolio_id: str | None = None) -> tuple[list[dict[str, Any]], list[str]]:
-    if portfolio_id:
-        holdings = database.get_portfolio(portfolio_id, user_id).get("holdings", [])
-    else:
-        portfolio = next(iter(database.list_portfolios(user_id)), None)
-        holdings = (portfolio or {}).get("holdings", [])
-    profile = database.load_profile(user_id) or {}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        portfolio_future = executor.submit(database.get_portfolio, portfolio_id, user_id) if portfolio_id else executor.submit(database.list_portfolios, user_id)
+        profile_future = executor.submit(database.load_profile, user_id)
+        portfolio_result = portfolio_future.result()
+        profile = profile_future.result() or {}
+    portfolio = portfolio_result if portfolio_id else next(iter(portfolio_result), None)
+    holdings = (portfolio or {}).get("holdings", [])
     return holdings, [str(ticker).upper() for ticker in profile.get("watchlist", [])]
 
 
@@ -1468,10 +1470,43 @@ def mark_security_research_reviewed(
     return result or {"id": None, "ticker": normalized, "created": False, "observation_count": 0}
 
 
+_RESEARCH_DETAIL_CACHE_TTL_SECONDS = max(30, min(900, int(os.getenv("RESEARCH_DETAIL_CACHE_TTL_SECONDS", "300"))))
+_RESEARCH_DETAIL_CACHE_MAX_ENTRIES = max(8, min(128, int(os.getenv("RESEARCH_DETAIL_CACHE_MAX_ENTRIES", "48"))))
+_RESEARCH_DETAIL_CACHE: dict[str, tuple[float, list[dict[str, Any]], dict[str, Any]]] = {}
+_RESEARCH_DETAIL_CACHE_LOCK = threading.Lock()
+
+
+def _cached_research_detail(ticker: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Reuse immutable stored evidence for repeat symbol lookups.
+
+    User-specific portfolio fit, thesis context, and personalization are added
+    after this cache, so no account data can cross cache entries.
+    """
+    now = time.monotonic()
+    with _RESEARCH_DETAIL_CACHE_LOCK:
+        cached = _RESEARCH_DETAIL_CACHE.get(ticker)
+        if cached and now - cached[0] < _RESEARCH_DETAIL_CACHE_TTL_SECONDS:
+            return deepcopy(cached[1]), deepcopy(cached[2])
+    rows = security_research([ticker], price_limit=260)
+    reference = database.research_reference_data([ticker])
+    with _RESEARCH_DETAIL_CACHE_LOCK:
+        _RESEARCH_DETAIL_CACHE[ticker] = (now, deepcopy(rows), deepcopy(reference))
+        expired = [key for key, value in _RESEARCH_DETAIL_CACHE.items() if now - value[0] >= _RESEARCH_DETAIL_CACHE_TTL_SECONDS]
+        for key in expired:
+            _RESEARCH_DETAIL_CACHE.pop(key, None)
+        while len(_RESEARCH_DETAIL_CACHE) > _RESEARCH_DETAIL_CACHE_MAX_ENTRIES:
+            oldest = min(_RESEARCH_DETAIL_CACHE, key=lambda key: _RESEARCH_DETAIL_CACHE[key][0])
+            _RESEARCH_DETAIL_CACHE.pop(oldest, None)
+    return rows, reference
+
+
 def _research_context(user: AuthenticatedUser, query: str = "", explicit: list[str] | None = None) -> tuple[list[dict[str, Any]], list[str], list[str], dict[str, Any]]:
-    portfolios = database.list_portfolios(user.id)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        portfolios_future = executor.submit(database.list_portfolios, user.id)
+        profile_future = executor.submit(database.load_profile, user.id)
+        portfolios = portfolios_future.result()
+        profile = profile_future.result() or InvestorProfile().model_dump(mode="json")
     holdings = [str(row.get("ticker") or "").upper() for row in (portfolios[0].get("holdings", []) if portfolios else [])]
-    profile = database.load_profile(user.id) or InvestorProfile().model_dump(mode="json")
     watchlist = [str(ticker).upper() for ticker in profile.get("watchlist", [])]
     requested = list(explicit or [])
     normalized_query = query.strip().upper()
@@ -1487,11 +1522,15 @@ def _research_context(user: AuthenticatedUser, query: str = "", explicit: list[s
     # A direct symbol detail request should not pay the cost of rescoring every
     # holding and watchlist item. Those are still passed separately for portfolio-fit context.
     tickers = list(dict.fromkeys(requested if explicit else requested + holdings + watchlist + catalog_tickers))[:200]
-    reference = database.research_reference_data(tickers)
+    if explicit and len(tickers) == 1:
+        rows, reference = _cached_research_detail(tickers[0])
+    else:
+        reference = database.research_reference_data(tickers)
+        rows = security_research(tickers, price_limit=756)
     reference["fund_lookup"] = fund_lookup
     # A single-symbol card needs one year of prices, not the broader
     # three-year discovery window. This bounds latency and allocation churn.
-    return security_research(tickers, price_limit=260 if explicit else 756), holdings, watchlist, reference
+    return rows, holdings, watchlist, reference
 
 
 @app.get("/api/research/search")

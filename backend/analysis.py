@@ -250,6 +250,7 @@ def latest_macro() -> dict[str, Any]:
                 regime = "neutral"
             as_of = max(item["date"] for item in latest.values())
             return {
+                **market_climate(score),
                 "regime": regime, "score": round(_clip(score), 1), "as_of": as_of,
                 "source": "Supabase · FRED",
                 "metrics": {
@@ -259,12 +260,35 @@ def latest_macro() -> dict[str, Any]:
                 },
             }
     if not MACRO_PATH.exists():
-        return {"regime": "neutral", "score": 50, "as_of": None}
+        return {**market_climate(50), "regime": "neutral", "score": 50, "as_of": None}
     frame = pd.read_parquet(MACRO_PATH).sort_values("date")
     if frame.empty:
-        return {"regime": "neutral", "score": 50, "as_of": None}
+        return {**market_climate(50), "regime": "neutral", "score": 50, "as_of": None}
     row = frame.iloc[-1]
-    return {"regime": str(row.get("macro_regime", "neutral")), "score": round(_num(row.get("macro_score"), 50), 1), "as_of": str(row.get("date"))}
+    score = round(_num(row.get("macro_score"), 50), 1)
+    return {**market_climate(score), "regime": str(row.get("macro_regime", "neutral")), "score": score, "as_of": str(row.get("date"))}
+
+
+def market_climate(score: float) -> dict[str, Any]:
+    """Translate the deterministic macro support score into one clear five-state climate."""
+    value = _clip(score)
+    if value >= 75:
+        key, label, summary = "strong_expansion", "Strong expansion", "Growth conditions are broadly supportive and the main stress indicators are contained."
+    elif value >= 60:
+        key, label, summary = "steady_growth", "Steady growth", "The economic backdrop is generally supportive, with some constraints worth monitoring."
+    elif value >= 45:
+        key, label, summary = "mixed_conditions", "Mixed conditions", "Growth, inflation, rates, labor, and credit do not point in one clear direction."
+    elif value >= 30:
+        key, label, summary = "slowing_growth", "Slowing growth", "Economic support is weakening and portfolio resilience matters more than usual."
+    else:
+        key, label, summary = "economic_stress", "Economic stress", "Several macro indicators are consistent with contraction or elevated financial stress."
+    return {
+        "climate_state": key,
+        "climate_label": label,
+        "climate_summary": summary,
+        "climate_scale": ["Economic stress", "Slowing growth", "Mixed conditions", "Steady growth", "Strong expansion"],
+        "score_methodology": "A deterministic 0–100 support score using inflation, unemployment, the yield curve, credit spreads, and the policy rate. It describes the current backdrop; it is not a market-return forecast.",
+    }
 
 
 def macro_factor_dashboard() -> dict[str, Any]:

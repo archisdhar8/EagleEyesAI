@@ -91,15 +91,9 @@ export function DecisionsPage({
   const load = useCallback(async () => {
     setLoading(true); setError("");
     try {
-      const [workspaceResult,journalResult,personalizationResult] = await Promise.allSettled([
-        request(`/decisions/workspace${portfolioId?`?portfolio_id=${encodeURIComponent(String(portfolioId))}`:""}`).then(readJson<Partial<DecisionsWorkspace>>),
-        request("/decision-journal").then(readJson<DecisionJournalWorkspace>),
-        request("/personalization").then(readJson<DecisionPersonalization>),
-      ]);
-      if(workspaceResult.status==="rejected")throw workspaceResult.reason;
-      const raw=workspaceResult.value;
-      const journalData=journalResult.status==="fulfilled"?journalResult.value:null;
-      const personalizationData=personalizationResult.status==="fulfilled"?personalizationResult.value:null;
+      // Render the primary workspace as soon as it arrives. Journal and
+      // personalization are secondary panels and must not block first paint.
+      const raw=await request(`/decisions/workspace${portfolioId?`?portfolio_id=${encodeURIComponent(String(portfolioId))}`:""}`).then(readJson<Partial<DecisionsWorkspace>>);
       const data: DecisionsWorkspace = {
         active_theses: Array.isArray(raw.active_theses) ? raw.active_theses : [],
         recent_decisions: Array.isArray(raw.recent_decisions) ? raw.recent_decisions : [],
@@ -110,18 +104,28 @@ export function DecisionsPage({
       const searchParams = typeof window === "undefined" ? new URLSearchParams() : new URLSearchParams(window.location.search);
       const queryTicker = searchParams.get("ticker")?.toUpperCase() || "";
       setWorkspace(data);
-      setSelectedTicker(current=>current||queryTicker||holdings[0]?.ticker?.toUpperCase()||profile.watchlist[0]?.toUpperCase()||data.active_theses[0]?.ticker||"");
-      if(journalData)setJournal({version:journalData.version||"decision-journal-v1",recent_decisions:Array.isArray(journalData.recent_decisions)?journalData.recent_decisions:[],ready_for_review:Array.isArray(journalData.ready_for_review)?journalData.ready_for_review:[],completed_retrospectives:Array.isArray(journalData.completed_retrospectives)?journalData.completed_retrospectives:[],patterns:{reviewed_decisions:journalData.patterns?.reviewed_decisions||0,minimum_sample:journalData.patterns?.minimum_sample||5,status:journalData.patterns?.status||"INSUFFICIENT_SAMPLE",patterns:Array.isArray(journalData.patterns?.patterns)?journalData.patterns.patterns:[]},forecast_calibration:{sample_size:journalData.forecast_calibration?.sample_size||0,brier_score:journalData.forecast_calibration?.brier_score??null,status:journalData.forecast_calibration?.status||"INSUFFICIENT_SAMPLE",message:journalData.forecast_calibration?.message||"Resolved forecasts are insufficient for calibration.",buckets:Array.isArray(journalData.forecast_calibration?.buckets)?journalData.forecast_calibration.buckets:[],methodology:journalData.forecast_calibration?.methodology||"No calibration result without resolved forecasts."}});
-      if(personalizationData)setPersonalization({version:personalizationData.version||"decision-preferences-v1",explicit:personalizationData.explicit||{},accepted:personalizationData.accepted||{},inferred:Array.isArray(personalizationData.inferred)?personalizationData.inferred:[],dismissed:Array.isArray(personalizationData.dismissed)?personalizationData.dismissed:[],minimum_reviewed_decisions:personalizationData.minimum_reviewed_decisions||5,reviewed_decisions:personalizationData.reviewed_decisions||0});
+      // Do not auto-select the first holding. That previously launched three
+      // security requests and an AI draft every time the page opened.
+      setSelectedTicker(current=>current||queryTicker||"");
       const queryDecision = searchParams.get("decision")?.toUpperCase() as DecisionType | null;
       if(queryDecision&&["WATCH","BUY","ADD","HOLD","REDUCE","SELL","AVOID"].includes(queryDecision))setDecisionType(queryDecision);
-      const selected = data.active_theses.find(item => item.id === selectedId)
-        || data.active_theses.find(item => item.ticker === queryTicker);
+      const selected = data.active_theses.find(item => item.ticker === queryTicker);
       if (selected) { setSelectedId(selected.id || null); setForm(selected);setGuidedStage("review");setReviewConfirmed(true);setRelationship((selected.source_context?.relationship as ThesisRelationship)||"CONSIDER");setPersonalReason(String(selected.source_context?.user_reason||"")); }
-      else if (queryTicker && !selectedId) setForm({ ...EMPTY, ticker: queryTicker });
+      else if (queryTicker) setForm({ ...EMPTY, ticker: queryTicker });
+      setLoading(false);
+
+      void Promise.allSettled([
+        request("/decision-journal").then(readJson<DecisionJournalWorkspace>),
+        request("/personalization").then(readJson<DecisionPersonalization>),
+      ]).then(([journalResult,personalizationResult])=>{
+        const journalData=journalResult.status==="fulfilled"?journalResult.value:null;
+        const personalizationData=personalizationResult.status==="fulfilled"?personalizationResult.value:null;
+        if(journalData)setJournal({version:journalData.version||"decision-journal-v1",recent_decisions:Array.isArray(journalData.recent_decisions)?journalData.recent_decisions:[],ready_for_review:Array.isArray(journalData.ready_for_review)?journalData.ready_for_review:[],completed_retrospectives:Array.isArray(journalData.completed_retrospectives)?journalData.completed_retrospectives:[],patterns:{reviewed_decisions:journalData.patterns?.reviewed_decisions||0,minimum_sample:journalData.patterns?.minimum_sample||5,status:journalData.patterns?.status||"INSUFFICIENT_SAMPLE",patterns:Array.isArray(journalData.patterns?.patterns)?journalData.patterns.patterns:[]},forecast_calibration:{sample_size:journalData.forecast_calibration?.sample_size||0,brier_score:journalData.forecast_calibration?.brier_score??null,status:journalData.forecast_calibration?.status||"INSUFFICIENT_SAMPLE",message:journalData.forecast_calibration?.message||"Resolved forecasts are insufficient for calibration.",buckets:Array.isArray(journalData.forecast_calibration?.buckets)?journalData.forecast_calibration.buckets:[],methodology:journalData.forecast_calibration?.methodology||"No calibration result without resolved forecasts."}});
+        if(personalizationData)setPersonalization({version:personalizationData.version||"decision-preferences-v1",explicit:personalizationData.explicit||{},accepted:personalizationData.accepted||{},inferred:Array.isArray(personalizationData.inferred)?personalizationData.inferred:[],dismissed:Array.isArray(personalizationData.dismissed)?personalizationData.dismissed:[],minimum_reviewed_decisions:personalizationData.minimum_reviewed_decisions||5,reviewed_decisions:personalizationData.reviewed_decisions||0});
+      });
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not load decisions."); }
     finally { setLoading(false); }
-  }, [request, portfolioId, selectedId, holdings, profile.watchlist]);
+  }, [request, portfolioId]);
 
   const securityUniverse=useMemo(()=>{
     const source=[...holdings.map(item=>({ticker:item.ticker.toUpperCase(),source:"Holding"})),...profile.watchlist.map(ticker=>({ticker:ticker.toUpperCase(),source:"Watchlist"})),...(workspace?.active_theses||[]).map(item=>({ticker:item.ticker,source:"Thesis"})),...(workspace?.needs_thesis||[]).map(item=>({ticker:item.ticker,source:item.source==="holding"?"Holding":"Watchlist"}))];

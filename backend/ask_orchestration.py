@@ -31,7 +31,11 @@ _INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("THESIS_REPLACEMENT", ("weakest investment thesis", "weakest thesis", "replace it with", "replacement for")),
     ("PORTFOLIO_CHANGE", ("materially changed in my portfolio", "portfolio since my last review", "portfolio changed since")),
     ("VALUATION_RANKING", ("most overvalued", "overvalued relative to", "valuation relative to growth")),
-    ("HIDDEN_RISK", ("hidden concentration risk", "across sectors", "correlated companies", "theme concentration")),
+    ("HIDDEN_RISK", (
+        "hidden concentration risk", "across sectors", "correlated companies", "theme concentration",
+        "where is my portfolio actually concentrated", "where is my portfolio concentrated",
+        "actually concentrated", "concentration by sector", "concentration by theme",
+    )),
     ("MULTI_SCENARIO", ("what would happen to my portfolio", "interest rates rose", "ai spending slowed", "economy entered a recession")),
     ("WATCHLIST_COMPARISON", ("watchlist stocks", "watchlist names", "stronger risk-adjusted case")),
     ("PORTFOLIO_EVENTS", ("upcoming earnings reports", "economic events", "company catalysts", "upcoming catalysts")),
