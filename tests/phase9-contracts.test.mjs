@@ -8,15 +8,18 @@ const shared = readFileSync("app/components/shared/workspace-implementations.tsx
 const research = readFileSync("app/components/research/ResearchDiscovery.tsx", "utf8");
 const backend = readFileSync("backend/main.py", "utf8");
 
-test("primary Ask is a split conversational workspace using the calculated board directly", () => {
+test("primary Ask is chat-first with a contextual calculated canvas", () => {
   assert.match(ask, /ResearchChat/);
   assert.match(ask, /ask-split-shell/);
   assert.match(ask, /role="separator"/);
+  assert.match(ask, /CanvasState = "closed" \| "open"/);
+  assert.match(ask, /useState<CanvasState>\("closed"\)/);
   assert.match(ask, /Chat<\/button>/);
-  assert.match(ask, /Dashboard<\/button>/);
-  assert.match(ask, /<AIWorkspace \{\.\.\.dashboardProps\} variant="canvas"/);
+  assert.match(ask, /Analysis<\/button>/);
+  assert.match(ask, /<AIWorkspace \{\.\.\.dashboardProps\} variant="canvas" onClose=\{closeCanvas\}/);
   assert.doesNotMatch(ask, /Expert tool/);
-  assert.match(shared, /Your analysis will appear here/);
+  assert.match(shared, /Start your analysis/);
+  assert.match(shared, /Close analysis canvas/);
   assert.match(dashboard, /messages=\{researchChatMessages\}/);
 });
 

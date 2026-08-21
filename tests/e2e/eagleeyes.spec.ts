@@ -12,53 +12,61 @@ async function signIn(page: Page) {
 
 async function buildBoard(page: Page, prompt = "Show my portfolio return and risks") {
   await page.goto("/ask");
-  const composer = page.getByPlaceholder("Describe the dashboard you want…");
+  const composer = page.getByPlaceholder(/Ask about your portfolio/);
   await composer.fill(prompt);
-  await page.getByRole("button", { name: "Build view →" }).click();
-  await expect(page.getByRole("heading", { name: "Portfolio return and risks" })).toBeVisible();
+  await page.getByRole("button", { name: "Ask EagleEyes →" }).click();
+  await expect(page.locator(".canvas-view-switcher summary")).toHaveText(/Portfolio return and risks/);
   await expect(page.getByText("Required evidence verified")).toBeVisible();
 }
 
-test("Ask uses a resizable desktop canvas and state-preserving mobile tabs", async ({ page }) => {
+test("Ask starts chat-first, opens a resizable canvas for visuals, and preserves mobile state", async ({ page }) => {
   await installApiMock(page);
   await signIn(page);
   await page.goto("/ask");
 
   await expect(page.locator(".ask-chat-pane")).toBeVisible();
-  await expect(page.locator(".ask-canvas-pane")).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Your analysis will appear here." })).toBeVisible();
+  await expect(page.locator(".ask-canvas-pane")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "What are you trying to understand?" })).toBeVisible();
   await expect(page.getByText("Expert tool")).toHaveCount(0);
-  const divider = page.getByRole("separator", { name: "Resize chat and dashboard" });
-  await expect(divider).toHaveAttribute("aria-valuenow", "35");
+  const askInput = page.getByPlaceholder(/Ask about your portfolio/);
+  await askInput.fill("Compare my largest holdings");
+  await page.getByRole("button", { name: "Ask EagleEyes →" }).click();
+  await expect(page.locator(".ask-canvas-pane")).toHaveCount(0);
+
+  await askInput.fill("Show my portfolio performance against SPY.");
+  await page.getByRole("button", { name: "Ask EagleEyes →" }).click();
+  const divider = page.getByRole("separator", { name: "Resize chat and analysis" });
+  await expect(divider).toHaveAttribute("aria-valuenow", "38");
   await divider.press("ArrowRight");
-  await expect(divider).toHaveAttribute("aria-valuenow", "37");
+  await expect(divider).toHaveAttribute("aria-valuenow", "40");
   const themeButton = page.getByRole("button", { name: /Light mode|Dark mode/ });
   const themeBefore = await themeButton.textContent();
   await themeButton.click();
   await expect(themeButton).not.toHaveText(themeBefore || "");
 
   await page.setViewportSize({ width: 390, height: 844 });
-  const askInput = page.getByPlaceholder(/Ask about research/);
-  await askInput.fill("Compare my largest holdings");
-  await page.getByRole("tab", { name: "Dashboard" }).click();
+  await page.getByRole("tab", { name: "Analysis" }).click();
   await expect(page.locator(".ask-canvas-pane")).toBeVisible();
   await expect(page.locator(".ask-chat-pane")).toBeHidden();
   await page.getByRole("tab", { name: "Chat" }).click();
-  await expect(askInput).toHaveValue("Compare my largest holdings");
+  await expect(askInput).toHaveValue("");
+  await page.getByRole("tab", { name: "Analysis" }).click();
+  await page.getByRole("button", { name: "Close analysis canvas" }).click();
+  await expect(page.locator(".ask-canvas-pane")).toHaveCount(0);
 });
 
 test("conversational dashboard edits persist through undo, save, and reload", async ({ page }) => {
   await installApiMock(page);
   await signIn(page);
   await page.goto("/ask");
-  const composer=page.getByPlaceholder(/Ask about research/);
+  const composer=page.getByPlaceholder(/Ask about your portfolio/);
   const send=async(question:string)=>{
     await composer.fill(question);
     await page.getByRole("button",{name:"Ask EagleEyes →"}).click();
   };
 
   await send("Build me a portfolio overview dashboard.");
-  await expect(page.getByRole("heading",{name:"Portfolio overview"})).toBeVisible();
+  await expect(page.locator(".canvas-view-switcher summary")).toHaveText(/Portfolio overview/);
   await expect(page.getByRole("heading",{name:"Portfolio news"})).toBeVisible();
 
   await send("Add performance against SPY.");
@@ -73,17 +81,20 @@ test("conversational dashboard edits persist through undo, save, and reload", as
   await expect(page.getByRole("heading",{name:"Portfolio news"})).toBeVisible();
   await send("Save this as Portfolio Overview.");
   await expect(page.getByText("Saved as Portfolio Overview.").last()).toBeVisible();
-  await expect(page.getByText("Saved dashboard")).toBeVisible();
+  await expect(page.getByText("Saved",{exact:true})).toBeVisible();
 
-  await page.getByRole("button",{name:"＋ New",exact:true}).click();
-  await expect(page.getByRole("heading",{name:"Your analysis will appear here."})).toBeVisible();
-  await page.getByRole("button",{name:"Portfolio workspace"}).click();
-  await expect(page.getByText("Saved dashboard")).toBeVisible();
-  await expect(page.getByRole("heading",{name:"Portfolio Overview"})).toBeVisible();
+  await page.getByRole("button",{name:"New chat",exact:true}).click();
+  await expect(page.locator(".ask-canvas-pane")).toHaveCount(0);
+  await page.getByRole("button",{name:"History",exact:true}).click();
+  await page.getByRole("button",{name:/^Portfolio workspace \d+ messages/}).click();
+  await page.locator(".ask-open-analysis").click();
+  await expect(page.getByText("Saved",{exact:true})).toBeVisible();
+  await expect(page.locator(".canvas-view-switcher summary")).toHaveText(/Portfolio Overview/);
 
   await page.reload();
-  await expect(page.getByText("Saved dashboard")).toBeVisible();
-  await expect(page.getByRole("heading",{name:"Portfolio Overview"})).toBeVisible();
+  await page.locator(".ask-open-analysis").click();
+  await expect(page.getByText("Saved",{exact:true})).toBeVisible();
+  await expect(page.locator(".canvas-view-switcher summary")).toHaveText(/Portfolio Overview/);
   await expect(page.getByText("Saved as Portfolio Overview.").last()).toBeVisible();
 });
 
@@ -212,21 +223,17 @@ test("AI board supports progressive build, revision, add, resize, remove, save, 
   page.once("dialog", dialog => dialog.accept());
   await page.getByRole("button", { name: "Remove Optional risk summary" }).click();
   await expect(page.getByRole("heading", { name: "Optional risk summary" })).toHaveCount(0);
-  await page.getByLabel("Dashboard actions").click();
+  await page.getByLabel("Analysis actions").click();
   await page.getByRole("button", { name: "Add verified data" }).click();
   await page.getByRole("button", { name: /^Macro Macro trends Stored macro factors/ }).click();
   await expect(page.getByRole("heading", { name: "Macro trends" })).toBeVisible();
-  await page.getByPlaceholder("Revise this view…").fill("Focus the explanation on drawdown risk");
-  await page.getByRole("button", { name: "Revise view →" }).click();
-  await expect(page.getByRole("heading", { name: "Revised portfolio board" })).toBeVisible();
   await page.getByRole("button", { name: "Save dashboard" }).click();
   await expect(page.getByText("Dashboard view saved.")).toBeVisible();
-  await page.getByTitle("Open saved dashboard").click();
-  await expect(page.getByText("Saved dashboard")).toBeVisible();
-  await page.getByLabel("Dashboard actions").click();
+  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+  await page.getByLabel("Analysis actions").click();
   await page.getByRole("button", { name: "Duplicate", exact: true }).click();
   await expect(page.getByText("Dashboard duplicated with the same layout and compatible results.")).toBeVisible();
-  await expect(page.getByText("Revised portfolio board copy")).toBeVisible();
+  await expect(page.locator(".canvas-view-switcher summary")).toHaveText(/Portfolio return and risks copy/);
 });
 
 test("partial widget failure preserves successful evidence and narration", async ({ page }) => {

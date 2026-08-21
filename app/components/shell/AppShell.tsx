@@ -48,8 +48,8 @@ export function AppShell({
       <header className="topbar">
         <div><span className="eyebrow">EagleEyes / {isPrimaryTab(activeTab) ? "Workspace" : "More"}</span><h1>{navigationLabel(activeTab)}</h1></div>
         <div className="top-actions">
-          {topAction}
-          <div className="freshness"><span>Data lineage</span><strong>{freshness}</strong></div>
+          {activeTab !== "ask" && topAction}
+          {activeTab !== "ask" && <div className="freshness"><span>Data lineage</span><strong>{freshness}</strong></div>}
           <details className="secondary-menu">
             <summary aria-label="Open secondary navigation">More <span aria-hidden>⌄</span></summary>
             <div>

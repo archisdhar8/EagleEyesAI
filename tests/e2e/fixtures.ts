@@ -183,6 +183,11 @@ export async function installApiMock(page: Page, options: { portfolio?: boolean;
       const lower=question.toLowerCase();
       const userMessage={id:`chat-${state.chatMessages.length+1}`,role:"user",content:question,structured_content:{},model:null,created_at:now};
       state.chatMessages.push(userMessage);
+      if(lower.includes("compare my largest holdings")){
+        const assistantMessage={id:`chat-${state.chatMessages.length+1}`,role:"assistant",content:"Your largest holding is AAPL at 60% of the fixture portfolio.",model:"deterministic-answer-v1",created_at:now,structured_content:{}};
+        state.chatMessages.push(assistantMessage);
+        return json(route,{conversation_id:"conversation-1",message:assistantMessage});
+      }
       let resourceType:"draft"|"view"="draft";
       let resourceId=state.job.id;
       let response="Updated dashboard.";

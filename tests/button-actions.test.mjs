@@ -160,9 +160,10 @@ test("Ask EagleEyes exposes durable conversation controls as the single chat sur
     "newChatConversation", "openChatConversation", "renameChatConversation",
     "deleteChatConversation", "buildBoardFromConversation",
   ]) assert.match(source, new RegExp(`function ${action}\\(`));
-  for (const copy of ["Research conversations", "Linked evidence", "＋ New", "Internal retrieval steps stay behind the answer"]) {
+  for (const copy of ["Research conversations", "Linked evidence", "＋ New", "Visual analysis opens only when you request it"]) {
     assert.match(source, new RegExp(copy));
   }
+  assert.match(source, /ask-history-drawer/);
   assert.match(source, /`eagleeyes-\$\{workspace\}-conversation-\$\{portfolioId\?\?"general"\}`/);
   assert.match(source, /onKeyDown=\{event=>\{if\(event\.key!=="Enter"\|\|event\.shiftKey\|\|event\.nativeEvent\.isComposing\)return/);
 });

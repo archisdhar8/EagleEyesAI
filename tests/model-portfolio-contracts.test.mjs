@@ -34,11 +34,13 @@ test("model portfolio builder exposes comparisons, benchmarks, and combined stre
   assert.match(builder, /Stress \+ simulate selected/);
 });
 
-test("Ask EagleEyes provides a full-width conversational canvas without requiring a portfolio", () => {
+test("Ask EagleEyes starts as full-width chat and reveals a contextual canvas", () => {
   const ask = read("app/components/ask/AskPage.tsx");
   const css = read("app/globals.css");
   assert.match(ask, /ask-conversational-workspace/);
+  assert.match(ask, /useState<CanvasState>\("closed"\)/);
   assert.match(ask, /variant="canvas"/);
   assert.match(css, /\.ask-split-shell\{display:grid/);
+  assert.match(css, /\.canvas-closed \.ask-split-shell\{display:block/);
   assert.match(css, /\.ask-mobile-tabs/);
 });
