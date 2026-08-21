@@ -5,10 +5,11 @@ import test from "node:test";
 const root=new URL("../",import.meta.url);
 const read=path=>fs.readFileSync(new URL(path,root),"utf8");
 
-test("six primary destinations include the forward-looking market climate",()=>{
+test("five primary destinations include the forward-looking market climate and retire Decisions",()=>{
   const routes=read("app/lib/routes.ts");
   const block=routes.match(/PRIMARY_NAV_ITEMS[\s\S]*?SECONDARY_NAV_ITEMS/)?.[0]||"";
-  for(const label of ["Today","Portfolio","Research","Market Climate","Decisions","Ask EagleEyes"])assert.match(block,new RegExp(label));
+  for(const label of ["Today","Portfolio","Research","Market Climate","Ask EagleEyes"])assert.match(block,new RegExp(label));
+  assert.doesNotMatch(block,/Decisions/);
   for(const label of ["Plan & profile","Learn","Advanced"])assert.doesNotMatch(block,new RegExp(label));
 });
 
@@ -19,10 +20,10 @@ test("shared trust vocabulary distinguishes facts, models, markets, beliefs, and
   assert.match(trust,/As known on/);
 });
 
-test("alerts remain in-app, attention-derived, grouped, and preference controlled",()=>{
+test("the unified Action Center remains attention-derived and preference controlled",()=>{
   const today=read("app/components/today/TodayPage.tsx");
   const backend=read("backend/product_preferences.py");
-  assert.match(today,/In-app alert center/);assert.match(today,/Email and push are intentionally not enabled/);
+  assert.match(today,/Action Center/);assert.match(today,/No open portfolio actions/);
   assert.match(backend,/group_key/);assert.match(backend,/supersedes_id/);assert.match(backend,/attention_items/);
 });
 

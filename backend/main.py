@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import database, ask_orchestration, ask_portfolio, attention, decision_journal, earnings_intelligence, evidence, forecasting, model_portfolios, portfolio_intelligence, portfolio_overview, product_preferences, thesis_monitor, theses
+from . import database, ask_orchestration, ask_portfolio, attention, dashboard_chat, decision_journal, earnings_intelligence, evidence, forecasting, model_portfolios, portfolio_intelligence, portfolio_overview, product_preferences, thesis_monitor, theses
 from .ask_runtime import (
     PortfolioContext, attach_coverage as attach_ask_coverage, build_portfolio_context, parse_scenario_factors,
     scenario_payload, verified_analysis_result, verify_results,
@@ -37,8 +37,9 @@ from .dashboard_workspace import (
     DraftRequest, RevisionRequest, SaveViewRequest, UpdateViewRequest, WidgetAddRequest,
     LayoutMutationRequest, DuplicateViewRequest, TERMINAL_STATES,
     add_widget_to_draft, add_widget_to_view, create_draft, dashboard_data_catalog,
-    mutate_draft_layout, portfolio_performance_widget, revise_draft,
+    mutate_draft_layout, portfolio_performance_widget, revise_draft, run_dashboard_action,
 )
+from .dashboard_actions import DashboardActionResult, DashboardActionStatus
 from .dashboard_workspace import MACRO_SENSITIVITY_FACTORS, calculate_macro_sensitivity
 from .explanations import generate_explanation
 from .ingestion import refresh_fred, refresh_polygon, refresh_sec, refresh_security_catalog, refresh_security_evidence, refresh_tiingo
@@ -189,6 +190,8 @@ class ChatPageContext(BaseModel):
     decision_id: str | None = Field(default=None, max_length=80)
     thesis_id: str | None = Field(default=None, max_length=80)
     portfolio_id: str | None = Field(default=None, max_length=80)
+    dashboard_resource_type: Literal["draft", "view"] | None = None
+    dashboard_resource_id: str | None = Field(default=None, max_length=80)
     enabled_context: list[Literal["evidence", "thesis", "portfolio"]] = Field(
         default_factory=lambda: ["evidence", "thesis", "portfolio"], max_length=3
     )
@@ -664,6 +667,7 @@ def portfolios(user: AuthenticatedUser = Depends(require_user)) -> list[dict[str
 def create_portfolio(payload: PortfolioPayload, background_tasks: BackgroundTasks,
                      user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     portfolio = database.save_portfolio(payload.name, [item.model_dump(mode="json") for item in payload.holdings], user_id=user.id)
+    _invalidate_research_overview_cache(user.id)
     background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio["id"], "PORTFOLIO_CHANGE")
     return portfolio
 
@@ -673,6 +677,7 @@ def update_portfolio(portfolio_id: str, payload: PortfolioPayload, background_ta
                      user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     try:
         portfolio = database.save_portfolio(payload.name, [item.model_dump(mode="json") for item in payload.holdings], portfolio_id, user.id)
+        _invalidate_research_overview_cache(user.id)
         background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio_id, "PORTFOLIO_CHANGE")
         return portfolio
     except KeyError as exc:
@@ -696,6 +701,7 @@ def import_portfolio(payload: CsvImport, background_tasks: BackgroundTasks,
         raise HTTPException(422, str(exc)) from exc
     holdings = result["holdings"]
     portfolio = database.save_portfolio(payload.name, holdings, user_id=user.id)
+    _invalidate_research_overview_cache(user.id)
     background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio["id"], "PORTFOLIO_CHANGE")
     return {
         "portfolio": portfolio,
@@ -887,6 +893,48 @@ def get_profile(user: AuthenticatedUser = Depends(require_user)) -> dict[str, An
     return database.load_profile(user.id) or InvestorProfile().model_dump(mode="json")
 
 
+def _validated_watchlist_ticker(ticker: str) -> str:
+    normalized = ticker.strip().upper()
+    if normalized == "CASH" or not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", normalized):
+        raise HTTPException(422, "Invalid security symbol")
+    rows, _ = _cached_research_detail(normalized)
+    if not rows and not recognized_fund(normalized):
+        raise HTTPException(404, "Security is not available in the supported research universe")
+    return normalized
+
+
+@app.get("/api/watchlist")
+def get_watchlist(user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    profile = get_profile(user)
+    return {"tickers": list(dict.fromkeys(str(item).strip().upper() for item in profile.get("watchlist", []) if item))}
+
+
+@app.put("/api/watchlist/{ticker}")
+def add_watchlist_security(ticker: str, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    normalized = _validated_watchlist_ticker(ticker)
+    profile = get_profile(user)
+    tickers = list(dict.fromkeys(str(item).strip().upper() for item in profile.get("watchlist", []) if item))
+    if normalized not in tickers:
+        tickers.append(normalized)
+    profile["watchlist"] = tickers
+    database.save_profile(InvestorProfile.model_validate(profile).model_dump(mode="json"), user.id)
+    _invalidate_research_overview_cache(user.id)
+    return {"ticker": normalized, "watchlisted": True, "tickers": tickers}
+
+
+@app.delete("/api/watchlist/{ticker}")
+def remove_watchlist_security(ticker: str, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    normalized = ticker.strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", normalized):
+        raise HTTPException(422, "Invalid security symbol")
+    profile = get_profile(user)
+    tickers = [str(item).strip().upper() for item in profile.get("watchlist", []) if str(item).strip().upper() != normalized]
+    profile["watchlist"] = list(dict.fromkeys(tickers))
+    database.save_profile(InvestorProfile.model_validate(profile).model_dump(mode="json"), user.id)
+    _invalidate_research_overview_cache(user.id)
+    return {"ticker": normalized, "watchlisted": False, "tickers": profile["watchlist"]}
+
+
 @app.get("/api/learn/catalog")
 def learning_catalog(user: AuthenticatedUser | None = Depends(optional_user)) -> dict[str, Any]:
     payload = catalog_payload(public_only=user is None)
@@ -1014,7 +1062,9 @@ def post_learning_tutor_message(thread_id: str, payload: LearningTutorMessagePay
 
 @app.put("/api/profile")
 def put_profile(profile: InvestorProfile, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    return database.save_profile(profile.model_dump(mode="json"), user.id)
+    saved = database.save_profile(profile.model_dump(mode="json"), user.id)
+    _invalidate_research_overview_cache(user.id)
+    return saved
 
 
 @app.get("/api/plan/profile")
@@ -1474,6 +1524,9 @@ _RESEARCH_DETAIL_CACHE_TTL_SECONDS = max(30, min(900, int(os.getenv("RESEARCH_DE
 _RESEARCH_DETAIL_CACHE_MAX_ENTRIES = max(8, min(128, int(os.getenv("RESEARCH_DETAIL_CACHE_MAX_ENTRIES", "48"))))
 _RESEARCH_DETAIL_CACHE: dict[str, tuple[float, list[dict[str, Any]], dict[str, Any]]] = {}
 _RESEARCH_DETAIL_CACHE_LOCK = threading.Lock()
+_RESEARCH_OVERVIEW_CACHE_TTL_SECONDS = max(15, min(300, int(os.getenv("RESEARCH_OVERVIEW_CACHE_TTL_SECONDS", "60"))))
+_RESEARCH_OVERVIEW_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_RESEARCH_OVERVIEW_CACHE_LOCK = threading.Lock()
 
 
 def _cached_research_detail(ticker: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1498,6 +1551,82 @@ def _cached_research_detail(ticker: str) -> tuple[list[dict[str, Any]], dict[str
             oldest = min(_RESEARCH_DETAIL_CACHE, key=lambda key: _RESEARCH_DETAIL_CACHE[key][0])
             _RESEARCH_DETAIL_CACHE.pop(oldest, None)
     return rows, reference
+
+
+def _invalidate_research_overview_cache(user_id: str) -> None:
+    prefix = f"{user_id}:"
+    with _RESEARCH_OVERVIEW_CACHE_LOCK:
+        for key in [item for item in _RESEARCH_OVERVIEW_CACHE if item.startswith(prefix)]:
+            _RESEARCH_OVERVIEW_CACHE.pop(key, None)
+
+
+def _selected_research_portfolio(user_id: str, portfolio_id: str | None) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    portfolios = database.list_portfolios(user_id)
+    if portfolio_id:
+        portfolio = next((item for item in portfolios if str(item.get("id")) == str(portfolio_id)), None)
+        if portfolio is None:
+            raise HTTPException(404, "Portfolio not found")
+    else:
+        portfolio = portfolios[0] if portfolios else None
+    return portfolio, list((portfolio or {}).get("holdings") or [])
+
+
+def _case_confidence(row: dict[str, Any]) -> str:
+    raw_coverage = (row.get("freshness") or {}).get("coverage") or row.get("confidence") or 0
+    if isinstance(raw_coverage, str):
+        normalized = raw_coverage.strip().lower()
+        label_coverage = {"high": .85, "full": .85, "medium": .6, "partial": .5, "low": .3, "missing": 0}
+        if normalized in label_coverage:
+            coverage = label_coverage[normalized]
+        else:
+            try:
+                coverage = float(normalized.rstrip("%"))
+            except ValueError:
+                coverage = 0
+    else:
+        coverage = float(raw_coverage or 0)
+    if coverage > 1:
+        coverage /= 100
+    return "High" if coverage >= .75 else "Medium" if coverage >= .5 else "Low"
+
+
+def _research_cases(ticker: str, row: dict[str, Any], active: dict[str, Any] | None) -> dict[str, Any]:
+    generated = theses.evidence_draft(ticker, row, allow_ai=False)["draft"]
+    source = "saved_thesis" if active else "generated_from_stored_evidence"
+    draft = active or generated
+    factors = list(draft.get("factors") or generated.get("factors") or [])
+    assumptions = list(draft.get("assumptions") or generated.get("assumptions") or [])
+    catalysts = [str(item.get("description") or "") for item in factors if item.get("factor_type") == "CATALYST"]
+    risks = [str(item.get("description") or "") for item in factors if item.get("factor_type") == "RISK"]
+    breakers = [str(item.get("description") or "") for item in factors if item.get("factor_type") == "BREAKER"]
+    base_drivers = [str(item.get("description") or "") for item in assumptions]
+    freshness = row.get("freshness") or {}
+    as_of = freshness.get("fundamentals_as_of") or freshness.get("price_as_of")
+    confidence = _case_confidence(row)
+    definitions = {
+        "bear": ("Worse than the current path", risks, breakers or base_drivers, draft.get("bear_case") or generated["bear_case"]),
+        "base": ("The current path persists", base_drivers, risks or breakers, draft.get("base_case") or generated["base_case"]),
+        "bull": ("Better than the current path", catalysts, risks or breakers, draft.get("bull_case") or generated["bull_case"]),
+    }
+    return {
+        key: {
+            "key": key, "label": key.title(), "outcome": outcome,
+            "drivers": [item for item in drivers if item][:4],
+            "invalidation_conditions": [item for item in invalidation if item][:3],
+            "full_text": str(full_text), "confidence": confidence, "evidence_as_of": as_of,
+            "source": source, "saved_as_user_belief": bool(active),
+        }
+        for key, (outcome, drivers, invalidation, full_text) in definitions.items()
+    }
+
+
+def _safe_research_part(callable_: Any, fallback: Any) -> Any:
+    try:
+        value = callable_()
+        return value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+    except Exception as exc:
+        record_metric("research.overview.partial", tags={"error_type": type(exc).__name__})
+        return fallback
 
 
 def _research_context(user: AuthenticatedUser, query: str = "", explicit: list[str] | None = None) -> tuple[list[dict[str, Any]], list[str], list[str], dict[str, Any]]:
@@ -1614,6 +1743,88 @@ def research_security(ticker: str, user: AuthenticatedUser = Depends(require_use
     security = payload["results"][0]
     security["decision_context"] = theses.decision_contexts(user.id, [normalized]).get(normalized, {})
     return {"security": security, "universe": payload["universe"], "method": payload["method"], "historical_coverage": coverage}
+
+
+@app.get("/api/research/security/{ticker}/overview")
+def consolidated_research_security_overview(
+    ticker: str, portfolio_id: str | None = Query(default=None),
+    user: AuthenticatedUser = Depends(require_user),
+) -> dict[str, Any]:
+    """Return one cached, stored-evidence payload for the company workspace.
+
+    This path intentionally performs no provider refresh and no LLM call. Stale
+    evidence remains visible with its dates while scheduled jobs refresh it.
+    """
+    normalized = ticker.strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", normalized):
+        raise HTTPException(422, "Invalid ticker")
+    portfolio, portfolio_holdings = _selected_research_portfolio(user.id, portfolio_id)
+    selected_portfolio_id = str(portfolio.get("id")) if portfolio else "none"
+    cache_key = f"{user.id}:{selected_portfolio_id}:{normalized}"
+    now = time.monotonic()
+    with _RESEARCH_OVERVIEW_CACHE_LOCK:
+        cached = _RESEARCH_OVERVIEW_CACHE.get(cache_key)
+        if cached and now - cached[0] < _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS:
+            response = deepcopy(cached[1])
+            response["cache"] = {"status": "hit", "ttl_seconds": _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS}
+            return response
+
+    profile = get_profile(user)
+    watchlist = [str(item).strip().upper() for item in profile.get("watchlist", [])]
+    holding_symbols = [str(item.get("ticker") or "").strip().upper() for item in portfolio_holdings]
+    rows, reference = _cached_research_detail(normalized)
+    rows = [row for row in rows if str(row.get("ticker") or "").upper() == normalized]
+    if not rows:
+        raise HTTPException(404, "Security research is not available")
+    payload = research_search_payload(
+        rows, normalized, holdings=holding_symbols, watchlist=watchlist,
+        requested=[normalized], limit=1, context=reference,
+    )
+    if not payload.get("results"):
+        raise HTTPException(404, "Security research is not available")
+    security = payload["results"][0]
+    active = theses.active_thesis(user.id, normalized)
+    security["decision_context"] = theses.decision_contexts(user.id, [normalized]).get(normalized, {})
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        earnings_future = executor.submit(lambda: _safe_research_part(lambda: earnings_intelligence_view(normalized, user), {"status": "unavailable", "warnings": ["Stored earnings evidence is unavailable."]}))
+        forecast_future = executor.submit(lambda: _safe_research_part(lambda: forecasting.build_intelligence(user.id, ticker=normalized, limit=30), {"markets": [], "warnings": ["Stored forward-looking evidence is unavailable."]}))
+        changes_future = executor.submit(lambda: _safe_research_part(lambda: evidence.get_changes(user.id, normalized, baseline_type="LAST_RESEARCH_REVIEW"), {"status": "unavailable", "changes": [], "warnings": ["No prior research review is available for comparison."]}))
+        earnings_payload = earnings_future.result()
+        forecast_payload = forecast_future.result()
+        changes_payload = changes_future.result()
+
+    freshness = security.get("freshness") or {}
+    missing = list((security.get("field_coverage") or {}).get("missing") or [])
+    response = {
+        "ticker": normalized,
+        "security": security,
+        "universe": payload.get("universe"),
+        "method": payload.get("method"),
+        "portfolio": {"id": portfolio.get("id"), "name": portfolio.get("name")} if portfolio else None,
+        "membership": {
+            "holding": normalized in holding_symbols,
+            "watchlist": normalized in watchlist,
+            "holding_detail": next((item for item in portfolio_holdings if str(item.get("ticker") or "").upper() == normalized), None),
+        },
+        "earnings": earnings_payload,
+        "forecasts": forecast_payload,
+        "changes": changes_payload,
+        "cases": _research_cases(normalized, security, active),
+        "freshness": freshness,
+        "confidence": _case_confidence(security),
+        "missing_data": missing,
+        "partial": bool(missing),
+        "refresh": {"mode": "stored_evidence", "queued_when_stale": True, "interactive_provider_calls": False},
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "cache": {"status": "miss", "ttl_seconds": _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS},
+    }
+    with _RESEARCH_OVERVIEW_CACHE_LOCK:
+        _RESEARCH_OVERVIEW_CACHE[cache_key] = (now, deepcopy(response))
+        if len(_RESEARCH_OVERVIEW_CACHE) > _RESEARCH_DETAIL_CACHE_MAX_ENTRIES * 4:
+            oldest = min(_RESEARCH_OVERVIEW_CACHE, key=lambda key: _RESEARCH_OVERVIEW_CACHE[key][0])
+            _RESEARCH_OVERVIEW_CACHE.pop(oldest, None)
+    return response
 
 
 @app.get("/api/research/securities/{ticker}/overview")
@@ -3700,6 +3911,70 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
                                {"page_context": page_context, "planned_intent": plan.intent,
                                 "route_confidence": plan.confidence})
     started = time.monotonic()
+    dashboard_execution: dashboard_chat.DashboardChatExecution | None = None
+    dashboard_resource_type = page_context.get("dashboard_resource_type")
+    dashboard_resource_id = page_context.get("dashboard_resource_id")
+    dashboard_widgets: list[dict[str, Any]] = []
+    if dashboard_resource_type and dashboard_resource_id:
+        try:
+            dashboard_widgets = dashboard_chat.dashboard_resource_widgets(
+                user.id, dashboard_resource_type, dashboard_resource_id,
+            )
+        except (KeyError, ValueError):
+            dashboard_resource_type = None
+            dashboard_resource_id = None
+    dashboard_request = dashboard_chat.interpret_dashboard_request(
+        payload.question, dashboard_widgets, previous_context,
+    )
+    if dashboard_request.intent != dashboard_chat.DashboardChatIntent.NORMAL_ANSWER:
+        dashboard_execution = dashboard_chat.execute_dashboard_chat_request(
+            user.id, dashboard_request, dashboard_resource_type, dashboard_resource_id,
+            portfolio_id=requested_portfolio_id, conversation_id=conversation_id,
+        )
+        if dashboard_execution.resource_type and dashboard_execution.resource_id:
+            page_context["dashboard_resource_type"] = dashboard_execution.resource_type
+            page_context["dashboard_resource_id"] = dashboard_execution.resource_id
+        if dashboard_execution.handled and not dashboard_execution.mixed_answer:
+            dashboard_payload = dashboard_execution.model_dump(mode="json", exclude_none=True)
+            operation_dashboard = (dashboard_execution.action_result.dashboard if dashboard_execution.action_result else None) or {}
+            operation_widgets = (
+                operation_dashboard.get("layout")
+                or (operation_dashboard.get("specification") or {}).get("widgets")
+                or []
+            )
+            operation_revision = (dashboard_execution.action_result.revision if dashboard_execution.action_result else None) or {}
+            structured_content = {
+                "sources": [], "tool_results": [], "page_context": page_context,
+                "dashboard_operation": dashboard_payload,
+                "analysis_context": {
+                    "intent": dashboard_execution.intent.value,
+                    "portfolio_id": requested_portfolio_id,
+                    "dashboard_widget_id": dashboard_execution.widget_id,
+                    "dashboard_resource_type": dashboard_execution.resource_type,
+                    "dashboard_resource_id": dashboard_execution.resource_id,
+                    "dashboard_revision_id": operation_revision.get("id"),
+                    "active_dashboard_widget_ids": [str(widget.get("id")) for widget in operation_widgets],
+                    "recent_dashboard_action": (dashboard_execution.action_result.action if dashboard_execution.action_result else None),
+                    "conversation_id": conversation_id,
+                    "request_id": request_id,
+                    "answer_complete": True,
+                },
+            }
+            response_model = (
+                "deterministic-dashboard-planner-v1"
+                if dashboard_execution.intent == dashboard_chat.DashboardChatIntent.CREATE_DASHBOARD
+                else "deterministic-dashboard-actions-v1"
+            )
+            message = database.save_chat_message(
+                user.id, conversation_id, "assistant",
+                dashboard_execution.response or dashboard_execution.clarification or "I couldn't apply that dashboard change.",
+                structured_content, response_model,
+            )
+            record_metric("ask.dashboard_action", tags={
+                "intent": dashboard_execution.intent.value,
+                "status": dashboard_execution.action_result.status.value if dashboard_execution.action_result else "CLARIFICATION",
+            })
+            return {"conversation_id": conversation_id, "message": message, "sources": [], "tool_results": []}
     tool_started = started
     tool_results, evidence_rows, execution_steps = _execute_chat_plan_tools(
         plan.tools, user.id, routed_question, started, requested_portfolio_id, plan.tickers, portfolio_context,
@@ -3796,6 +4071,8 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
             record_metric("ask.narration.fallback", tags={"intent": plan.intent, "error_type": type(exc).__name__})
             answer = deterministic_answer or _chat_narration_fallback(tool_results)
             model = "deterministic-timeout-fallback-v1"
+    if dashboard_execution and dashboard_execution.response:
+        answer = answer.rstrip() + f"\n\n**Canvas:** {dashboard_execution.response}"
     narration_elapsed = time.monotonic() - narration_started
     sources = [{"id": f"S{index + 1}", "label": item["label"], "url": item.get("url"), "as_of": item.get("as_of")} for index, item in enumerate(evidence)]
     structured_content = {
@@ -3825,6 +4102,16 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
         "grounding": {"categories": ["VERIFIED_FACT", "MODEL_OUTPUT", "MARKET_IMPLIED", "USER_BELIEF", "AI_INTERPRETATION"],
                       "tool_claim_types": {item.get("tool_name"): claim_types.get(str(item.get("tool_name")), "VERIFIED_FACT") for item in tool_results}},
     }
+    visual_suggestion = dashboard_chat.visual_suggestion_for(payload.question)
+    if visual_suggestion:
+        structured_content["visual_suggestion"] = visual_suggestion
+    if dashboard_execution:
+        structured_content["dashboard_operation"] = dashboard_execution.model_dump(mode="json", exclude_none=True)
+        structured_content["analysis_context"].update({
+            "dashboard_widget_id": dashboard_execution.widget_id,
+            "dashboard_resource_type": dashboard_execution.resource_type,
+            "dashboard_resource_id": dashboard_execution.resource_id,
+        })
     message = database.save_chat_message(user.id, conversation_id, "assistant", answer, structured_content, model)
     _persist_chat_tool_links(user.id, conversation_id, message["id"], tool_results)
     updated_history = [*history, {"role": "user", "content": payload.question}, message]
@@ -3937,6 +4224,12 @@ def mutate_dashboard_draft_widget(job_id: str, widget_id: str, payload: LayoutMu
         raise HTTPException(422,str(exc)) from exc
 
 
+@app.post("/api/dashboard/drafts/{job_id}/actions", response_model=DashboardActionResult)
+def execute_dashboard_draft_action(job_id: str, payload: dict[str, Any],
+                                   user: AuthenticatedUser = Depends(require_user)) -> DashboardActionResult:
+    return run_dashboard_action(user.id, "draft", job_id, payload)
+
+
 @app.post("/api/dashboard/drafts/{job_id}/cancel")
 def cancel_dashboard_draft(job_id: str, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     try:
@@ -4042,8 +4335,30 @@ def add_dashboard_view_widget(view_id: str, payload: WidgetAddRequest,
 def mutate_dashboard_view_widget(view_id: str, widget_id: str, payload: LayoutMutationRequest,
                                  user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     try:
-        return database.mutate_dashboard_layout(view_id,user.id,widget_id,payload.operation,payload.width,payload.height,payload.direction)
+        view = database.get_dashboard_view(view_id, user.id)
+        widgets = view.get("layout") or []
+        index = next((position for position, item in enumerate(widgets) if str(item.get("id")) == widget_id), -1)
+        if index < 0:
+            raise KeyError(widget_id)
+        if payload.operation == "remove":
+            action = {"type": "DELETE_WIDGET", "widget_id": widget_id}
+        elif payload.operation == "resize":
+            action = {"type": "RESIZE_WIDGET", "widget_id": widget_id,
+                      "width": payload.width, "height": payload.height}
+        else:
+            action = {"type": "MOVE_WIDGET", "widget_id": widget_id,
+                      "to_index": index + (-1 if (payload.direction or 0) < 0 else 1)}
+        result = run_dashboard_action(user.id, "view", view_id, action)
+        if result.status != DashboardActionStatus.SUCCESS:
+            raise ValueError(result.error or "Dashboard action failed")
+        return result.dashboard or view
     except KeyError as exc:
         raise HTTPException(404,"Dashboard widget not found") from exc
     except ValueError as exc:
         raise HTTPException(422,str(exc)) from exc
+
+
+@app.post("/api/dashboard/views/{view_id}/actions", response_model=DashboardActionResult)
+def execute_dashboard_view_action(view_id: str, payload: dict[str, Any],
+                                  user: AuthenticatedUser = Depends(require_user)) -> DashboardActionResult:
+    return run_dashboard_action(user.id, "view", view_id, payload)

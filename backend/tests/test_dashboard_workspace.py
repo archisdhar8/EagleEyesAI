@@ -4,20 +4,27 @@ import pandas as pd
 from fastapi.testclient import TestClient
 
 from backend.dashboard_workspace import (
-    CALCULATION_VERSION, DashboardPlan, calculate_macro_sensitivity, compile_spec, deterministic_plan,
-    _template_narrative, execute_task, review_dashboard_answer, run_dashboard_job, validate_dag,
+    CALCULATION_VERSION, DashboardPlan, DraftRequest, calculate_macro_sensitivity, compile_spec, deterministic_plan,
+    _template_narrative, create_draft, dashboard_data_source_registry, execute_task, materialize_planned_widgets,
+    review_dashboard_answer, run_dashboard_job, validate_dag,
     verify_required_evidence, verify_widget_result,
 )
 from backend import database
 from backend.main import app
 
 
-def test_planner_separates_intent_from_widget_layout() -> None:
+def test_planner_returns_typed_goal_relevant_widget_plan() -> None:
     plan = deterministic_plan("Compare AAPL and MSFT growth, valuation, and downside risk over 3 years")
     assert plan.intent == "compare_securities"
     assert plan.entities.tickers == ["AAPL", "MSFT"]
     assert plan.time_range == "3y"
-    assert "widgets" not in plan.model_dump()
+    assert plan.goal
+    assert plan.title == "AAPL, MSFT Comparison"
+    assert 4 <= len(plan.widgets) <= 8
+    assert all(widget.widget_type == widget.data_request.metric for widget in plan.widgets)
+    assert {widget.widget_type for widget in plan.widgets} == {
+        "security_comparison", "security_performance", "security_drawdown", "risk_summary",
+    }
 
 
 def test_spec_compiler_is_deterministic_and_versioned() -> None:
@@ -28,6 +35,67 @@ def test_spec_compiler_is_deterministic_and_versioned() -> None:
     assert first["compiler_version"]
     assert all(task["calculation_version"] == CALCULATION_VERSION for task in first["tasks"])
     assert all("grid" in widget for widget in first["widgets"])
+
+
+@pytest.mark.parametrize(
+    "prompt,expected_title,required_metric",
+    [
+        ("Build me a dashboard for monitoring my portfolio.", "Portfolio Overview", "portfolio_performance"),
+        ("Create a dashboard for researching NVDA.", "NVDA Research", "security_comparison"),
+        ("Build a dashboard comparing AAPL, MSFT, and GOOG.", "AAPL, MSFT, GOOG Comparison", "security_performance"),
+        ("Make me a risk dashboard.", "Portfolio Risk Monitor", "correlation_matrix"),
+        ("Build a dashboard to decide whether I should increase my AI exposure.", "AI Exposure Monitor", "sector_exposure"),
+        ("Build a dashboard for monitoring recession scenarios.", "Scenario Monitor", "scenario_probabilities"),
+        ("Build a fundamental quality dashboard for MSFT.", "Fundamental Quality Dashboard", "security_comparison"),
+        ("Build a performance dashboard for my portfolio.", "Portfolio Performance", "drawdown"),
+    ],
+)
+def test_phase4_dashboard_plan_contracts(prompt: str, expected_title: str, required_metric: str) -> None:
+    plan = deterministic_plan(prompt)
+    assert plan.title == expected_title
+    assert 4 <= len(plan.widgets) <= 8
+    assert required_metric in {widget.widget_type for widget in plan.widgets}
+    spec = compile_spec(plan)
+    assert 4 <= len(spec["widgets"]) <= 8
+    assert all(widget.get("purpose") for widget in spec["widgets"])
+    assert all(widget.get("binding", {}).get("metric") == widget["widget_type"] for widget in spec["widgets"])
+    assert all(widget["grid"]["w"] in {4, 6, 8, 12} for widget in spec["widgets"])
+
+
+def test_phase4_registry_exposes_only_typed_approved_sources() -> None:
+    registry = dashboard_data_source_registry()
+    assert {"portfolio_performance", "sector_exposure", "correlation_matrix", "security_comparison"} <= set(registry)
+    assert all(row["metric"] == metric for metric, row in registry.items())
+    assert all(row["default_visualization"] in row["visualizations"] for row in registry.values())
+
+
+def test_phase4_ai_exposure_discloses_unsupported_direct_metric() -> None:
+    plan = deterministic_plan("Show me everything important about AI exposure in my portfolio")
+    assert plan.title == "AI Exposure Monitor"
+    assert any("not a supported stored metric" in disclosure for disclosure in plan.ambiguities)
+    assert "ai_theme_exposure" not in {widget.widget_type for widget in plan.widgets}
+
+
+def test_phase4_unsupported_metric_is_disclosed_and_never_invented() -> None:
+    plan = deterministic_plan("Build a dashboard showing my tax lots and options Greeks")
+    assert any("not an approved dashboard data source" in disclosure for disclosure in plan.ambiguities)
+    assert all(widget.widget_type in dashboard_data_source_registry() for widget in plan.widgets)
+
+
+@pytest.mark.parametrize("failed_indexes", [set(), {1}, {1, 3}])
+def test_materialization_uses_typed_actions_and_preserves_partial_dashboard_slots(failed_indexes: set[int]) -> None:
+    spec = compile_spec(deterministic_plan("Build a performance dashboard for my portfolio"))
+    results = {
+        widget["task_id"]: {"widget_id": widget["task_id"], "status": "FAILED" if index in failed_indexes else "READY"}
+        for index, widget in enumerate(spec["widgets"])
+    }
+    widgets, actions, errors = materialize_planned_widgets(spec, results)
+    assert errors == []
+    assert len(widgets) == len(spec["widgets"])
+    assert len(actions) == len(widgets)
+    assert all(action["status"] == "SUCCESS" for action in actions)
+    assert sum(results[widget["task_id"]]["status"] == "FAILED" for widget in widgets) == len(failed_indexes)
+    assert sum(results[widget["task_id"]]["status"] == "READY" for widget in widgets) == len(widgets) - len(failed_indexes)
 
 
 def test_macro_plan_supplies_prices_to_quantitative_sensitivity() -> None:
@@ -265,7 +333,7 @@ def test_saved_board_resize_remove_duplicate_and_reopen_preserve_results() -> No
     assert duplicated["latest_run"]["widget_results"] == resized["latest_run"]["widget_results"]
     removed = database.mutate_dashboard_layout(duplicated["id"], user_id, first_widget, "remove")
     assert first_widget not in {widget["id"] for widget in removed["layout"]}
-    assert [revision["revision_type"] for revision in removed["revisions"][:2]] == ["layout", "duplicated"]
+    assert [revision["revision_type"] for revision in removed["revisions"][:2]] == ["action_delete_widget", "duplicated"]
 
 
 def test_orchestrator_preserves_widgets_as_partial_success(monkeypatch) -> None:
@@ -290,7 +358,44 @@ def test_orchestrator_preserves_widgets_as_partial_success(monkeypatch) -> None:
     result = database.get_dashboard_job(job["id"], user_id)
     assert result["state"] == "PARTIAL_SUCCESS"
     assert any(widget["status"] == "READY" for widget in result["widget_results"])
-    assert any(widget["status"] == "FAILED" for widget in result["widget_results"])
+    assert any("fixture failure" in warning for warning in result["warnings"])
+
+
+def test_draft_returns_a_provisional_widget_layout_before_background_work(monkeypatch) -> None:
+    user_id = "00000000-0000-0000-0000-000000000001"
+    monkeypatch.setattr("backend.dashboard_workspace.submit_dashboard_job", lambda *_args: None)
+    job = create_draft(user_id, DraftRequest(prompt="Build me a portfolio overview dashboard"))
+    assert job["state"] == "PLANNING"
+    assert job["specification"]["widgets"]
+    assert all(widget["id"] and widget["task_id"] for widget in job["specification"]["widgets"])
+
+
+def test_narrator_failure_preserves_verified_widgets(monkeypatch) -> None:
+    user_id = "00000000-0000-0000-0000-000000000001"
+    job = database.create_dashboard_job(user_id, "Show my portfolio return")
+    monkeypatch.setattr("backend.dashboard_workspace.plan_dashboard", lambda prompt, portfolio: deterministic_plan(prompt))
+
+    def fail_narration(*_args):
+        raise TimeoutError("fixture narrator timeout")
+
+    def ready_task(context, task, deps):
+        return {
+            "widget_id": task["id"], "status": "READY", "as_of": "2026-08-09",
+            "data": {}, "lineage": [{"provider": "fixture", "dataset": "golden"}],
+            "calculation": {"method": task["task_type"], "version": CALCULATION_VERSION, "parameters": {}},
+            "quality": {"data_quality": "high", "reasons": ["fixture"]},
+            "assumptions": [], "warnings": [], "how_calculated": "Golden fixture.",
+        }
+
+    monkeypatch.setattr("backend.dashboard_workspace._narrate", fail_narration)
+    monkeypatch.setattr("backend.dashboard_workspace._run_task", ready_task)
+    monkeypatch.setattr("backend.dashboard_workspace.verify_required_evidence", lambda *_args: {"status": "passed", "checks": ["fixture"], "issues": []})
+    run_dashboard_job(job["id"], user_id)
+    result = database.get_dashboard_job(job["id"], user_id)
+    assert result["state"] == "PARTIAL_SUCCESS"
+    assert result["specification"]["widgets"]
+    assert all(widget["status"] == "READY" for widget in result["widget_results"])
+    assert "fixture narrator timeout" in (result["error"] or "")
 
 
 def test_cancelled_job_does_not_restart(monkeypatch) -> None:

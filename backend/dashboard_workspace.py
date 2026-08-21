@@ -6,29 +6,32 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+import uuid
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from . import database
 from .analysis import latest_macro, macro_factor_dashboard, security_research
 from .chat import _candidate, _gemini_request
+from .dashboard_actions import DashboardActionResult, DashboardActionStatus, DashboardDataBinding, apply_dashboard_action, execute_dashboard_action
 from .guidance import guidance_disclosure
 from .scenarios import refresh as refresh_scenarios
 from .resilience import RetryPolicy, retry_call
 
 
-PLAN_VERSION = "dashboard-plan-v2"
+PLAN_VERSION = "dashboard-plan-v3"
 COMPILER_VERSION = "dashboard-spec-compiler-v2"
 CALCULATION_VERSION = "ai-workspace-calculations-v1.4.0"
 TERMINAL_STATES = {"COMPLETE", "PARTIAL_SUCCESS", "FAILED", "CANCELLED", "EXPIRED"}
 PLANNER_MAX_ATTEMPTS = max(1, min(2, int(os.getenv("DASHBOARD_PLANNER_MAX_ATTEMPTS", "2"))))
 DASHBOARD_TASK_WAIT_SECONDS = max(10, min(60, int(os.getenv("DASHBOARD_TASK_TIMEOUT_SECONDS", "45"))))
 DASHBOARD_NARRATIVE_WAIT_SECONDS = max(10, min(45, int(os.getenv("DASHBOARD_NARRATIVE_TIMEOUT_SECONDS", "30"))))
+DASHBOARD_MAX_PARALLEL_TASKS = max(2, min(8, int(os.getenv("DASHBOARD_MAX_PARALLEL_TASKS", "6"))))
 INTENTS = (
     "portfolio_review", "compare_securities", "research_candidates",
     "macro_analysis", "correlation_analysis", "scenario_analysis",
@@ -74,6 +77,26 @@ class DashboardEntities(BaseModel):
     themes: list[str] = Field(default_factory=list, max_length=20)
 
 
+class DashboardPlannedWidget(BaseModel):
+    """A requested analysis slot. It never contains model-generated values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=120)
+    purpose: str = Field(min_length=3, max_length=240)
+    widget_type: str = Field(min_length=2, max_length=80)
+    title: str = Field(min_length=1, max_length=160)
+    visualization: str = Field(min_length=2, max_length=80)
+    data_request: DashboardDataBinding
+    priority: int = Field(default=5, ge=1, le=8)
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "DashboardPlannedWidget":
+        if self.widget_type != self.data_request.metric:
+            raise ValueError("Planned widget type must match its approved data source")
+        return self
+
+
 class DashboardPlan(BaseModel):
     version: str = PLAN_VERSION
     intent: Literal[
@@ -87,6 +110,9 @@ class DashboardPlan(BaseModel):
     filters: dict[str, Any] = Field(default_factory=dict)
     research_query: ResearchQueryPlan | None = None
     ambiguities: list[str] = Field(default_factory=list, max_length=8)
+    goal: str = Field(default="Portfolio research dashboard", min_length=3, max_length=300)
+    title: str = Field(default="EagleEyes Research Dashboard", min_length=1, max_length=120)
+    widgets: list[DashboardPlannedWidget] = Field(default_factory=list, max_length=8)
 
 
 class DraftRequest(BaseModel):
@@ -127,6 +153,7 @@ class DuplicateViewRequest(BaseModel):
 DATA_WIDGET_CATALOG: dict[str, dict[str, Any]] = {
     "portfolio_performance": {"label": "Portfolio performance", "group": "Portfolio", "description": "Cumulative adjusted-price return and annualized volatility.", "datasets": ["price_bars", "holdings"]},
     "allocation": {"label": "Current allocation", "group": "Portfolio", "description": "Saved position weights normalized to 100%.", "datasets": ["holdings"]},
+    "sector_exposure": {"label": "Sector exposure", "group": "Portfolio", "description": "Saved portfolio weights grouped by stored security classifications.", "datasets": ["holdings", "security_research_snapshots"]},
     "drawdown": {"label": "Portfolio drawdown", "group": "Portfolio", "description": "Largest modeled peak-to-trough portfolio decline.", "datasets": ["price_bars", "holdings"]},
     "macro_trends": {"label": "Macro trend monitor", "group": "Macro", "description": "Rates, inflation, growth, labor, and credit observations.", "datasets": ["macro_observations"]},
     "historical_regimes": {"label": "Historical regimes", "group": "Macro", "description": "Point-in-time monthly regime sample counts.", "datasets": ["macro_regime_labels"]},
@@ -143,20 +170,25 @@ DATA_WIDGET_CATALOG: dict[str, dict[str, Any]] = {
 EXTRA_TASKS: dict[str, list[tuple[str, str, list[str], bool]]] = {
     "portfolio_performance": [("portfolio", "portfolio_snapshot", [], False), ("prices", "price_history", ["portfolio"], False), ("performance", "portfolio_performance", ["portfolio", "prices"], True)],
     "allocation": [("portfolio", "portfolio_snapshot", [], False), ("allocation", "allocation", ["portfolio"], False)],
+    "sector_exposure": [("portfolio", "portfolio_snapshot", [], False), ("research", "security_research", ["portfolio"], False), ("sector_exposure", "sector_exposure", ["portfolio", "research"], False)],
     "drawdown": [("portfolio", "portfolio_snapshot", [], False), ("prices", "price_history", ["portfolio"], False), ("performance", "portfolio_performance", ["portfolio", "prices"], True), ("drawdown", "drawdown", ["performance"], True)],
     "macro_trends": [("macro", "macro_trends", [], True)],
     "historical_regimes": [("regimes", "historical_regimes", [], False)],
-    "holdings_sensitivity": [("portfolio", "portfolio_snapshot", [], False), ("prices", "price_history", ["portfolio"], False), ("macro", "macro_trends", [], True), ("scenarios", "scenario_probabilities", [], True), ("sensitivity", "holdings_sensitivity", ["portfolio", "prices", "macro", "scenarios"], True)],
+    "holdings_sensitivity": [("portfolio", "portfolio_snapshot", [], False), ("prices", "price_history", ["portfolio"], False), ("macro", "macro_trends", [], True), ("scenarios", "scenario_probabilities", [], True), ("holdings_sensitivity", "holdings_sensitivity", ["portfolio", "prices", "macro", "scenarios"], True)],
     "scenario_probabilities": [("scenarios", "scenario_probabilities", [], True)],
     "correlation_matrix": [("portfolio", "portfolio_snapshot", [], False), ("prices", "price_history", ["portfolio"], False), ("correlations", "correlation_matrix", ["prices"], True)],
     "security_comparison": [("research", "security_research", [], False), ("comparison", "security_comparison", ["research"], True)],
+    "security_performance": [("security_prices", "price_history", [], False), ("security_performance", "security_performance", ["security_prices"], True)],
+    "security_drawdown": [("security_prices", "price_history", [], False), ("security_drawdown", "security_drawdown", ["security_prices"], True)],
+    "risk_summary": [("research", "security_research", [], False), ("risks", "risk_summary", ["research"], True)],
+    "macro_risk": [("portfolio", "portfolio_snapshot", [], False), ("macro", "macro_trends", [], True), ("scenarios", "scenario_probabilities", [], True), ("macro_risk", "macro_risk", ["portfolio", "macro", "scenarios"], False)],
     "research_universe": [("portfolio", "portfolio_snapshot", [], False), ("universe", "research_universe", ["portfolio"], True)],
     "optimizer_comparison": [("portfolio", "portfolio_snapshot", [], False), ("optimizer", "optimizer_comparison", ["portfolio"], False)],
 }
 
 
 def _clean_tickers(values: list[str]) -> list[str]:
-    blocked = {"I", "SHOW", "FIND", "WHAT", "WITH", "FROM", "THAT", "THIS", "STOCK", "STOCKS", "MACRO", "RISK", "BUY", "SELL", "YEAR", "RETURN"}
+    blocked = {"I", "AI", "ETF", "SHOW", "FIND", "WHAT", "WITH", "FROM", "THAT", "THIS", "STOCK", "STOCKS", "MACRO", "RISK", "BUY", "SELL", "YEAR", "RETURN"}
     return list(dict.fromkeys(value.upper() for value in values if re.fullmatch(r"[A-Za-z]{1,10}", value) and value.upper() not in blocked))[:50]
 
 
@@ -175,7 +207,9 @@ def deterministic_plan(prompt: str, portfolio_id: str | None = None) -> Dashboar
         intent = "portfolio_review"
     elif "compare my portfolio" in lower:
         intent = "portfolio_review"
-    elif any(word in lower for word in ("compare", " versus ", " vs ")) and len(tickers) >= 2:
+    elif tickers and any(term in lower for term in ("researching", "research dashboard", "fundamental quality", "quality dashboard", "valuation dashboard")):
+        intent = "compare_securities"
+    elif any(word in lower for word in ("compar", " versus ", " vs ")) and len(tickers) >= 2:
         intent = "compare_securities"
     elif any(word in lower for word in ("correlat", "diversif", "overlap")):
         intent = "correlation_analysis"
@@ -254,11 +288,17 @@ def deterministic_plan(prompt: str, portfolio_id: str | None = None) -> Dashboar
     if benchmark_match:
         benchmark=benchmark_match.group(1).upper(); plan_filters["requested_benchmark"]=benchmark
         if benchmark not in tickers: tickers.append(benchmark)
-    return DashboardPlan(
+    plan = DashboardPlan(
         intent=intent, entities=DashboardEntities(tickers=tickers, portfolio_id=portfolio_id),
         questions=outputs, time_range=time_range, requested_outputs=outputs,
         filters=plan_filters, research_query=research_query,
     )
+    goal, title, planned_widgets, disclosures = deterministic_widget_plan(prompt, plan)
+    plan.goal = goal
+    plan.title = title
+    plan.widgets = planned_widgets
+    plan.ambiguities = list(dict.fromkeys([*plan.ambiguities, *disclosures]))[:8]
+    return plan
 
 
 def _planner_prompt(prompt: str, fallback: DashboardPlan, portfolio: dict[str, Any] | None) -> str:
@@ -266,11 +306,13 @@ def _planner_prompt(prompt: str, fallback: DashboardPlan, portfolio: dict[str, A
         "portfolio_id": portfolio.get("id") if portfolio else None,
         "holding_tickers": [row["ticker"] for row in (portfolio or {}).get("holdings", [])],
         "supported_intents": INTENTS,
+        "approved_dashboard_sources": dashboard_data_source_registry(),
         "fallback_interpretation": fallback.model_dump(mode="json"),
     }
     return f"""You are the low-creativity intent planner for an investment research dashboard.
-Return JSON only. Do not create widgets, layouts, formulas, SQL, code, allocations, or buy/sell instructions.
-Select one supported intent and identify entities, questions, time range, requested outputs, filters, and ambiguities.
+Return JSON only. Do not create formulas, financial values, SQL, code, allocations, or buy/sell instructions.
+Select one supported intent and 4-8 goal-relevant widgets using only approved_dashboard_sources.
+For each widget choose the analysis purpose and approved binding; backend tools determine every value.
 For stock-buy language, use research_candidates. Preserve explicitly named ticker symbols.
 The output must validate against this shape: {json.dumps(DashboardPlan.model_json_schema())}
 Context: {json.dumps(context, default=str)}
@@ -278,10 +320,14 @@ User request: {prompt}"""
 
 
 def plan_dashboard(prompt: str, portfolio: dict[str, Any] | None = None) -> DashboardPlan:
+    planner_started = time.monotonic()
     fallback = deterministic_plan(prompt, str(portfolio.get("id")) if portfolio else None)
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
     if not api_key:
+        from .operational_monitoring import record_metric
+        record_metric("dashboard.planner.latency_ms", (time.monotonic() - planner_started) * 1000,
+                      tags={"mode": "deterministic", "widget_count": len(fallback.widgets)})
         return fallback
     contents = [{"role": "user", "parts": [{"text": _planner_prompt(prompt, fallback, portfolio)}]}]
     for _ in range(PLANNER_MAX_ATTEMPTS):
@@ -301,16 +347,41 @@ def plan_dashboard(prompt: str, portfolio: dict[str, Any] | None = None) -> Dash
             candidate.entities.tickers = _clean_tickers(candidate.entities.tickers)
             candidate.entities.portfolio_id = candidate.entities.portfolio_id or fallback.entities.portfolio_id
             candidate.filters = {**fallback.filters, **candidate.filters}
+            candidate.goal = candidate.goal if candidate.goal != "Portfolio research dashboard" else fallback.goal
+            candidate.title = candidate.title if candidate.title != "EagleEyes Research Dashboard" else fallback.title
+            valid_widgets: list[DashboardPlannedWidget] = []
+            seen_widget_ids: set[str] = set()
+            seen_widget_types: set[str] = set()
+            for widget in candidate.widgets:
+                source = DASHBOARD_DATA_SOURCE_REGISTRY.get(widget.widget_type)
+                if source is None or widget.visualization not in source.visualizations:
+                    continue
+                # A generated plan may not create ambiguous IDs or repeat the same
+                # analysis under several titles. Both would make later references
+                # such as "move that chart" unreliable.
+                if widget.id in seen_widget_ids or widget.widget_type in seen_widget_types:
+                    continue
+                seen_widget_ids.add(widget.id)
+                seen_widget_types.add(widget.widget_type)
+                valid_widgets.append(widget)
+            candidate.widgets = valid_widgets[:8] if len(valid_widgets) >= 4 else fallback.widgets
+            candidate.ambiguities = list(dict.fromkeys([*fallback.ambiguities, *candidate.ambiguities]))[:8]
             if candidate.intent == "research_candidates" and candidate.research_query is None:
                 candidate.research_query = fallback.research_query or ResearchQueryPlan()
             elif candidate.intent == "research_candidates" and fallback.research_query:
                 candidate.research_query.theme = candidate.research_query.theme or fallback.research_query.theme
                 candidate.research_query.universe = fallback.research_query.universe
+            from .operational_monitoring import record_metric
+            record_metric("dashboard.planner.latency_ms", (time.monotonic() - planner_started) * 1000,
+                          tags={"mode": "model", "widget_count": len(candidate.widgets)})
             return candidate
         except (RuntimeError, ValidationError, ValueError) as exc:
             from .operational_monitoring import record_metric
             record_metric("gemini.planning_failure", tags={"error_type": type(exc).__name__, "model": model})
             contents.append({"role": "user", "parts": [{"text": "The prior output was invalid. Return one JSON object matching the schema exactly."}]})
+    from .operational_monitoring import record_metric
+    record_metric("dashboard.planner.latency_ms", (time.monotonic() - planner_started) * 1000,
+                  tags={"mode": "fallback", "widget_count": len(fallback.widgets)})
     return fallback
 
 
@@ -378,7 +449,7 @@ TASK_TEMPLATES: dict[str, dict[str, Any]] = {
 
 WIDGET_META = {
     "portfolio_performance": ("Portfolio performance", "line", 8, 2), "drawdown": ("Portfolio drawdown", "area", 4, 2),
-    "allocation": ("Current allocation", "bar", 4, 2), "macro_trends": ("Macro trend monitor", "cards", 8, 2),
+    "allocation": ("Current allocation", "bar", 4, 2), "sector_exposure": ("Sector Exposure", "bar_chart", 6, 2), "macro_trends": ("Macro trend monitor", "cards", 8, 2),
     "scenario_probabilities": ("Scenario probabilities", "bar", 4, 2), "macro_risk": ("Portfolio macro risks", "table", 8, 2),
     "optimizer_comparison": ("Constrained alternatives", "comparison", 12, 2), "security_comparison": ("Research comparison", "table", 12, 2),
     "security_performance": ("Cumulative performance", "line", 8, 2), "security_drawdown": ("Security drawdown", "bar", 4, 2),
@@ -397,6 +468,161 @@ WIDGET_META = {
 }
 
 
+class DashboardDataSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    metric: str
+    label: str
+    purpose: str
+    visualizations: list[str]
+    default_visualization: str
+    portfolio_required: bool = False
+    entity_scope: Literal["portfolio", "security", "market", "mixed"] = "mixed"
+
+
+def _source(metric: str, *, purpose: str, visualizations: list[str], portfolio_required: bool = False,
+            entity_scope: Literal["portfolio", "security", "market", "mixed"] = "mixed") -> DashboardDataSource:
+    title, default_visualization, _, _ = WIDGET_META[metric]
+    return DashboardDataSource(
+        metric=metric, label=title, purpose=purpose, visualizations=visualizations,
+        default_visualization=default_visualization, portfolio_required=portfolio_required,
+        entity_scope=entity_scope,
+    )
+
+
+DASHBOARD_DATA_SOURCE_REGISTRY: dict[str, DashboardDataSource] = {
+    "portfolio_performance": _source("portfolio_performance", purpose="Track portfolio return through time", visualizations=["line", "line_chart", "area", "area_chart"], portfolio_required=True, entity_scope="portfolio"),
+    "allocation": _source("allocation", purpose="Show position weights and capital concentration", visualizations=["bar", "bar_chart", "table"], portfolio_required=True, entity_scope="portfolio"),
+    "sector_exposure": _source("sector_exposure", purpose="Measure sector concentration from stored classifications", visualizations=["bar", "bar_chart", "table"], portfolio_required=True, entity_scope="portfolio"),
+    "drawdown": _source("drawdown", purpose="Measure modeled peak-to-trough portfolio decline", visualizations=["area", "area_chart", "bar", "bar_chart"], portfolio_required=True, entity_scope="portfolio"),
+    "macro_trends": _source("macro_trends", purpose="Monitor stored rates, inflation, labor, growth, and credit observations", visualizations=["cards", "table"], entity_scope="market"),
+    "scenario_probabilities": _source("scenario_probabilities", purpose="Show stored macro and prediction-market scenario evidence", visualizations=["bar", "bar_chart", "table"], entity_scope="market"),
+    "historical_regimes": _source("historical_regimes", purpose="Compare historical macro regime observations", visualizations=["bar", "bar_chart", "table"], entity_scope="market"),
+    "holdings_sensitivity": _source("holdings_sensitivity", purpose="Estimate holding sensitivity to a selected macro factor", visualizations=["table", "bar", "bar_chart"], portfolio_required=True, entity_scope="portfolio"),
+    "correlation_matrix": _source("correlation_matrix", purpose="Reveal shared return behavior across holdings", visualizations=["heatmap", "table"], portfolio_required=True, entity_scope="portfolio"),
+    "security_comparison": _source("security_comparison", purpose="Compare stored fundamentals, growth, valuation, momentum, and evidence confidence", visualizations=["table", "bar", "bar_chart"], entity_scope="security"),
+    "security_performance": _source("security_performance", purpose="Compare security performance through time", visualizations=["line", "line_chart", "area", "area_chart"], entity_scope="security"),
+    "security_drawdown": _source("security_drawdown", purpose="Compare security drawdowns", visualizations=["bar", "bar_chart", "table"], entity_scope="security"),
+    "risk_summary": _source("risk_summary", purpose="Summarize stored company risks and evidence gaps", visualizations=["list", "table"], entity_scope="security"),
+    "macro_risk": _source("macro_risk", purpose="Connect portfolio holdings to current macro risks", visualizations=["table", "list"], portfolio_required=True, entity_scope="mixed"),
+    "research_universe": _source("research_universe", purpose="Disclose the securities included in a candidate screen", visualizations=["summary", "table"], entity_scope="security"),
+    "candidate_ranking": _source("candidate_ranking", purpose="Rank the explicit research universe using stored evidence", visualizations=["table", "bar", "bar_chart"], entity_scope="security"),
+    "factor_correlation_candidates": _source("factor_correlation_candidates", purpose="Rank candidates by measured correlation with a selected macro factor", visualizations=["table"], entity_scope="mixed"),
+    "portfolio_fit": _source("portfolio_fit", purpose="Compare candidate evidence with current portfolio structure", visualizations=["table"], portfolio_required=True, entity_scope="mixed"),
+    "diversification_summary": _source("diversification_summary", purpose="Summarize effective diversification and concentration", visualizations=["summary", "table"], portfolio_required=True, entity_scope="portfolio"),
+    "correlation_stability": _source("correlation_stability", purpose="Check whether measured correlations persist across sample windows", visualizations=["summary", "table"], portfolio_required=True, entity_scope="portfolio"),
+    "scenario_history": _source("scenario_history", purpose="Show the stored history behind scenario evidence", visualizations=["line", "line_chart", "table"], entity_scope="market"),
+    "scenario_sensitivity": _source("scenario_sensitivity", purpose="Connect scenario evidence to affected securities", visualizations=["table", "bar", "bar_chart"], portfolio_required=True, entity_scope="mixed"),
+    "optimizer_comparison": _source("optimizer_comparison", purpose="Compare the current portfolio with stored constrained alternatives", visualizations=["comparison", "table"], portfolio_required=True, entity_scope="portfolio"),
+    "weekly_market_changes": _source("weekly_market_changes", purpose="Summarize material stored market changes from the past week", visualizations=["table"], entity_scope="market"),
+    "next_dollar_research": _source("next_dollar_research", purpose="Evaluate contribution-only research paths without selling holdings", visualizations=["summary", "table"], portfolio_required=True, entity_scope="portfolio"),
+    "evidence_audit": _source("evidence_audit", purpose="Disclose stale and missing evidence across the portfolio", visualizations=["table"], portfolio_required=True, entity_scope="portfolio"),
+    "thesis_invalidation": _source("thesis_invalidation", purpose="Show evidence that would weaken or invalidate a stored thesis", visualizations=["table"], entity_scope="security"),
+    "sector_beneficiaries": _source("sector_beneficiaries", purpose="Identify sectors with supporting stored evidence for a named condition", visualizations=["table"], entity_scope="market"),
+}
+
+
+def dashboard_data_source_registry() -> dict[str, dict[str, Any]]:
+    """Public, serializable catalog used by planners and contract tests."""
+    return {key: value.model_dump(mode="json") for key, value in DASHBOARD_DATA_SOURCE_REGISTRY.items()}
+
+
+def _planned_widget(metric: str, *, purpose: str | None = None, period: str = "1Y",
+                    tickers: list[str] | None = None, priority: int = 5,
+                    visualization: str | None = None, benchmark: str | None = None) -> DashboardPlannedWidget:
+    source = DASHBOARD_DATA_SOURCE_REGISTRY[metric]
+    chosen = visualization or source.default_visualization
+    if chosen not in source.visualizations:
+        chosen = source.default_visualization
+    return DashboardPlannedWidget(
+        id=f"planned-{metric}", purpose=purpose or source.purpose,
+        widget_type=metric, title=source.label, visualization=chosen,
+        data_request=DashboardDataBinding(metric=metric, period=period, tickers=tickers or [], benchmark=benchmark),
+        priority=priority,
+    )
+
+
+def deterministic_widget_plan(prompt: str, plan: DashboardPlan) -> tuple[str, str, list[DashboardPlannedWidget], list[str]]:
+    """Choose useful supported analyses without generating any financial values."""
+    lower = prompt.lower().removeprefix("/design").strip()
+    period = plan.time_range.upper()
+    period = period if re.fullmatch(r"(?:1|3|5|7|10|20)Y", period) else "1Y"
+    tickers = plan.entities.tickers
+    disclosures: list[str] = []
+
+    if plan.intent == "research_candidates":
+        goal, title = "Screen an explicit candidate universe with stored, verified evidence", "Research Candidate Screen"
+        candidate_metric = "factor_correlation_candidates" if plan.filters.get("factor_correlation") else "candidate_ranking"
+        metrics = ["research_universe", candidate_metric, "security_comparison", "portfolio_fit"]
+    elif any(term in lower for term in ("ai exposure", "artificial intelligence exposure", "semiconductor exposure")):
+        goal, title = "Evaluate portfolio exposure to AI-adjacent industries and its supporting evidence", "AI Exposure Monitor"
+        metrics = ["sector_exposure", "allocation", "security_comparison", "correlation_matrix", "scenario_probabilities"]
+        disclosures.append("Direct AI-linked revenue exposure is not a supported stored metric; the dashboard uses sector, security-research, correlation, and scenario evidence instead.")
+    elif any(term in lower for term in ("risk dashboard", "portfolio risk", "monitor risk")):
+        goal, title = "Monitor portfolio concentration, drawdown, shared risk, and macro exposure", "Portfolio Risk Monitor"
+        metrics = ["allocation", "sector_exposure", "drawdown", "correlation_matrix", "macro_risk", "scenario_probabilities"]
+    elif plan.intent == "scenario_analysis" or any(term in lower for term in ("scenario dashboard", "macro monitor")):
+        goal, title = "Monitor macro conditions and portfolio scenario sensitivity", "Scenario Monitor"
+        metrics = ["scenario_probabilities", "scenario_sensitivity", "scenario_history", "macro_trends"]
+    elif any(term in lower for term in ("fundamental quality", "quality dashboard", "valuation dashboard")):
+        goal, title = "Compare company quality, valuation, performance, and evidence risks", "Fundamental Quality Dashboard"
+        metrics = ["security_comparison", "security_performance", "security_drawdown", "risk_summary"]
+    elif plan.intent == "macro_analysis":
+        goal, title = "Measure macro conditions and holding sensitivity using stored historical evidence", "Macro Sensitivity Monitor"
+        metrics = ["holdings_sensitivity", "macro_trends", "historical_regimes", "scenario_probabilities"]
+    elif plan.intent == "correlation_analysis":
+        goal, title = "Evaluate portfolio correlation, concentration, and stability", "Diversification Monitor"
+        metrics = ["correlation_matrix", "diversification_summary", "correlation_stability", "allocation"]
+    elif len(tickers) == 1 and any(term in lower for term in ("research", "everything important")):
+        goal, title = f"Research {tickers[0]} using stored company and market evidence", f"{tickers[0]} Research"
+        metrics = ["security_comparison", "security_performance", "security_drawdown", "risk_summary"]
+    elif plan.intent == "compare_securities" or len(tickers) >= 2:
+        names = ", ".join(tickers) if tickers else "Selected Securities"
+        goal, title = f"Compare {names} using stored research and market evidence", f"{names} Comparison"
+        metrics = ["security_comparison", "security_performance", "security_drawdown", "risk_summary"]
+    elif tickers and "dashboard" in lower:
+        goal, title = f"Research {tickers[0]} using stored company and market evidence", f"{tickers[0]} Research"
+        metrics = ["security_comparison", "security_performance", "security_drawdown", "risk_summary"]
+    elif any(term in lower for term in ("performance", "returns", "benchmark")):
+        goal, title = "Monitor portfolio performance, downside, allocation, and exposure", "Portfolio Performance"
+        metrics = ["portfolio_performance", "drawdown", "allocation", "sector_exposure"]
+    else:
+        goal, title = "Monitor portfolio structure, performance, concentration, and current risks", "Portfolio Overview"
+        metrics = ["portfolio_performance", "allocation", "sector_exposure", "drawdown", "correlation_matrix", "scenario_probabilities"]
+
+    requested_widget_map = {
+        "weekly_market_changes": "weekly_market_changes",
+        "sector_beneficiaries": "sector_beneficiaries",
+        "contribution_only_diversification": "optimizer_comparison",
+        "next_dollar_research": "next_dollar_research",
+        "combined_macro_states": "scenario_sensitivity",
+        "thesis_invalidation": "thesis_invalidation",
+        "stale_evidence_audit": "evidence_audit",
+    }
+    specialized = [requested_widget_map[item] for item in plan.requested_outputs if item in requested_widget_map]
+    if plan.intent == "portfolio_review" and plan.filters.get("macro_factor"):
+        specialized.append("macro_trends")
+    metrics = list(dict.fromkeys([*specialized, *metrics]))[:8]
+
+    benchmark_match = re.search(r"(?:against|versus|vs\.?|benchmark(?:ed)?\s+(?:against|to)?)\s+([A-Z]{1,10})\b", prompt, re.I)
+    benchmark = benchmark_match.group(1).upper() if benchmark_match else ("SPY" if "portfolio_performance" in metrics else None)
+    unsupported = {
+        "tax lot": "Tax-lot analytics",
+        "options greek": "Options-Greek analytics",
+        "intraday order flow": "Intraday order-flow analytics",
+        "social sentiment": "Social-sentiment analytics",
+    }
+    for phrase, label in unsupported.items():
+        if phrase in lower:
+            disclosures.append(f"{label} is not an approved dashboard data source, so no widget or value was generated for it.")
+    widgets = [
+        _planned_widget(metric, period=period, tickers=tickers if DASHBOARD_DATA_SOURCE_REGISTRY[metric].entity_scope == "security" else [],
+                        priority=index + 1, benchmark=benchmark if metric == "portfolio_performance" else None)
+        for index, metric in enumerate(metrics[:8])
+    ]
+    return goal, title, widgets, disclosures
+
+
 def compile_spec(plan: DashboardPlan) -> dict[str, Any]:
     template = TASK_TEMPLATES[plan.intent]
     task_template = list(template["tasks"])
@@ -411,7 +637,8 @@ def compile_spec(plan: DashboardPlan) -> dict[str, Any]:
         ]
     present_types = {item[1] for item in task_template}
     present_ids = {item[0] for item in task_template}
-    for requested in plan.filters.get("additional_widgets", []):
+    planned_metrics = [widget.widget_type for widget in plan.widgets]
+    for requested in [*planned_metrics, *plan.filters.get("additional_widgets", [])]:
         if requested not in EXTRA_TASKS or requested in present_types:
             continue
         for item in EXTRA_TASKS[requested]:
@@ -440,9 +667,34 @@ def compile_spec(plan: DashboardPlan) -> dict[str, Any]:
             "required_for_narrative": required, "query": query,
             "calculation_version": CALCULATION_VERSION,
         })
-        if task_type in WIDGET_META:
+    if plan.widgets:
+        task_id_by_type = {task["task_type"]: task["id"] for task in tasks}
+        for planned in sorted(plan.widgets, key=lambda item: item.priority):
+            task_id = task_id_by_type.get(planned.widget_type)
+            if not task_id:
+                continue
+            _, _, default_width, height = WIDGET_META[planned.widget_type]
+            width = 12 if planned.priority == 1 and planned.widget_type in {"portfolio_performance", "security_comparison", "correlation_matrix"} else default_width
+            if column + width > 12:
+                row += 3
+                column = 0
+            widgets.append({
+                "id": planned.id, "task_id": task_id, "widget_type": planned.widget_type,
+                "title": planned.title, "purpose": planned.purpose,
+                "visualization": planned.visualization,
+                "binding": planned.data_request.model_dump(mode="json"),
+                "grid": {"x": column, "y": row, "w": width, "h": height},
+            })
+            column += width
+    else:
+        for task in tasks:
+            task_type, task_id = task["task_type"], task["id"]
+            if task_type not in WIDGET_META:
+                continue
             title, visualization, width, height = WIDGET_META[task_type]
-            if column + width > 12: row += 2; column = 0
+            if column + width > 12:
+                row += 2
+                column = 0
             widgets.append({"id": task_id, "task_id": task_id, "widget_type": task_type,
                             "title": title, "visualization": visualization,
                             "grid": {"x": column, "y": row, "w": width, "h": height}})
@@ -450,8 +702,9 @@ def compile_spec(plan: DashboardPlan) -> dict[str, Any]:
     validate_dag(tasks)
     return {"version": "dashboard-spec-v2", "spec_version":"dashboard-spec-v2",
             "layout_version":"dashboard-layout-v2", "compiler_version": COMPILER_VERSION,
-            "title": template["title"], "description": f"Generated from {plan.intent.replace('_',' ')} intent.",
+            "title": plan.title or template["title"], "description": plan.goal,
             "filters": {"time_range": plan.time_range}, "tasks": tasks, "widgets": widgets,
+            "plan_disclosures": plan.ambiguities,
             "agent_pipeline": [
                 {"agent": "planner", "responsibility": "Interpret the request and select evidence needs."},
                 {"agent": "widget_builders", "responsibility": "Run approved data services and deterministic calculations."},
@@ -496,6 +749,7 @@ def _presentation(task: dict[str, Any], data: Any) -> dict[str, Any]:
         "drawdown": {"chart": "area", "x_axis": "Portfolio", "y_axis": "Maximum drawdown", "unit": "%", "frequency": "Daily"},
         "security_drawdown": {"chart": "bar", "x_axis": "Security", "y_axis": "Maximum drawdown", "unit": "%", "frequency": "Daily"},
         "allocation": {"chart": "bar", "x_axis": "Holding", "y_axis": "Portfolio weight", "unit": "%", "frequency": "Current snapshot"},
+        "sector_exposure": {"chart": "bar", "x_axis": "Sector", "y_axis": "Portfolio weight", "unit": "%", "frequency": "Current snapshot"},
         "scenario_probabilities": {"chart": "bar", "x_axis": "Scenario", "y_axis": "Probability", "unit": "%", "frequency": "Latest snapshot"},
         "historical_regimes": {"chart": "bar", "x_axis": "Regime", "y_axis": "Monthly observations", "unit": "months", "frequency": "Monthly"},
         "correlation_matrix": {"chart": "heatmap", "x_axis": "Security", "y_axis": "Security", "unit": "correlation (-1 to +1)", "frequency": "Daily returns"},
@@ -558,6 +812,10 @@ def _portfolio(user_id: str, requested_id: str | None = None) -> dict[str, Any]:
 
 def _tickers(context: dict[str, Any], task: dict[str, Any], deps: dict[str, Any]) -> list[str]:
     explicit = _clean_tickers(task.get("query", {}).get("tickers", []))
+    if explicit and "portfolio" in deps:
+        portfolio = deps["portfolio"].get("data") or context["portfolio"]
+        holdings = [row["ticker"] for row in portfolio.get("holdings", []) if row["ticker"] != "CASH"]
+        return list(dict.fromkeys([*holdings, *explicit]))
     if explicit: return explicit
     universe = deps.get("universe", {}).get("data") or {}
     if universe.get("tickers"):
@@ -571,6 +829,14 @@ def _price_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
     frame = pd.DataFrame(rows)
     frame["date"] = pd.to_datetime(frame["date"], utc=True)
     return frame.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index().ffill()
+
+
+def _trading_sessions(time_range: str) -> int:
+    match = re.fullmatch(r"(\d+)([my])", str(time_range).strip().lower())
+    if not match:
+        return 252
+    amount, unit = int(match.group(1)), match.group(2)
+    return max(21, min(20 * 252, amount * (21 if unit == "m" else 252)))
 
 
 MACRO_SENSITIVITY_FACTORS = {
@@ -733,11 +999,13 @@ def execute_task(context: dict[str, Any], task: dict[str, Any], deps: dict[str, 
 
     # Derived tasks use only validated dependency outputs.
     if task_type in {"portfolio_performance","security_performance","security_drawdown","correlation_matrix","correlation_stability"}:
-        price_result = deps.get("prices") or deps.get("performance") or {}
+        price_result = deps.get("prices") or deps.get("security_prices") or deps.get("performance") or next(
+            (value for value in deps.values() if (value.get("calculation") or {}).get("method") == "price_history"), {}
+        )
         rows = price_result.get("data", [])
         if task_type == "portfolio_performance" and "prices" in deps: rows=deps["prices"]["data"]
         frame=_price_frame(rows)
-        years=int(str(task["query"].get("time_range","1y")).rstrip("y") or 1); frame=frame.tail(252*years)
+        frame=frame.tail(_trading_sessions(str(task["query"].get("time_range", "1y"))))
         if frame.empty or len(frame)<2: raise ValueError("Insufficient adjusted price history")
         returns=frame.pct_change().dropna(how="all").fillna(0)
         if task_type == "portfolio_performance":
@@ -745,6 +1013,13 @@ def execute_task(context: dict[str, Any], task: dict[str, Any], deps: dict[str, 
             total=sum(raw.values()) or len(raw); weights=pd.Series({key:(value/total if sum(raw.values()) else 1/total) for key,value in raw.items()})
             series=(returns[weights.index]*weights).sum(axis=1); cumulative=(1+series).cumprod()-1
             data={"total_return":float(cumulative.iloc[-1]),"annualized_volatility":float(series.std()*np.sqrt(252)),"series":[{"date":idx.date().isoformat(),"value":round(float(value),6)} for idx,value in cumulative.items()]}
+            benchmark = str(task.get("query", {}).get("filters", {}).get("benchmark") or "").upper()
+            if benchmark and benchmark in frame.columns:
+                benchmark_series = frame[benchmark].dropna()
+                benchmark_series = benchmark_series / benchmark_series.iloc[0] - 1
+                data["benchmark"] = benchmark
+                data["benchmark_return"] = float(benchmark_series.iloc[-1])
+                data["benchmark_series"] = [{"date": idx.date().isoformat(), "value": round(float(value), 6)} for idx, value in benchmark_series.items()]
             how="Calculated daily weighted portfolio returns from adjusted closes using normalized current weights, then compounded them. Historical holdings reconstruction is not available."
         elif task_type == "security_performance":
             normalized=frame/frame.iloc[0]-1; data={"series":{col:[{"date":idx.date().isoformat(),"value":round(float(value),6)} for idx,value in normalized[col].items()] for col in normalized}}
@@ -768,6 +1043,28 @@ def execute_task(context: dict[str, Any], task: dict[str, Any], deps: dict[str, 
         holdings=context["portfolio"].get("holdings",[]); total=sum(float(row.get("weight") or 0) for row in holdings) or 1
         data=[{"ticker":row["ticker"],"weight":round(float(row.get("weight") or 0)/total,6)} for row in holdings]
         return _task_result(task,data,lineage=deps["portfolio"]["lineage"],as_of=deps["portfolio"]["as_of"],quality=_quality("high",["Saved portfolio weights"]),assumptions=[],warnings=[],how="Normalized saved holding weights to 100%; no LLM calculation was used.")
+    if task_type == "sector_exposure":
+        holdings = context["portfolio"].get("holdings", [])
+        research = {str(row.get("ticker")): row for row in deps["research"].get("data", [])}
+        total = sum(float(row.get("weight") or 0) for row in holdings) or 1
+        grouped: dict[str, float] = {}
+        missing: list[str] = []
+        for holding in holdings:
+            ticker = str(holding.get("ticker"))
+            sector = str((research.get(ticker) or {}).get("sector") or "Unclassified")
+            grouped[sector] = grouped.get(sector, 0) + float(holding.get("weight") or 0) / total
+            if sector == "Unclassified":
+                missing.append(ticker)
+        data = [{"sector": sector, "weight": round(weight, 6)} for sector, weight in sorted(grouped.items(), key=lambda item: item[1], reverse=True)]
+        coverage = 1 - grouped.get("Unclassified", 0)
+        return _task_result(
+            task, data, lineage=[*deps["portfolio"].get("lineage", []), *deps["research"].get("lineage", [])],
+            as_of=max(filter(None, (deps["portfolio"].get("as_of"), deps["research"].get("as_of"))), default=now),
+            quality=_quality("high" if coverage >= .9 else "medium" if coverage >= .6 else "low", [f"{coverage * 100:.1f}% of portfolio weight has a stored sector classification"]),
+            assumptions=["Sector weights use current saved portfolio weights and the latest stored security classification."],
+            warnings=[f"Missing sector classification for {ticker}." for ticker in missing[:12]],
+            how="Joined saved holdings to stored security classifications, normalized current weights to 100%, and summed weights by sector. No LLM values were used.",
+        )
     if task_type in {"security_comparison","risk_summary","candidate_ranking"}:
         rows=deps["research"]["data"]
         if task_type == "candidate_ranking":
@@ -1017,7 +1314,7 @@ def _template_narrative(prompt: str, results: list[dict[str, Any]]) -> str:
 
 
 def _narrate(prompt: str, results: list[dict[str, Any]]) -> str:
-    useful=[{"widget_id":row["widget_id"],"data":row["data"],"quality":row["quality"],"warnings":row["warnings"],"as_of":row["as_of"],"calculation":row.get("calculation",{}),"presentation":row.get("presentation",{})} for row in results if row["status"] in {"READY","STALE"}]
+    useful=[{"widget_id":row["widget_id"],"data":row["data"],"quality":row["quality"],"warnings":row["warnings"],"as_of":row["as_of"],"calculation":row.get("calculation",{}),"presentation":row.get("presentation",{})} for row in results if row["status"] in {"READY","STALE","PARTIAL"}]
     if not useful: return "No validated widget evidence was available, so no interpretation was generated."
     api_key=os.getenv("GEMINI_API_KEY","").strip(); model=os.getenv("GEMINI_MODEL","gemini-3.5-flash").strip()
     if not api_key:
@@ -1037,7 +1334,7 @@ Validated widgets: {json.dumps(useful,default=str)[:60000]}"""
 
 def review_dashboard_answer(prompt: str, narrative: str, results: list[dict[str, Any]]) -> dict[str, Any]:
     """Deterministically check evidence coverage and whether the prose addresses the request."""
-    lower = prompt.lower(); available = {row.get("calculation", {}).get("method") for row in results if row.get("status") in {"READY", "STALE"}}
+    lower = prompt.lower(); available = {row.get("calculation", {}).get("method") for row in results if row.get("status") in {"READY", "STALE", "PARTIAL"}}
     issues, checks = [], []
     expectations = {
         "return": {"portfolio_performance", "security_performance"}, "drawdown": {"drawdown", "security_drawdown"},
@@ -1075,7 +1372,7 @@ def review_dashboard_answer(prompt: str, narrative: str, results: list[dict[str,
 
 def verify_required_evidence(prompt: str, plan: DashboardPlan, tasks: dict[str,dict[str,Any]],
                              results: dict[str,dict[str,Any]]) -> dict[str,Any]:
-    ready={task_id:result for task_id,result in results.items() if result.get("status") in {"READY","STALE"}}
+    ready={task_id:result for task_id,result in results.items() if result.get("status") in {"READY","STALE","PARTIAL"}}
     issues=[];checks=[]
     for task_id,task in tasks.items():
         if not task.get("required_for_narrative"): continue
@@ -1157,6 +1454,29 @@ def _run_task_bounded(context: dict[str, Any], task: dict[str, Any], deps: dict[
     )
 
 
+def materialize_planned_widgets(specification: dict[str, Any], results: dict[str, dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Validate every generated canvas mutation through the Phase 2 executor."""
+    state: dict[str, Any] = {"name": specification.get("title"), "widgets": [], "layout_version": "dashboard-layout-v2"}
+    action_log: list[dict[str, Any]] = []
+    errors: list[str] = []
+    available_task_ids = set(results)
+    for widget in specification.get("widgets") or []:
+        if str(widget.get("task_id")) not in available_task_ids:
+            errors.append(f"{widget.get('title')}: approved data task did not produce a result")
+            continue
+        action = {"type": "CREATE_WIDGET", "widget": widget}
+        outcome = apply_dashboard_action(
+            state, action, allowed_widget_types=set(DASHBOARD_DATA_SOURCE_REGISTRY) | set(WIDGET_META),
+            available_task_ids=available_task_ids,
+        )
+        action_log.append({"action": action, "status": outcome.status.value, "error": outcome.error})
+        if outcome.status != DashboardActionStatus.SUCCESS or outcome.dashboard is None:
+            errors.append(f"{widget.get('title')}: {outcome.error or 'widget action failed'}")
+            continue
+        state = outcome.dashboard
+    return list(state["widgets"]), action_log, errors
+
+
 def submit_dashboard_job(job: dict[str, Any], user_id: str) -> None:
     with ACTIVE_LOCK:
         existing=ACTIVE_JOBS.get(job["id"])
@@ -1165,6 +1485,7 @@ def submit_dashboard_job(job: dict[str, Any], user_id: str) -> None:
 
 
 def run_dashboard_job(job_id: str, user_id: str) -> None:
+    generation_started = time.monotonic()
     try:
         job=database.get_dashboard_job(job_id,user_id)
         if job["state"] == "CANCELLED":
@@ -1175,9 +1496,17 @@ def run_dashboard_job(job_id: str, user_id: str) -> None:
         goals=database.list_goals(user_id)
         guidance=guidance_disclosure(portfolio=portfolio,profile=profile,policy=policy,goals=goals)
         context={"user_id":user_id,"portfolio":portfolio,"profile":profile,"policy":policy,"goals":goals,"guidance":guidance}
+        planner_started = time.monotonic()
         plan=DashboardPlan.model_validate(job["plan"]) if job.get("plan") else plan_dashboard(job["prompt"],portfolio)
+        planner_elapsed = time.monotonic() - planner_started
         database.update_dashboard_job(job_id,user_id,state="PLAN_VALIDATED",progress=12,plan=plan.model_dump(mode="json"))
         spec=compile_spec(plan)
+        from .operational_monitoring import record_metric
+        record_metric(
+            "dashboard.tools_requested",
+            len(spec["tasks"]),
+            tags={"intent": plan.intent, "widget_count": len(spec["widgets"])},
+        )
         spec["guidance_decision"]={
             **guidance,
             "inputs_used": {
@@ -1189,33 +1518,53 @@ def run_dashboard_job(job_id: str, user_id: str) -> None:
         database.update_dashboard_job(job_id,user_id,state="SPEC_COMPILED",progress=20,specification=spec)
         for task in spec["tasks"]: database.save_dashboard_task(job_id,task)
         database.update_dashboard_job(job_id,user_id,state="FETCHING",progress=25)
-        tasks={task["id"]:task for task in spec["tasks"]}; pending=set(tasks); running:dict[Future[Any],str]={}; results:dict[str,dict[str,Any]]={}; failures=[]; narrative_future:Future[str]|None=None; evidence_gate:dict[str,Any]|None=None
+        tasks={task["id"]:task for task in spec["tasks"]}; pending=set(tasks); running:dict[Future[Any],tuple[str,float]]={}; results:dict[str,dict[str,Any]]={}; failures=[]; narrative_future:Future[str]|None=None; evidence_gate:dict[str,Any]|None=None
+        execution_started = time.monotonic()
         while pending or running:
             current=database.get_dashboard_job(job_id,user_id)
             if current["state"]=="CANCELLED":
                 for task_id in pending: database.save_dashboard_task(job_id,tasks[task_id],state="CANCELLED")
                 return
             for task_id in list(pending):
+                if len(running) >= DASHBOARD_MAX_PARALLEL_TASKS:
+                    break
                 task=tasks[task_id]
                 if all(dep in results for dep in task["depends_on"]):
                     dep_values={dep:results[dep] for dep in task["depends_on"]}; database.save_dashboard_task(job_id,task,state="RUNNING")
-                    running[TASK_EXECUTOR.submit(_run_task_bounded,context,task,dep_values)]=task_id; pending.remove(task_id)
+                    running[TASK_EXECUTOR.submit(_run_task_bounded,context,task,dep_values)]=(task_id,time.monotonic()); pending.remove(task_id)
             if not running and pending:
                 raise RuntimeError("No runnable tasks remain in the dashboard graph")
             if running:
-                future=next(as_completed(list(running),timeout=DASHBOARD_TASK_WAIT_SECONDS)); task_id=running.pop(future); task=tasks[task_id]
-                try:
-                    result=future.result(); results[task_id]=result; database.save_dashboard_task(job_id,task,state="READY",result=result)
-                except Exception as exc:
-                    failures.append(f"{task_id}: {exc}"); failed=_task_result(task,{},lineage=[],as_of=None,quality=_quality("low",["Task failed"]),assumptions=[],warnings=[str(exc)],how="The calculation did not complete.",status="FAILED")
-                    results[task_id]=failed; database.save_dashboard_task(job_id,task,state="FAILED",result=failed,error=str(exc))
+                completed,_=wait(list(running),timeout=.25,return_when=FIRST_COMPLETED)
+                expired={future for future,(_,started_at) in running.items() if time.monotonic()-started_at>DASHBOARD_TASK_WAIT_SECONDS}
+                for future in completed|expired:
+                    task_id,_=running.pop(future); task=tasks[task_id]
+                    try:
+                        if future in expired and not future.done():
+                            future.cancel()
+                            raise TimeoutError(f"Task exceeded {DASHBOARD_TASK_WAIT_SECONDS} seconds")
+                        result=future.result()
+                        if result.get("status") == "READY" and result.get("warnings"):
+                            result = {**result, "status": "PARTIAL"}
+                        results[task_id]=result; database.save_dashboard_task(job_id,task,state="READY",result=result)
+                    except Exception as exc:
+                        unavailable = isinstance(exc, (TimeoutError, ConnectionError)) or any(
+                            token in type(exc).__name__.lower() for token in ("timeout", "connection")
+                        )
+                        status = "UNAVAILABLE" if unavailable else "FAILED"
+                        failures.append(f"{task_id}: {exc}"); failed=_task_result(task,{},lineage=[],as_of=None,quality=_quality("low",["Task unavailable" if unavailable else "Task failed"]),assumptions=[],warnings=[str(exc)],how="The calculation did not complete.",status=status)
+                        results[task_id]=failed; database.save_dashboard_task(job_id,task,state="FAILED",result=failed,error=str(exc))
                 visible=[results[w["task_id"]] for w in spec["widgets"] if w["task_id"] in results]
                 progress=min(78,25+int(53*len(results)/max(1,len(tasks)))); database.update_dashboard_job(job_id,user_id,state="CALCULATING",progress=progress,widget_results=visible,warnings=failures)
                 required=[task["id"] for task in tasks.values() if task["required_for_narrative"]]
                 if narrative_future is None and all(task_id in results for task_id in required):
                     evidence_gate=verify_required_evidence(job["prompt"],plan,tasks,results)
                     if evidence_gate["status"]=="passed":
-                        narrative_future=TASK_EXECUTOR.submit(_narrate,job["prompt"],[results[key] for key in required if results[key]["status"]!="FAILED"])
+                        narrative_future=TASK_EXECUTOR.submit(_narrate,job["prompt"],[results[key] for key in required if results[key]["status"] in {"READY","STALE","PARTIAL"}])
+        materialized_widgets,action_log,action_errors=materialize_planned_widgets(spec,results)
+        spec["widgets"]=materialized_widgets
+        spec["dashboard_actions"]=action_log
+        failures.extend(action_errors)
         visible=[results[w["task_id"]] for w in spec["widgets"] if w["task_id"] in results]
         database.update_dashboard_job(job_id,user_id,state="WIDGETS_READY",progress=82,widget_results=visible,warnings=failures)
         narrative=""; narrative_error=None
@@ -1232,7 +1581,14 @@ def run_dashboard_job(job_id: str, user_id: str) -> None:
         if answer_review["issues"]:
             failures.extend(f"Answer review: {issue}" for issue in answer_review["issues"])
         final_state="PARTIAL_SUCCESS" if failures or narrative_error else "COMPLETE"
-        from .operational_monitoring import record_metric
+        successful_widgets=sum(1 for row in visible if row.get("status") in {"READY","STALE","PARTIAL"})
+        failed_widgets=sum(1 for row in visible if row.get("status") in {"FAILED","UNAVAILABLE"})
+        record_metric("dashboard.parallel_execution.latency_ms",(time.monotonic()-execution_started)*1000,
+                      tags={"task_count":len(tasks),"max_parallel":DASHBOARD_MAX_PARALLEL_TASKS})
+        record_metric("dashboard.generation.latency_ms",(time.monotonic()-generation_started)*1000,
+                      tags={"intent":plan.intent,"widget_count":len(spec["widgets"]),"successful_widgets":successful_widgets,"failed_widgets":failed_widgets,"planner_ms":round(planner_elapsed*1000)})
+        for row in visible:
+            record_metric("dashboard.widget.result",tags={"widget_id":row.get("widget_id"),"status":row.get("status","UNKNOWN")})
         record_metric("dashboard.partial_success" if final_state == "PARTIAL_SUCCESS" else "dashboard.complete", tags={"intent": plan.intent, "compiler_version": spec.get("compiler_version")}, persist=True)
         database.update_dashboard_job(job_id,user_id,state=final_state,progress=100,specification=spec,widget_results=visible,narrative=narrative,warnings=failures,error=narrative_error)
     except Exception as exc:
@@ -1244,10 +1600,17 @@ def run_dashboard_job(job_id: str, user_id: str) -> None:
 
 def create_draft(user_id: str, request: DraftRequest, source_view_id: str | None = None) -> dict[str, Any]:
     # Validate prompt synchronously so adversarial actions fail before a worker is scheduled.
-    deterministic_plan(request.prompt,request.portfolio_id)
+    provisional_plan = deterministic_plan(request.prompt,request.portfolio_id)
     if request.conversation_id:
         database.get_conversation(user_id, request.conversation_id)
     job=database.create_dashboard_job(user_id,request.prompt,request.portfolio_id,source_view_id,request.conversation_id)
+    # Give the canvas a deterministic layout immediately.  The worker may still
+    # refine the plan, but users see independent widget skeletons instead of one
+    # global planning spinner.
+    provisional_spec = compile_spec(provisional_plan)
+    job = database.update_dashboard_job(
+        job["id"], user_id, state="PLANNING", progress=4, specification=provisional_spec,
+    )
     submit_dashboard_job(job,user_id)
     return job
 
@@ -1297,23 +1660,160 @@ def revise_draft(user_id: str, job_id: str, request: RevisionRequest) -> dict[st
 
 def mutate_draft_layout(user_id: str, job_id: str, widget_id: str,
                         request: LayoutMutationRequest) -> dict[str, Any]:
-    job=database.get_dashboard_job(job_id,user_id)
-    if job["state"] not in TERMINAL_STATES or not job.get("specification"):
-        raise ValueError("Dashboard layout can be edited after widget calculation finishes")
-    spec=dict(job["specification"]); widgets=[dict(item) for item in spec.get("widgets",[])]
-    index=next((position for position,item in enumerate(widgets) if str(item.get("id"))==widget_id),-1)
-    if index<0: raise KeyError(widget_id)
-    if request.operation=="remove":
-        widgets.pop(index)
-    elif request.operation=="resize":
-        if request.width not in {4,6,8,12} or request.height is None or not 2<=request.height<=6:
-            raise ValueError("Widget size must use width 4, 6, 8, or 12 and height 2 through 6")
-        widgets[index]={**widgets[index],"grid":{**(widgets[index].get("grid") or {}),"w":request.width,"h":request.height}}
+    job = database.get_dashboard_job(job_id, user_id)
+    widgets = (job.get("specification") or {}).get("widgets") or []
+    index = next((position for position, item in enumerate(widgets) if str(item.get("id")) == widget_id), -1)
+    if index < 0:
+        raise KeyError(widget_id)
+    if request.operation == "remove":
+        action = {"type": "DELETE_WIDGET", "widget_id": widget_id}
+    elif request.operation == "resize":
+        action = {"type": "RESIZE_WIDGET", "widget_id": widget_id, "width": request.width, "height": request.height}
     else:
-        step=-1 if (request.direction or 0)<0 else 1; target=index+step
-        if target<0 or target>=len(widgets): raise ValueError("Widget cannot move farther in that direction")
-        widgets[index],widgets[target]=widgets[target],widgets[index]
-    spec={**spec,"widgets":widgets,"layout_version":"dashboard-layout-v2"}
-    visible_ids={item.get("task_id") for item in widgets}
-    results=[item for item in job.get("widget_results",[]) if item.get("widget_id") in visible_ids]
-    return database.update_dashboard_job(job_id,user_id,specification=spec,widget_results=results)
+        action = {"type": "MOVE_WIDGET", "widget_id": widget_id,
+                  "to_index": index + (-1 if (request.direction or 0) < 0 else 1)}
+    result = run_dashboard_action(user_id, "draft", job_id, action)
+    if result.status.value != "SUCCESS":
+        raise ValueError(result.error or "Dashboard action failed")
+    return result.dashboard or job
+
+
+def run_dashboard_action(user_id: str, resource_type: Literal["draft", "view"], resource_id: str,
+                         action: dict[str, Any]) -> DashboardActionResult:
+    return execute_dashboard_action(
+        user_id, resource_type, resource_id, action,
+        allowed_widget_types=set(DATA_WIDGET_CATALOG) | set(WIDGET_META),
+    )
+
+
+def widget_meta(widget_type: str) -> tuple[str, str, int, int]:
+    if widget_type not in WIDGET_META or widget_type not in DATA_WIDGET_CATALOG:
+        raise ValueError(f"Unsupported dashboard widget: {widget_type}")
+    return WIDGET_META[widget_type]
+
+
+def new_conversational_task_id(widget_type: str) -> str:
+    return f"chat-{widget_type}-{uuid.uuid4().hex[:12]}"
+
+
+def next_widget_grid(widgets: list[dict[str, Any]], width: int, height: int) -> dict[str, int]:
+    if not widgets:
+        return {"x": 0, "y": 0, "w": width, "h": height}
+    bottom = max(int((widget.get("grid") or {}).get("y", 0)) + int((widget.get("grid") or {}).get("h", 2)) for widget in widgets)
+    return {"x": 0, "y": bottom, "w": width, "h": height}
+
+
+def dashboard_resource_state(user_id: str, resource_type: Literal["draft", "view"], resource_id: str) -> dict[str, Any]:
+    if resource_type == "draft":
+        resource = database.get_dashboard_job(resource_id, user_id)
+        specification = resource.get("specification") or {}
+        return {"name": specification.get("title"), "widgets": specification.get("widgets") or [], "resource": resource}
+    resource = database.get_dashboard_view(resource_id, user_id)
+    return {"name": resource.get("name"), "widgets": resource.get("layout") or [], "resource": resource}
+
+
+def create_empty_dashboard_draft(user_id: str, portfolio_id: str | None, conversation_id: str | None) -> dict[str, Any]:
+    prompt = "Conversational research canvas"
+    plan = deterministic_plan("Show my current portfolio allocation", portfolio_id)
+    job = database.create_dashboard_job(user_id, prompt, portfolio_id, conversation_id=conversation_id)
+    specification = {
+        "version": "dashboard-spec-v2", "spec_version": "dashboard-spec-v2",
+        "layout_version": "dashboard-layout-v2", "compiler_version": COMPILER_VERSION,
+        "title": "EagleEyes Research Canvas", "description": "Widgets added through Ask EagleEyes.",
+        "filters": {}, "tasks": [], "widgets": [], "agent_pipeline": [],
+    }
+    return database.update_dashboard_job(
+        job["id"], user_id, state="COMPLETE", progress=100,
+        plan=plan.model_dump(mode="json"), specification=specification,
+        widget_results=[], narrative="", warnings=[],
+    )
+
+
+def _binding_query(binding: DashboardDataBinding) -> dict[str, Any]:
+    years = binding.period.lower()
+    filters = {
+        "benchmark": binding.benchmark,
+        "widget_filters": [item.model_dump(mode="json") for item in binding.filters],
+    }
+    return {"tickers": [*binding.tickers, *([binding.benchmark] if binding.benchmark else [])], "time_range": years, "filters": filters}
+
+
+def _apply_binding_filters(result: dict[str, Any], binding: DashboardDataBinding) -> dict[str, Any]:
+    if not binding.filters:
+        return result
+    data = result.get("data")
+    if not isinstance(data, list):
+        raise ValueError("This widget's data does not support row filters")
+    filtered = data
+    for condition in binding.filters:
+        wanted = condition.value if isinstance(condition.value, list) else [condition.value]
+        wanted_text = [str(value).lower() for value in wanted]
+        def value_for(row: dict[str, Any]) -> str:
+            if condition.field == "classification":
+                return " ".join(str(row.get(key) or "") for key in ("sector", "industry", "ticker", "company")).lower()
+            return str(row.get(condition.field) or "").lower()
+        if condition.operator == "contains":
+            filtered = [row for row in filtered if any(value in value_for(row) for value in wanted_text)]
+        elif condition.operator == "eq":
+            filtered = [row for row in filtered if value_for(row) in wanted_text]
+        elif condition.operator == "neq":
+            filtered = [row for row in filtered if value_for(row) not in wanted_text]
+        else:
+            filtered = [row for row in filtered if value_for(row) in wanted_text]
+    if not filtered:
+        raise ValueError("No rows matched the requested widget filter")
+    return {**result, "data": filtered, "warnings": [*result.get("warnings", []), "A conversational display filter is active."],
+            "calculation": {**result.get("calculation", {}), "parameters": _binding_query(binding)}}
+
+
+def prepare_conversational_widget(
+    user_id: str,
+    portfolio_id: str | None,
+    binding: DashboardDataBinding,
+    task_id: str,
+) -> dict[str, Any]:
+    metric = binding.metric
+    if metric not in EXTRA_TASKS:
+        raise ValueError(f"No approved data binding is available for {metric}")
+    portfolio = _portfolio(user_id, portfolio_id)
+    if not portfolio.get("id") and metric in {"portfolio_performance", "allocation", "sector_exposure", "correlation_matrix"}:
+        raise ValueError("Select and save a portfolio first")
+    profile = database.load_profile(user_id) or {}
+    policy = database.load_investment_policy(user_id)
+    goals = database.list_goals(user_id)
+    context = {"user_id": user_id, "portfolio": portfolio, "profile": profile, "policy": policy, "goals": goals,
+               "guidance": guidance_disclosure(portfolio=portfolio, profile=profile, policy=policy, goals=goals)}
+    query = _binding_query(binding)
+    template = EXTRA_TASKS[metric]
+    id_map = {template_id: (task_id if task_type == metric else f"{task_id}-{template_id}") for template_id, task_type, _, _ in template}
+    results: dict[str, dict[str, Any]] = {}
+    for template_id, task_type, dependencies, required in template:
+        task = {"id": id_map[template_id], "task_type": task_type,
+                "depends_on": [id_map[dependency] for dependency in dependencies],
+                "required_for_narrative": required, "query": query, "calculation_version": CALCULATION_VERSION}
+        dependency_results = {dependency: results[dependency] for dependency in task["depends_on"]}
+        # execute_task expects the template dependency names, while cache keys and
+        # persisted widget IDs use stable, conversation-safe identifiers.
+        normalized_dependencies = {original: dependency_results[id_map[original]] for original in dependencies}
+        result = _run_task_bounded(context, task, normalized_dependencies)
+        if result.get("status") == "FAILED" or result.get("data") in (None, {}, []):
+            raise ValueError((result.get("warnings") or [f"{task_type} data is unavailable"])[0])
+        results[task["id"]] = result
+    prepared = results[task_id]
+    prepared["widget_id"] = task_id
+    prepared["calculation"] = {**prepared.get("calculation", {}), "parameters": query, "binding": binding.model_dump(mode="json")}
+    return _apply_binding_filters(prepared, binding)
+
+
+def persist_prepared_widget_result(
+    user_id: str,
+    resource_type: Literal["draft", "view"],
+    resource_id: str,
+    result: dict[str, Any],
+) -> None:
+    if resource_type == "draft":
+        job = database.get_dashboard_job(resource_id, user_id)
+        rows = [row for row in job.get("widget_results") or [] if str(row.get("widget_id")) != str(result.get("widget_id"))]
+        database.update_dashboard_job(resource_id, user_id, widget_results=[*rows, result])
+        return
+    database.persist_dashboard_widget_results(resource_id, user_id, result)

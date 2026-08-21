@@ -5,21 +5,21 @@ import { readFile } from "node:fs/promises";
 const root = new URL("../", import.meta.url);
 const read = (path) => readFile(new URL(path, root), "utf8");
 
-test("Today is attention-first and keeps price movement contextual", async () => {
+test("Today is snapshot-first with a unified Action Center", async () => {
   const [page, attention, dashboard] = await Promise.all([
     read("app/components/today/TodayPage.tsx"),
     read("backend/attention.py"),
     read("app/Dashboard.tsx"),
   ]);
-  assert.match(page, /Your portfolio is up to date/);
-  assert.match(page, /Preparing your daily brief/);
-  assert.match(page, /restore it automatically on future sign-ins/);
+  assert.match(page, /Restoring the latest portfolio snapshot/);
+  assert.match(page, /Preparing the first portfolio snapshot/);
+  assert.match(page, /Future visits load the saved result immediately/);
   assert.match(dashboard, /Your saved portfolio is loaded/);
   assert.match(dashboard, /eagleeyes-today-refresh/);
   assert.match(dashboard, /Fresh price and macro checks are continuing in the background/);
-  assert.match(page, /Nothing material changed/);
-  assert.match(page, /Price is context/);
-  assert.match(page, /Mark read/);
+  assert.match(page, /What changed/);
+  assert.match(page, /Action Center/);
+  assert.match(page, /Investigate/);
   assert.match(page, /Snooze/);
   assert.match(attention, /THESIS_BREAKER_TRIGGERED/);
   assert.match(attention, /breaker_override/);

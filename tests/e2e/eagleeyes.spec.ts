@@ -7,18 +7,85 @@ async function signIn(page: Page) {
   await page.getByTestId("auth-password").fill("browser-test-password");
   await page.getByTestId("auth-submit").click();
   await expect(page.getByRole("heading", { name: "Today", exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: /Your portfolio is up to date|Welcome to your research workspace|Preparing your daily brief/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Research", exact: true })).toBeVisible();
 }
 
 async function buildBoard(page: Page, prompt = "Show my portfolio return and risks") {
   await page.goto("/ask");
-  await page.getByText("Build or open a calculated research board", { exact: true }).click();
   const composer = page.getByPlaceholder("Describe the dashboard you want…");
   await composer.fill(prompt);
   await page.getByRole("button", { name: "Build view →" }).click();
   await expect(page.getByRole("heading", { name: "Portfolio return and risks" })).toBeVisible();
   await expect(page.getByText("Required evidence verified")).toBeVisible();
 }
+
+test("Ask uses a resizable desktop canvas and state-preserving mobile tabs", async ({ page }) => {
+  await installApiMock(page);
+  await signIn(page);
+  await page.goto("/ask");
+
+  await expect(page.locator(".ask-chat-pane")).toBeVisible();
+  await expect(page.locator(".ask-canvas-pane")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Your analysis will appear here." })).toBeVisible();
+  await expect(page.getByText("Expert tool")).toHaveCount(0);
+  const divider = page.getByRole("separator", { name: "Resize chat and dashboard" });
+  await expect(divider).toHaveAttribute("aria-valuenow", "35");
+  await divider.press("ArrowRight");
+  await expect(divider).toHaveAttribute("aria-valuenow", "37");
+  const themeButton = page.getByRole("button", { name: /Light mode|Dark mode/ });
+  const themeBefore = await themeButton.textContent();
+  await themeButton.click();
+  await expect(themeButton).not.toHaveText(themeBefore || "");
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const askInput = page.getByPlaceholder(/Ask about research/);
+  await askInput.fill("Compare my largest holdings");
+  await page.getByRole("tab", { name: "Dashboard" }).click();
+  await expect(page.locator(".ask-canvas-pane")).toBeVisible();
+  await expect(page.locator(".ask-chat-pane")).toBeHidden();
+  await page.getByRole("tab", { name: "Chat" }).click();
+  await expect(askInput).toHaveValue("Compare my largest holdings");
+});
+
+test("conversational dashboard edits persist through undo, save, and reload", async ({ page }) => {
+  await installApiMock(page);
+  await signIn(page);
+  await page.goto("/ask");
+  const composer=page.getByPlaceholder(/Ask about research/);
+  const send=async(question:string)=>{
+    await composer.fill(question);
+    await page.getByRole("button",{name:"Ask EagleEyes →"}).click();
+  };
+
+  await send("Build me a portfolio overview dashboard.");
+  await expect(page.getByRole("heading",{name:"Portfolio overview"})).toBeVisible();
+  await expect(page.getByRole("heading",{name:"Portfolio news"})).toBeVisible();
+
+  await send("Add performance against SPY.");
+  await expect(page.getByRole("heading",{name:"Performance vs SPY"})).toBeVisible();
+  await send("Make that five years.");
+  await expect(page.getByText("Updated Performance vs SPY.").last()).toBeVisible();
+  await send("Move sector exposure below performance.");
+  await expect(page.getByText("Moved Sector exposure.").last()).toBeVisible();
+  await send("Remove news.");
+  await expect(page.getByRole("heading",{name:"Portfolio news"})).toHaveCount(0);
+  await send("Undo that.");
+  await expect(page.getByRole("heading",{name:"Portfolio news"})).toBeVisible();
+  await send("Save this as Portfolio Overview.");
+  await expect(page.getByText("Saved as Portfolio Overview.").last()).toBeVisible();
+  await expect(page.getByText("Saved dashboard")).toBeVisible();
+
+  await page.getByRole("button",{name:"＋ New",exact:true}).click();
+  await expect(page.getByRole("heading",{name:"Your analysis will appear here."})).toBeVisible();
+  await page.getByRole("button",{name:"Portfolio workspace"}).click();
+  await expect(page.getByText("Saved dashboard")).toBeVisible();
+  await expect(page.getByRole("heading",{name:"Portfolio Overview"})).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByText("Saved dashboard")).toBeVisible();
+  await expect(page.getByRole("heading",{name:"Portfolio Overview"})).toBeVisible();
+  await expect(page.getByText("Saved as Portfolio Overview.").last()).toBeVisible();
+});
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => sessionStorage.clear());
@@ -36,7 +103,7 @@ test("login survives refresh and sign-out clears the local test session", async 
   });
   await page.reload();
   await expect(page.getByRole("heading", { name: "Today", exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: /Your portfolio is up to date|Welcome to your research workspace|Preparing your daily brief/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Research", exact: true })).toBeVisible();
   await expect.poll(() => state.authGrants).toContain("refresh_token");
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByTestId("auth-form")).toBeVisible();
@@ -52,8 +119,8 @@ test("portfolio import flows to Research and analysis", async ({ page }) => {
   await expect(page.locator(".save-state")).toContainText("All changes saved");
   await page.goto("/research?view=stocks");
   await page.getByLabel("Stock, ETF, or company").fill("AAPL");
-  await page.getByRole("button", { name: "Search research" }).click();
-  await expect(page.getByText("Apple Inc.")).toBeVisible();
+  await page.getByRole("button", { name: "Open research →" }).click();
+  await expect(page.getByText("Apple Inc.", { exact: true })).toBeVisible();
   await page.goto("/portfolio?view=analysis");
   await page.getByRole("button", { name: "Run portfolio analysis →" }).click();
   await expect(page.getByText("Three alternatives are ready. Review the tradeoffs—not just the headline return.")).toBeVisible();
@@ -83,7 +150,7 @@ test("legacy routes canonicalize without losing the requested subview", async ({
     ["/overview", "/today"], ["/scenarios", "/research?view=scenarios"],
     ["/research", "/research"], ["/optimize", "/portfolio?view=analysis"],
     ["/ai-workspace", "/ask"], ["/research-terminal", "/advanced?view=terminal"],
-    ["/decision-lab", "/decisions"], ["/portfolio?view=lab", "/decisions"],
+    ["/decision-lab", "/research"], ["/portfolio?view=lab", "/research"],
   ]) {
     await page.goto(legacy);
     await expect(page).toHaveURL(new RegExp(canonical.replace("?", "\\?")));
@@ -145,7 +212,8 @@ test("AI board supports progressive build, revision, add, resize, remove, save, 
   page.once("dialog", dialog => dialog.accept());
   await page.getByRole("button", { name: "Remove Optional risk summary" }).click();
   await expect(page.getByRole("heading", { name: "Optional risk summary" })).toHaveCount(0);
-  await page.getByRole("button", { name: "＋ Add data" }).click();
+  await page.getByLabel("Dashboard actions").click();
+  await page.getByRole("button", { name: "Add verified data" }).click();
   await page.getByRole("button", { name: /^Macro Macro trends Stored macro factors/ }).click();
   await expect(page.getByRole("heading", { name: "Macro trends" })).toBeVisible();
   await page.getByPlaceholder("Revise this view…").fill("Focus the explanation on drawdown risk");
@@ -155,8 +223,8 @@ test("AI board supports progressive build, revision, add, resize, remove, save, 
   await expect(page.getByText("Dashboard view saved.")).toBeVisible();
   await page.getByTitle("Open saved dashboard").click();
   await expect(page.getByText("Saved dashboard")).toBeVisible();
-  await page.locator('summary[aria-label="More actions for Revised portfolio board"]').click();
-  await page.getByRole("button", { name: "Duplicate exactly" }).click();
+  await page.getByLabel("Dashboard actions").click();
+  await page.getByRole("button", { name: "Duplicate", exact: true }).click();
   await expect(page.getByText("Dashboard duplicated with the same layout and compatible results.")).toBeVisible();
   await expect(page.getByText("Revised portfolio board copy")).toBeVisible();
 });
@@ -170,16 +238,15 @@ test("partial widget failure preserves successful evidence and narration", async
   await expect(page.getByRole("strong").filter({ hasText: "10.0%" })).toBeVisible();
 });
 
-test("stale fallback and no-portfolio mode remain useful", async ({ page }) => {
+test("no-portfolio mode still provides cached company research", async ({ page }) => {
   await installApiMock(page, { portfolio: false, stale: true });
   await signIn(page);
-  await expect(page.getByText("Start your workspace")).toBeVisible();
-  await expect(page.getByText("Using last validated provider snapshot")).toBeVisible();
+  await expect(page.getByText("Add or select a portfolio")).toBeVisible();
   await page.goto("/research?view=stocks");
   await page.getByLabel("Stock, ETF, or company").fill("AAPL");
-  await page.getByRole("button", { name: "Search research" }).click();
-  await expect(page.getByText("Browser fixture universe")).toBeVisible();
-  await expect(page.getByText("Apple Inc.")).toBeVisible();
+  await page.getByRole("button", { name: "Open research →" }).click();
+  await expect(page.getByRole("heading", { name: "Bear, base, and bull cases" })).toBeVisible();
+  await expect(page.getByText("Apple Inc.", { exact: true })).toBeVisible();
 });
 
 test("ETF Builder produces disclosed ranges, costs, and a benchmark", async ({ page }) => {
@@ -211,39 +278,22 @@ test("Stock Basket Builder discloses its universe, risk contribution, and benchm
   await expect(page.getByText("Paired paths browser-shared-paths")).toBeVisible();
 });
 
-test("Decision Lab compares six choices on one paired path set", async ({ page }) => {
+test("retired Decisions URLs preserve ticker context in unified Research", async ({ page }) => {
   await installApiMock(page);
   await signIn(page);
-  await page.goto("/decisions");
-  await page.getByText("Scenario comparison lab", { exact: true }).click();
-  await page.getByRole("button", { name: "Run Decision Lab" }).click();
-  await expect(page.getByText("Paired paths browser-shared-paths")).toBeVisible();
-  await expect(page.getByText("Today’s dollars", { exact: false }).first()).toBeVisible();
-  await expect(page.locator(".decision-frontier-table").locator("> div")).toHaveCount(7);
-  await expect(page.getByText("decision-lab-block-bootstrap-v1.0.0")).toBeVisible();
+  await page.goto("/decisions?ticker=AAPL");
+  await expect(page).toHaveURL(/\/research\?ticker=AAPL/);
+  await expect(page.getByRole("heading", { name: /AAPL Apple Inc\./ })).toBeVisible();
 });
 
-test("EagleEyes drafts a thesis but saves beliefs only after explicit review", async ({ page }) => {
-  const state = await installApiMock(page);
+test("unified Research exposes watchlist and Ask without a thesis editor", async ({ page }) => {
+  await installApiMock(page);
   await signIn(page);
-  await page.goto("/decisions");
-  await page.getByLabel("Search holdings or ticker").fill("AAPL");
-  await page.getByRole("button", { name: "Open AAPL" }).click();
-  await expect(page.getByRole("heading", { name: /AAPL/ }).first()).toBeVisible();
-  await page.getByRole("button", { name: "I own it" }).click();
-  await page.getByText("Create and review a thesis", { exact: true }).click();
-  await page.getByLabel(/3\. Why is it on your mind/).first().fill("I want to track services durability.");
-  await page.getByRole("button", { name: "Build an evidence-assisted thesis →" }).first().click();
-  await expect(page.getByRole("heading", { name: "Review what must remain true." })).toBeVisible();
-  await expect(page.getByText("Suggested by EagleEyes", { exact: true }).first()).toBeVisible();
-  const save = page.getByRole("button", { name: "Confirm and save thesis" });
-  await expect(save).toBeDisabled();
-  await page.getByLabel(/I reviewed this thesis/).first().check();
-  await save.click();
-  await expect(page.getByText("Thesis saved as version 1.")).toBeVisible();
-  const request = state.requests.find(item => item.path === "/theses" && item.method === "POST");
-  expect(request).toBeTruthy();
-  expect(request?.body).toMatchObject({ source_context: { relationship: "OWN", user_reason: "I want to track services durability.", confirmation_state: "USER_CONFIRMED" } });
+  await page.goto("/research?ticker=AAPL");
+  await expect(page.getByRole("heading", { name: /AAPL Apple Inc\./ })).toBeVisible();
+  await expect(page.getByRole("button", { name: "✓ On watchlist" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Ask EagleEyes →" })).toHaveAttribute("href", "/ask?ticker=AAPL");
+  await expect(page.getByRole("button", { name: "Confirm and save thesis" })).toHaveCount(0);
 });
 
 test("default presentation stays detailed and Expert mode lives under More", async ({ page }) => {

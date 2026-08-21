@@ -30,6 +30,25 @@ const research = [
   { ticker: "SPY", company: "SPDR S&P 500 ETF", sector: "Broad Market", industry: "ETF", final_score: 69, growth_rating: 61, valuation_score: 65, fundamental_score: 70, industry_score: 73, technical_score: 69, news_score: 50, confidence: 92, data_quality: "high", risk_flags: [], price: 650, price_change_1y: .11, price_as_of: now, fundamentals_as_of: now, revenue_growth: null, net_margin: null, news_count: 0, data_source: "fixture" },
 ];
 
+function researchOverview(ticker:string,holdings:Array<{ticker:string;weight?:number|null;market_value?:number|null}>,watchlist:string[]){
+  const normalized=ticker.toUpperCase();
+  const security=research.find(item=>item.ticker===normalized)||research[0];
+  const makeCase=(key:"bear"|"base"|"bull",outcome:string):Record<string,unknown>=>({
+    key,label:key[0].toUpperCase()+key.slice(1),outcome,
+    drivers:[`${security.company} stored fundamentals`],
+    invalidation_conditions:["Material deterioration in validated evidence"],
+    full_text:`${outcome}\n\nThis fixture case is grounded in cached research evidence.`,
+    confidence:"high",evidence_as_of:now,source:"fixture",saved_as_user_belief:false,
+  });
+  return {
+    ticker:normalized,security:{...security,statistics:{last_price:security.price,return_1y:security.price_change_1y,return_3m:.04,annualized_volatility:.2,max_drawdown:-.16},fundamental_trend:{revenue_growth:security.revenue_growth,net_margin:security.net_margin},valuation_range:{label:"Reasonable"}},
+    membership:{holding:holdings.some(item=>item.ticker===normalized),watchlist:watchlist.includes(normalized),holding_detail:holdings.find(item=>item.ticker===normalized)||null},
+    earnings:{status:"UNAVAILABLE",warnings:["No fixture earnings period"]},forecasts:{markets:[]},changes:{changes:[]},
+    cases:{bear:makeCase("bear","Operating evidence weakens"),base:makeCase("base","The current operating path persists"),bull:makeCase("bull","Growth and margins improve")},
+    freshness:{price_as_of:now,fundamentals_as_of:now},confidence:"high",missing_data:[],partial:false,cache:{status:"hit"},
+  };
+}
+
 const learnLesson = {
   id: "why-invest", module_id: "start-safely", title: "Why save and invest?", estimated_minutes: 8,
   concept_ids: ["saving", "investing", "compounding", "inflation"], source_refs: ["investor-gov"],
@@ -96,6 +115,8 @@ function createState(options: { portfolio?: boolean; stale?: boolean; partial?: 
     options, holdings, terminalWidgets: structuredClone(defaultWidgets), terminalLayouts: [] as TerminalLayoutFixture[],
     views: [] as Array<ReturnType<typeof viewFromJob>>, job: makeJob("job-1", options.partial), requests: [] as Array<{ method: string; path: string; body: unknown }>,
     authGrants: [] as string[], learningProgress: [] as Array<Record<string, unknown>>, theses: [] as Array<Record<string, unknown>>,
+    chatMessages: [] as Array<Record<string, unknown>>, chatArtifacts: [] as Array<Record<string, unknown>>,
+    dashboardHistory: [] as Array<ReturnType<typeof makeJob>>,
   };
 }
 
@@ -154,6 +175,76 @@ export async function installApiMock(page: Page, options: { portfolio?: boolean;
 
     if (path === "/portfolios" && method === "GET") return json(route, state.holdings.length ? [{ id: "portfolio-1", name: "Browser portfolio", holdings: state.holdings, updated_at: now }] : []);
     if (/^\/portfolios\/[^/]+\/activate$/.test(path) && method === "POST") return json(route, { id: path.split("/")[2], name: "Browser portfolio", holdings: state.holdings, updated_at: now });
+    if (/^\/portfolios\/[^/]+\/overview(?:\/recalculate)?$/.test(path)) return json(route, { detail: "No cached fixture snapshot" }, 404);
+    if (path === "/chat/conversations" && method === "GET") return json(route, state.chatMessages.length ? [{ id: "conversation-1", portfolio_id: "portfolio-1", title: "Portfolio workspace", workspace: "research", summary: "", summary_message_count: 0, message_count: state.chatMessages.length, artifact_count: state.chatArtifacts.length, created_at: now, updated_at: now }] : []);
+    if (path === "/chat/conversations/conversation-1" && method === "GET") return json(route, { id: "conversation-1", portfolio_id: "portfolio-1", title: "Portfolio workspace", workspace: "research", summary: "", summary_message_count: 0, created_at: now, updated_at: now, messages: state.chatMessages, artifacts: state.chatArtifacts });
+    if (path === "/chat/messages" && method === "POST") {
+      const question=String(body.question||"");
+      const lower=question.toLowerCase();
+      const userMessage={id:`chat-${state.chatMessages.length+1}`,role:"user",content:question,structured_content:{},model:null,created_at:now};
+      state.chatMessages.push(userMessage);
+      let resourceType:"draft"|"view"="draft";
+      let resourceId=state.job.id;
+      let response="Updated dashboard.";
+      let actionType="UPDATE_WIDGET";
+      if(lower.includes("build me a portfolio overview")){
+        state.job=makeJob("conversation-draft",false);
+        state.job.specification.title="Portfolio overview";
+        state.job.specification.widgets=[
+          state.job.specification.widgets[0],
+          {id:"sectors",task_id:"sectors",widget_type:"sector_exposure",title:"Sector exposure",visualization:"bar_chart",grid:{x:0,y:2,w:6,h:2}},
+          {id:"news",task_id:"news",widget_type:"news_summary",title:"Portfolio news",visualization:"list",grid:{x:6,y:2,w:6,h:2}},
+        ];
+        state.job.widget_results=[widgetResult("performance"),widgetResult("sectors"),widgetResult("news")];
+        state.dashboardHistory=[];
+        response="I’m building a focused dashboard from approved EagleEyes data.";
+        actionType="CREATE_DASHBOARD";
+      }else if(lower.includes("add performance against spy")){
+        state.dashboardHistory.push(structuredClone(state.job));
+        const performance=state.job.specification.widgets.find(item=>item.id==="performance")!;
+        performance.title="Performance vs SPY";
+        (performance as Record<string,unknown>).binding={metric:"portfolio_performance",period:"1Y",benchmark:"SPY",tickers:[],filters:[]};
+        response="Updated Performance vs SPY.";
+      }else if(lower.includes("make that five years")){
+        state.dashboardHistory.push(structuredClone(state.job));
+        const performance=state.job.specification.widgets.find(item=>item.id==="performance")! as Record<string,unknown>;
+        performance.binding={...(performance.binding as Record<string,unknown>),period:"5Y"};
+        response="Updated Performance vs SPY.";
+      }else if(lower.includes("move sector exposure below performance")){
+        state.dashboardHistory.push(structuredClone(state.job));
+        const widgets=state.job.specification.widgets;
+        const sectorIndex=widgets.findIndex(item=>item.id==="sectors");
+        const [sector]=widgets.splice(sectorIndex,1);
+        const performanceIndex=widgets.findIndex(item=>item.id==="performance");
+        widgets.splice(performanceIndex+1,0,sector);
+        response="Moved Sector exposure.";
+        actionType="MOVE_WIDGET";
+      }else if(lower.includes("remove news")){
+        state.dashboardHistory.push(structuredClone(state.job));
+        state.job.specification.widgets=state.job.specification.widgets.filter(item=>item.id!=="news");
+        state.job.widget_results=state.job.widget_results.filter(item=>item.widget_id!=="news");
+        response="Removed Portfolio news.";
+        actionType="DELETE_WIDGET";
+      }else if(lower.includes("undo")){
+        state.job=state.dashboardHistory.pop()||state.job;
+        response="Undid the last matching dashboard change.";
+        actionType="UNDO_DASHBOARD";
+      }else if(lower.includes("save this as")){
+        const name=question.match(/save this as (.+?)[.!]?$/i)?.[1]?.replace(/[.!]$/,"")||"Portfolio Overview";
+        const view=viewFromJob(`view-${state.views.length+1}`,name,state.job);
+        state.views.unshift(view);
+        state.chatArtifacts=[{id:"artifact-1",artifact_type:"dashboard_view",artifact_id:view.id,label:view.name,metadata:{job_id:state.job.id},created_at:now}];
+        resourceType="view";resourceId=view.id;response=`Saved as ${name}.`;actionType="SAVE_DASHBOARD";
+      }
+      const view=resourceType==="view"?state.views.find(item=>item.id===resourceId):undefined;
+      const dashboard=view||state.job;
+      const activeWidgetIds=view
+        ? view.layout.map((item:{id:string})=>item.id)
+        : state.job.specification.widgets.map((item:{id:string})=>item.id);
+      const assistantMessage={id:`chat-${state.chatMessages.length+1}`,role:"assistant",content:response,model:"deterministic-dashboard-actions-v1",created_at:now,structured_content:{dashboard_operation:{intent:actionType,resource_type:resourceType,resource_id:resourceId,action_result:{version:"dashboard-action-v1",status:"SUCCESS",action:{type:actionType},dashboard}},analysis_context:{conversation_id:"conversation-1",dashboard_resource_type:resourceType,dashboard_resource_id:resourceId,active_dashboard_widget_ids:activeWidgetIds}}};
+      state.chatMessages.push(assistantMessage);
+      return json(route,{conversation_id:"conversation-1",message:assistantMessage});
+    }
     if (path === "/home/briefing") return json(route, homePayload());
     if (path === "/home/refresh" && method === "POST") return json(route, { ...homePayload(), refresh: { status: "queued", requested_at: now, warnings: [], message: "Saved evidence is ready; configured providers are refreshing in the background." } });
     if (path === "/decisions/workspace") return json(route, { active_theses: state.theses, recent_decisions: [], needs_thesis: [], review_dates: [], contexts: {} });
@@ -185,18 +276,23 @@ export async function installApiMock(page: Page, options: { portfolio?: boolean;
     if (path === "/dashboard/views" && method === "GET") return json(route, state.views);
     if (path === "/dashboard/catalog") return json(route, [{ widget_type: "macro_trends", label: "Macro trends", group: "Macro", description: "Stored macro factors", available: true, record_count: 5, datasets: ["FRED"] }]);
     if (path === "/dashboard/drafts" && method === "POST") { state.job = makeJob(`job-${state.requests.length}`, options.partial); state.job.prompt = body.prompt||"Research request"; return json(route, state.job, 202); }
+    if (/^\/dashboard\/drafts\/[^/]+$/.test(path) && method === "GET") return json(route, state.job);
     if (path.endsWith("/events")) return route.fulfill({ status: 200, contentType: "text/event-stream", body: `event: dashboard\ndata: ${JSON.stringify(state.job)}\n\n` });
     if (/\/dashboard\/drafts\/[^/]+\/revise$/.test(path)) { state.job = makeJob(`job-${state.requests.length}`, options.partial); state.job.prompt = body.prompt||"Revised request"; state.job.specification.title = "Revised portfolio board"; return json(route, state.job, 202); }
     if (/\/dashboard\/drafts\/[^/]+\/widgets$/.test(path)) { state.job = structuredClone(state.job); state.job.specification.widgets.push({ id: "macro", task_id: "macro", widget_type: "macro_trends", title: "Macro trends", visualization: "cards", grid: { x: 0, y: 2, w: 8, h: 2 } }); state.job.widget_results.push(widgetResult("macro")); return json(route, state.job, 202); }
+    if (/\/dashboard\/drafts\/[^/]+\/actions$/.test(path) && method === "POST") { mutateJobAction(state.job, body); return json(route, { version:"dashboard-action-v1", status:"SUCCESS", action:body, dashboard:state.job }); }
     if (/\/dashboard\/drafts\/[^/]+\/layout\/widgets\//.test(path) && method === "PATCH") { mutateJob(state.job, path.split("/").at(-1)!, body); return json(route, state.job); }
     if (/\/dashboard\/drafts\/[^/]+\/save$/.test(path)) { const view = viewFromJob(`view-${state.views.length + 1}`, body.name||"Saved board", state.job); state.views.unshift(view); return json(route, view, 201); }
     if (/\/dashboard\/views\/[^/]+\/duplicate$/.test(path)) { const source = state.views.find(item => item.id === path.split("/")[3]) || state.views[0]; const copy = structuredClone(source); copy.id = `view-${state.views.length + 1}`; copy.name = `${source.name} copy`; state.views.unshift(copy); return json(route, copy, 201); }
+    if (/\/dashboard\/views\/[^/]+\/actions$/.test(path) && method === "POST") { const view=state.views.find(item=>item.id===path.split("/")[3])!; const viewJob=makeJob(`job-${view.id}`); viewJob.specification=structuredClone(view.specification); viewJob.specification.widgets=structuredClone(view.layout); viewJob.widget_results=structuredClone(view.latest_run.widget_results); mutateJobAction(viewJob,body); view.layout=structuredClone(viewJob.specification.widgets); view.specification.widgets=structuredClone(viewJob.specification.widgets); if(body.type==="RENAME_DASHBOARD")view.name=String(body.name); return json(route,{version:"dashboard-action-v1",status:"SUCCESS",action:body,dashboard:view,revision:{id:"revision-action"}}); }
     if (/\/dashboard\/views\/[^/]+$/.test(path) && method === "GET") { const view = state.views.find(item => item.id === path.split("/").at(-1)); return view ? json(route, view) : json(route, { detail: "Not found" }, 404); }
     if (path === "/research/refresh" && method === "POST") return json(route, { research, searched: research.length, markets_found: 0, warnings: [] });
     if (path === "/research" || path.startsWith("/research?")) return json(route, research);
     if (/^\/evidence\/securities\/[^/]+\/changes$/.test(path)) return json(route, { baseline: { as_of: now, source: "fixture", fallback_reason: null }, current_as_of: now, changes: [], coverage: [] });
     if (/^\/forecasting\/securities\/[^/]+\/markets$/.test(path)) return json(route, { markets: [] });
+    if (/^\/research\/security\/[^/]+\/overview$/.test(path)) return json(route,researchOverview(path.split("/")[3],state.holdings,profile.watchlist));
     if (/^\/research\/[^/]+\/earnings$/.test(path)) return json(route, { status: "UNAVAILABLE", actual_vs_expectations: {}, changes: [], guidance_changes: [], estimate_revisions: [], warnings: ["No fixture earnings period"] });
+    if (/^\/watchlist\/[^/]+$/.test(path)&&(method==="PUT"||method==="DELETE")) return json(route,{tickers:profile.watchlist});
     if (path === "/research/search") return json(route, { query: url.searchParams.get("q") || "", filters: {}, universe: { definition: "Browser fixture universe", source: "fixture", total: research.length, holdings: state.holdings.length, watchlist: 2, explicitly_requested: 0, sector_or_broad_etfs: 1, tickers: research.map(row => row.ticker) }, results: research.map((row, index) => ({ ...row, relative_rank: index + 1, evidence_bucket: index ? "Constructive evidence" : "Leading evidence", bucket_explanation: "Deterministic fixture bucket", strengths: [{ label: "Fundamentals", evidence: row.fundamental_score }], weaknesses: [{ label: "Valuation", evidence: row.valuation_score }], valuation_range: { label: "Reasonable", basis: "Fixture valuation" }, fundamental_trend: { label: "Stable", revenue_growth: row.revenue_growth, net_margin: row.net_margin }, price_behavior: { label: "Positive", one_year_change: row.price_change_1y }, catalysts: [], thesis_risks: row.risk_flags, portfolio_fit: "Review concentration", what_would_change_the_view: "Material earnings deterioration", freshness: { status: "current", price_as_of: now, fundamentals_as_of: now, coverage: "high", confidence_reasons: ["fixture"] }, disclaimer: "Research only" })), method: { name: "fixture", version: "v1", ranking_use: "ordering" }, disclaimer: "Not a recommendation" });
     if (path === "/builders/etf/optimize" && method === "POST") return json(route, {
       id: "etf-builder-1", builder_type: "etf", model_version: "etf-allocation-builder-v1.0.0", objective: body.objective,
@@ -238,6 +334,14 @@ function mutateJob(job: ReturnType<typeof makeJob>, widgetId: string, body: Mock
   if (body.operation === "remove") { job.specification.widgets.splice(index, 1); job.widget_results = job.widget_results.filter(item => item.widget_id !== widgetId); }
   if (body.operation === "resize") job.specification.widgets[index].grid.w = body.width??8;
   if (body.operation === "move") { const target = index + ((body.direction??1) < 0 ? -1 : 1); [job.specification.widgets[index], job.specification.widgets[target]] = [job.specification.widgets[target], job.specification.widgets[index]]; }
+}
+
+function mutateJobAction(job:ReturnType<typeof makeJob>,body:MockRequestBody){
+  const widgetId=String(body.widget_id||"");
+  const index=job.specification.widgets.findIndex(item=>item.id===widgetId);
+  if(body.type==="DELETE_WIDGET"&&index>=0){const taskId=job.specification.widgets[index].task_id;job.specification.widgets.splice(index,1);job.widget_results=job.widget_results.filter(item=>item.widget_id!==taskId);}
+  if(body.type==="RESIZE_WIDGET"&&index>=0){job.specification.widgets[index].grid.w=Number(body.width);job.specification.widgets[index].grid.h=Number(body.height);}
+  if(body.type==="MOVE_WIDGET"&&index>=0){const [widget]=job.specification.widgets.splice(index,1);job.specification.widgets.splice(Number(body.to_index),0,widget);}
 }
 
 function viewFromJob(id: string, name: string, job: ReturnType<typeof makeJob>) {

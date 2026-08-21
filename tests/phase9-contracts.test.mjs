@@ -8,9 +8,15 @@ const shared = readFileSync("app/components/shared/workspace-implementations.tsx
 const research = readFileSync("app/components/research/ResearchDiscovery.tsx", "utf8");
 const backend = readFileSync("backend/main.py", "utf8");
 
-test("primary Ask is conversation-first while preserving the calculated board", () => {
+test("primary Ask is a split conversational workspace using the calculated board directly", () => {
   assert.match(ask, /ResearchChat/);
-  assert.match(ask, /Build or open a calculated research board/);
+  assert.match(ask, /ask-split-shell/);
+  assert.match(ask, /role="separator"/);
+  assert.match(ask, /Chat<\/button>/);
+  assert.match(ask, /Dashboard<\/button>/);
+  assert.match(ask, /<AIWorkspace \{\.\.\.dashboardProps\} variant="canvas"/);
+  assert.doesNotMatch(ask, /Expert tool/);
+  assert.match(shared, /Your analysis will appear here/);
   assert.match(dashboard, /messages=\{researchChatMessages\}/);
 });
 
@@ -30,12 +36,10 @@ test("internal execution stays hidden while grounded navigation remains visible"
   assert.match(backend, /analysis_context/);
 });
 
-test("company research leads with six decision questions and workflow handoffs", () => {
-  for (const question of [
-    "Is the business improving?", "Is the balance sheet dangerous?", "What does the market expect?",
-    "What am I paying?", "What changes the story?", "How does it fit the portfolio?",
-  ]) assert.ok(research.includes(question), question);
-  assert.match(research, /Ask about \{row\.ticker\}/);
-  assert.match(research, /Record WATCH decision/);
-  assert.match(research, /Test portfolio scenario/);
+test("company research leads with one evidence report and only the approved actions", () => {
+  for (const section of ["Price", "Fundamentals", "Valuation", "Momentum", "Risk", "Portfolio fit"]) assert.ok(research.includes(section), section);
+  assert.match(research, /Add to watchlist/);
+  assert.match(research, /Ask EagleEyes/);
+  assert.doesNotMatch(research, /Record WATCH decision/);
+  assert.doesNotMatch(research, /Test portfolio scenario/);
 });

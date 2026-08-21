@@ -14,9 +14,9 @@ test("market expectations keep market and user probabilities distinct", () => {
 });
 
 test("company research exposes mapped forward-looking context", () => {
-  assert.match(research, /Forward-looking context/);
-  assert.match(research, /forecasting\/securities/);
-  assert.match(research, /Verified market mappings only/);
+  assert.match(research, /Forward statistics/);
+  assert.match(research, /Prediction-market evidence is shown only when a verified company mapping exists/);
+  assert.match(backend, /forecasting\.build_intelligence\(user\.id, ticker=normalized/);
 });
 
 test("forecasting APIs remain authenticated and scenario overrides preserve sources", () => {

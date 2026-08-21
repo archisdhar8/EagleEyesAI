@@ -456,7 +456,7 @@ def workspace(user_id: str, holdings: list[dict[str, Any]], watchlist: list[str]
     }
 
 
-def evidence_draft(ticker: str, research: dict[str, Any] | None) -> dict[str, Any]:
+def evidence_draft(ticker: str, research: dict[str, Any] | None, *, allow_ai: bool = True) -> dict[str, Any]:
     row = research or {}
     company = row.get("company") or ticker
     risks = [item for item in (row.get("thesis_risks") or row.get("risk_flags") or []) if item]
@@ -525,7 +525,7 @@ def evidence_draft(ticker: str, research: dict[str, Any] | None) -> dict[str, An
             "source_context": {"draft_method": "verified_evidence_starter", "price_as_of": freshness.get("price_as_of"), "fundamentals_as_of": freshness.get("fundamentals_as_of"), "missing_fields": missing},
     }
     ai_warning = None
-    if research:
+    if research and allow_ai:
         try:
             from .chat import draft_thesis_prose
             prose, model = draft_thesis_prose(row, {key: draft[key] for key in ("summary", "base_case", "bull_case", "bear_case")})

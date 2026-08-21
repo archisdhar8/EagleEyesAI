@@ -18,17 +18,19 @@ test("every rendered button has an action", async () => {
   const source = await dashboardSurface();
   const buttons = [...source.matchAll(/<button\b[\s\S]*?<\/button>/g)].map(match => match[0]);
   assert.ok(buttons.length >= 15, "expected the dashboard interaction surface");
-  const inert = buttons.filter(button => !/\bonClick\s*=/.test(button) && !/\btype="submit"/.test(button));
+  const inert = buttons.filter(button => !/\bonClick\s*=/.test(button) && !/\btype="submit"/.test(button) && !/Open research|Ask EagleEyes/.test(button));
   assert.deepEqual(inert, []);
+  assert.match(source, /unified-research-search" onSubmit=/);
+  assert.match(source, /chat-composer" onSubmit=/);
 });
 
 test("stock research search starts ready instead of blocking on an empty universe scan", async () => {
   const research = await readFile(researchPath, "utf8");
-  assert.match(research, /useState\(view!=="stocks"\|\|Boolean\(deepLinkedTicker\)\)/);
-  assert.match(research, /if\(view==="stocks"&&!deepLinkedTicker\)\{setLoading\(false\);setError\(""\);/);
-  assert.doesNotMatch(research, /deepLinkedTicker\?`\/research\/search\?q=.*:`\/research\/search\?`/);
-  assert.match(research, /Create a thesis/);
-  assert.match(research, /security-stat-workbench/);
+  assert.match(research, /useState\(Boolean\(deepLinkedTicker\)\)/);
+  assert.match(research, /AbortController/);
+  assert.match(research, /Choose a holding or search a company/);
+  assert.match(research, /\/research\/security\/\$\{encodeURIComponent\(ticker\)\}\/overview/);
+  assert.match(research, /Provider refreshes happen separately/);
 });
 
 test("critical portfolio and analysis actions remain wired", async () => {
@@ -67,7 +69,7 @@ test("manual research terminal exposes a persistent actionable widget catalog", 
     assert.match(source, new RegExp(widget));
   }
   assert.match(source, /Research terminal/);
-  for (const workspace of ["Today", "Portfolio", "Research", "Decisions", "Ask EagleEyes", "Plan & profile", "Learn", "Advanced"]) {
+  for (const workspace of ["Today", "Portfolio", "Research", "Market Climate", "Ask EagleEyes", "Plan & profile", "Learn", "Advanced"]) {
     assert.match(routes, new RegExp(`"${workspace}"`));
   }
   assert.match(source, /terminal_widgets/);
@@ -81,7 +83,7 @@ test("market workspace keeps planning secondary and route compatibility explicit
   for (const legacy of ["/overview", "/scenarios", "/research", "/optimize", "/ai-workspace", "/research-terminal", "/decision-lab"]) {
     assert.match(routes, new RegExp(legacy.replaceAll("/", "\\/")));
   }
-  assert.match(today, /Your portfolio is up to date/);
+  assert.match(today, /Restoring the latest portfolio snapshot/);
   assert.match(source, /Hypothetical one-year return using current holdings and weights/);
   assert.match(source, /Customize the research around what the portfolio is for/);
   for (const path of ["Current / do nothing", "Contributions only", "Gradual transition", "Immediate transition"]) {
@@ -110,31 +112,31 @@ test("planning, guidance, and flexible portfolio import are visible and actionab
 test("default research presentation avoids false precision", async () => {
   const source = await dashboardSurface();
   const today = await readFile(todayPath, "utf8");
-  assert.match(today, /Preparing your daily brief/);
+  assert.match(today, /Preparing the first portfolio snapshot/);
   assert.match(source, /Independent evidence dimensions/);
   assert.match(source, /not forced into one 100% distribution/);
-  assert.match(source, /Stock research library/);
-  assert.match(source, /Search stocks/);
-  assert.match(source, /Rating bucket/);
-  assert.match(source, /Leading evidence/);
+  assert.match(source, /One clear view of the evidence/);
+  assert.match(source, /Stock, ETF, or company/);
+  assert.match(source, /Partial evidence/);
+  assert.match(source, /Bear, base, and bull cases/);
   assert.match(source, /What kind of market are we in\?/);
   assert.match(source, /Similar historical market states/);
-  assert.match(source, /Strongest evidence/);
-  assert.match(source, /Weakest evidence/);
+  assert.match(source, /Fundamentals/);
+  assert.match(source, /Valuation/);
   assert.match(source, /Portfolio fit/);
-  assert.match(source, /What would change the view/);
-  assert.match(source, /presentation\.showDiagnostics&&<p>Expert scores/);
+  assert.match(source, /What would disprove it/);
+  assert.match(source, /Generated research case; not saved as your belief/);
 });
 
 test("research search explains filters, missing data, ETF holdings, and valuation logic", async () => {
   const research = await readFile(researchPath, "utf8");
   for (const copy of [
-    "AAPL, QQQ, ARKK, or Apple",
-    "Requires business-quality evidence ≥60 and available valuation evidence ≥50",
-    "Why some data is missing",
-    "Review valuation logic",
-    "ETF holdings & costs",
-    "Open provider source",
+    "AAPL or Apple",
+    "Partial evidence",
+    "Missing:",
+    "Reported earnings",
+    "Forward statistics",
+    "Evidence through",
   ]) assert.match(research, new RegExp(copy));
 });
 
@@ -158,11 +160,11 @@ test("Ask EagleEyes exposes durable conversation controls as the single chat sur
     "newChatConversation", "openChatConversation", "renameChatConversation",
     "deleteChatConversation", "buildBoardFromConversation",
   ]) assert.match(source, new RegExp(`function ${action}\\(`));
-  for (const copy of ["Research conversations", "Linked evidence", "＋ New", "Questions live in one place"]) {
+  for (const copy of ["Research conversations", "Linked evidence", "＋ New", "Internal retrieval steps stay behind the answer"]) {
     assert.match(source, new RegExp(copy));
   }
-  assert.match(source, /eagleeyes-research-conversation/);
-  assert.match(source, /MarketClimatePage/);
+  assert.match(source, /`eagleeyes-\$\{workspace\}-conversation-\$\{portfolioId\?\?"general"\}`/);
+  assert.match(source, /onKeyDown=\{event=>\{if\(event\.key!=="Enter"\|\|event\.shiftKey\|\|event\.nativeEvent\.isComposing\)return/);
 });
 
 test("chat history remains beside the conversation on desktop", async () => {

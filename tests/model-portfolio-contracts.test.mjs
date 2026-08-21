@@ -15,7 +15,7 @@ test("no-portfolio journey is reachable and keeps model holdings separate", () =
   assert.doesNotMatch(main, /"Starter portfolio"/);
   assert.doesNotMatch(database, /"Starter portfolio"/);
   assert.match(routes, /portfolio-builder/);
-  assert.match(research, /Start a portfolio/);
+  assert.match(research, /portfolio-builder/);
   assert.match(builder, /Ask EagleEyes for candidates/);
   assert.match(builder, /Save draft/);
   assert.match(builder, /Convert to tracked portfolio/);
@@ -34,10 +34,11 @@ test("model portfolio builder exposes comparisons, benchmarks, and combined stre
   assert.match(builder, /Stress \+ simulate selected/);
 });
 
-test("Ask EagleEyes provides a full-width no-portfolio entry point", () => {
+test("Ask EagleEyes provides a full-width conversational canvas without requiring a portfolio", () => {
   const ask = read("app/components/ask/AskPage.tsx");
   const css = read("app/globals.css");
-  assert.match(ask, /No tracked portfolio/);
-  assert.match(ask, /research\?view=portfolio-builder/);
-  assert.match(css, /ask-decision-workspace>\.chat-workspace\{width:100%;max-width:none!important/);
+  assert.match(ask, /ask-conversational-workspace/);
+  assert.match(ask, /variant="canvas"/);
+  assert.match(css, /\.ask-split-shell\{display:grid/);
+  assert.match(css, /\.ask-mobile-tabs/);
 });

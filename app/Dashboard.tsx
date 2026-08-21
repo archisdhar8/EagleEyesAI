@@ -8,10 +8,9 @@ import { PortfolioPage } from "./components/portfolio/PortfolioPage";
 import { ExplorePage } from "./components/research/ExplorePage";
 import { LearnPage } from "./components/learn/LearnPage";
 import { AskPage } from "./components/ask/AskPage";
-import { DecisionsPage } from "./components/decisions/DecisionsPage";
 import { MarketClimatePage } from "./components/markets/MarketClimatePage";
 import { AdvancedPage, ResearchTerminal } from "./components/terminal/AdvancedPage";
-import { adaptDashboardSpecification } from "./components/ask/contracts";
+import { adaptDashboardSpecification, type DashboardAction, type DashboardActionResult } from "./components/ask/contracts";
 import { adaptTerminalWidgets, type TerminalLayout, type TerminalWidgetConfig, type TerminalWidgetType } from "./components/terminal/contracts";
 import { normalizePresentationLevel } from "./lib/presentation-level";
 import { navigationLabel, pathForTab, resolveAppRoute, type AdvancedView, type ExploreView, type PortfolioView, type RouteState, type Tab } from "./lib/routes";
@@ -192,7 +191,21 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       if(!detailResponse.ok||!active)return;
       const detail=await detailResponse.json();
       conversationCache.current[activeWorkspace].set(selected,{messages:detail.messages||[],artifacts:detail.artifacts||[]});
-      if(activeWorkspace==="research"){setResearchConversationId(selected);setResearchChatMessages(detail.messages||[]);setResearchChatArtifacts(detail.artifacts||[]);}
+      if(activeWorkspace==="research"){
+        setResearchConversationId(selected);setResearchChatMessages(detail.messages||[]);setResearchChatArtifacts(detail.artifacts||[]);
+        const linkedDashboard=(detail.artifacts||[]).find((artifact:ChatArtifact)=>artifact.artifact_type==="dashboard_view");
+        if(linkedDashboard){
+          const viewResponse=await apiRequest(`/dashboard/views/${linkedDashboard.artifact_id}`);
+          if(viewResponse.ok&&active)loadDashboardViewState(await viewResponse.json());
+        }else{
+          const lastDashboardMessage=[...(detail.messages||[])].reverse().find((message:ChatMessage)=>message.structured_content?.dashboard_operation?.resource_type==="draft");
+          const draftId=lastDashboardMessage?.structured_content?.dashboard_operation?.resource_id;
+          if(draftId){
+            const draftResponse=await apiRequest(`/dashboard/drafts/${draftId}`);
+            if(draftResponse.ok&&active){setSelectedDashboardView(null);setDashboardJob(await draftResponse.json());}
+          }
+        }
+      }
       else{setPortfolioConversationId(selected);setPortfolioChatMessages(detail.messages||[]);setPortfolioChatArtifacts(detail.artifacts||[]);}
       window.localStorage.setItem(chatStorageKey(activeWorkspace),selected);
     }
@@ -796,6 +809,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     const cached=conversationCache.current[workspace].get(conversationId);
     if(workspace==="research"){
       setResearchConversationId(conversationId);setResearchChatMessages(cached?.messages||[]);setResearchChatArtifacts(cached?.artifacts||[]);
+      setSelectedDashboardView(null);setDashboardJob(null);
     }else{
       setPortfolioConversationId(conversationId);setPortfolioChatMessages(cached?.messages||[]);setPortfolioChatArtifacts(cached?.artifacts||[]);
     }
@@ -808,6 +822,18 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     if(window.localStorage.getItem(chatStorageKey(workspace))!==conversationId)return;
     if(workspace==="research"){
       setResearchConversationId(conversationId);setResearchChatMessages(detail.messages||[]);setResearchChatArtifacts(detail.artifacts||[]);
+      const linkedDashboard=(detail.artifacts||[]).find((artifact:ChatArtifact)=>artifact.artifact_type==="dashboard_view");
+      if(linkedDashboard)void openDashboardView(linkedDashboard.artifact_id);
+      else {
+        const lastDashboardMessage=[...(detail.messages||[])].reverse().find((message:ChatMessage)=>message.structured_content?.dashboard_operation?.resource_type==="draft");
+        const draftId=lastDashboardMessage?.structured_content?.dashboard_operation?.resource_id;
+        if(draftId){
+          const draftResponse=await apiRequest(`/dashboard/drafts/${draftId}`);
+          if(draftResponse.ok&&window.localStorage.getItem(chatStorageKey(workspace))===conversationId){
+            setSelectedDashboardView(null);setDashboardJob(await draftResponse.json());
+          }
+        }
+      }
     }else{
       setPortfolioConversationId(conversationId);setPortfolioChatMessages(detail.messages||[]);setPortfolioChatArtifacts(detail.artifacts||[]);
     }
@@ -817,7 +843,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   function newChatConversation(workspace:"research"|"portfolio") {
     window.localStorage.removeItem(chatStorageKey(workspace));
     if(workspace==="research"){
-      setResearchConversationId(null);setResearchChatMessages([]);setResearchChatArtifacts([]);setResearchChatQuestion("");
+      setResearchConversationId(null);setResearchChatMessages([]);setResearchChatArtifacts([]);setResearchChatQuestion("");setSelectedDashboardView(null);setDashboardJob(null);
     }else{
       setPortfolioConversationId(null);setPortfolioChatMessages([]);setPortfolioChatArtifacts([]);setPortfolioChatQuestion("");
     }
@@ -879,16 +905,34 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     try {
       const currentUrl=new URL(window.location.href);
       const contextTicker=(currentUrl.searchParams.get("ticker")||"").toUpperCase()||undefined;
+      const dashboardResourceType=selectedDashboardView?"view":dashboardJob?"draft":undefined;
+      const dashboardResourceId=selectedDashboardView||dashboardJob?.id||undefined;
       const response = await apiRequest("/chat/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: cleanQuestion, conversation_id: researchConversationId, workspace: "research", page_context:{route:`${currentUrl.pathname}${currentUrl.search}`,workspace:tab==="ask"?"ask":"research",entity_type:contextTicker?"security":undefined,ticker:contextTicker,portfolio_id:portfolioId?String(portfolioId):undefined,enabled_context:askEnabledContext} }),
+        body: JSON.stringify({ question: cleanQuestion, conversation_id: researchConversationId, workspace: "research", page_context:{route:`${currentUrl.pathname}${currentUrl.search}`,workspace:tab==="ask"?"ask":"research",entity_type:contextTicker?"security":undefined,ticker:contextTicker,portfolio_id:portfolioId?String(portfolioId):undefined,dashboard_resource_type:dashboardResourceType,dashboard_resource_id:dashboardResourceId,enabled_context:askEnabledContext} }),
       });
       if (!response.ok) throw new Error(await apiError(response, "Unable to answer the research question"));
       const data = await response.json();
       setResearchConversationId(data.conversation_id || null);
       if(data.conversation_id)window.localStorage.setItem(chatStorageKey("research"),data.conversation_id);
       setResearchChatMessages(items => [...items, data.message]);
+      const operation=data.message?.structured_content?.dashboard_operation;
+      if(operation?.action_result?.status==="SUCCESS"&&operation.action_result.dashboard){
+        if(operation.resource_type==="view"){
+          loadDashboardViewState(operation.action_result.dashboard as DashboardView);
+        }else{
+          setSelectedDashboardView(null);
+          const generated=operation.action_result.dashboard as DashboardJob;
+          setDashboardJob(generated);
+          if(!DASHBOARD_TERMINAL_STATES.has(generated.state)){
+            setDashboardBusy(true);
+            void streamDashboard(generated.id)
+              .catch(error=>setNotice(error instanceof Error?error.message:"Dashboard generation stopped before completion."))
+              .finally(()=>setDashboardBusy(false));
+          }
+        }
+      }
       void refreshConversationList("research");
       if(data.conversation_id)void refreshConversationArtifacts("research",data.conversation_id);
     } catch (error) {
@@ -951,7 +995,13 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   async function openDashboardView(viewId: string) {
     const response = await apiFetch(`${API}/dashboard/views/${viewId}`);
     if (!response.ok) { setNotice(await apiError(response, "Unable to open saved view")); return; }
-    const view: DashboardView = await response.json(); setSelectedDashboardView(view.id);
+    const view: DashboardView = await response.json();
+    loadDashboardViewState(view);
+  }
+
+  function loadDashboardViewState(view:DashboardView){
+    setSelectedDashboardView(view.id);
+    setDashboardViews(items=>[view,...items.filter(item=>item.id!==view.id)]);
     const specification = adaptDashboardSpecification(view.specification) as DashboardSpec;
     setDashboardJob({ id: view.latest_run?.created_at || view.id, prompt: view.original_prompt, state: view.latest_run?.status || "COMPLETE", progress: 100, plan: view.plan, specification: { ...specification, widgets: view.layout?.length ? view.layout : specification.widgets }, widget_results: view.latest_run?.widget_results || [], narrative: view.latest_run?.narrative, warnings: view.latest_run?.warnings || [] });
   }
@@ -969,8 +1019,10 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   async function renameDashboardView(viewId: string) {
     const current = dashboardViews.find(item => item.id === viewId); const name = window.prompt("Rename dashboard", current?.name || "");
     if (!name?.trim()) return;
-    const response = await apiFetch(`${API}/dashboard/views/${viewId}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: name.trim() }) });
-    if (response.ok) { const updated = await response.json(); setDashboardViews(items => items.map(item => item.id === viewId ? updated : item)); }
+    const response = await apiFetch(`${API}/dashboard/views/${viewId}/actions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type:"RENAME_DASHBOARD", name:name.trim() } satisfies DashboardAction) });
+    const result:DashboardActionResult<DashboardView>=await response.json();
+    if(response.ok&&result.status==="SUCCESS"&&result.dashboard){setDashboardViews(items=>items.map(item=>item.id===viewId?result.dashboard!:item));}
+    else setNotice(result.error||"Unable to rename dashboard");
   }
 
   async function deleteDashboardView(viewId: string) {
@@ -997,26 +1049,25 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     finally{setDashboardBusy(false);}
   }
 
-  async function mutateDashboardWidget(widgetId:string,operation:"move"|"resize"|"remove",options:{direction?:number;width?:number;height?:number}={}){
+  async function executeDashboardAction(action:DashboardAction){
     if(!dashboardJob?.specification)return;
-    const target=selectedDashboardView?`${API}/dashboard/views/${selectedDashboardView}/layout/widgets/${widgetId}`:`${API}/dashboard/drafts/${dashboardJob.id}/layout/widgets/${widgetId}`;
-    const response=await apiFetch(target,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({operation,...options})});
-    if(!response.ok){setNotice(await apiError(response,"Unable to update widget layout"));return;}
-    if(selectedDashboardView){const view:DashboardView=await response.json();setDashboardViews(items=>items.map(item=>item.id===view.id?view:item));await openDashboardView(view.id);}
-    else setDashboardJob(await response.json());
+    const target=selectedDashboardView?`${API}/dashboard/views/${selectedDashboardView}/actions`:`${API}/dashboard/drafts/${dashboardJob.id}/actions`;
+    const response=await apiFetch(target,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(action)});
+    const result:DashboardActionResult<DashboardView|DashboardJob>=await response.json();
+    if(!response.ok||result.status!=="SUCCESS"||!result.dashboard){setNotice(result.error||"Unable to update dashboard");return;}
+    if(selectedDashboardView){const view=result.dashboard as DashboardView;setDashboardViews(items=>items.map(item=>item.id===view.id?view:item));await openDashboardView(view.id);}
+    else setDashboardJob(result.dashboard as DashboardJob);
   }
 
   function moveDashboardWidget(widgetId: string, direction: -1 | 1) {
     if (!dashboardJob?.specification) return;
     const widgets = [...dashboardJob.specification.widgets]; const index = widgets.findIndex(widget => widget.id === widgetId); const target = index + direction;
     if (index < 0 || target < 0 || target >= widgets.length) return;
-    [widgets[index], widgets[target]] = [widgets[target], widgets[index]];
-    setDashboardJob({ ...dashboardJob, specification: { ...dashboardJob.specification, widgets } });
-    void mutateDashboardWidget(widgetId,"move",{direction});
+    void executeDashboardAction({type:"MOVE_WIDGET",widget_id:widgetId,to_index:target});
   }
 
-  function resizeDashboardWidget(widgetId:string,width:number,height:number){void mutateDashboardWidget(widgetId,"resize",{width,height});}
-  function removeDashboardWidget(widgetId:string){if(window.confirm("Remove this widget from the board?"))void mutateDashboardWidget(widgetId,"remove");}
+  function resizeDashboardWidget(widgetId:string,width:number,height:number){void executeDashboardAction({type:"RESIZE_WIDGET",widget_id:widgetId,width,height});}
+  function removeDashboardWidget(widgetId:string){if(window.confirm("Remove this widget from the board?"))void executeDashboardAction({type:"DELETE_WIDGET",widget_id:widgetId});}
 
   const currentWeightTotal = holdings.reduce((sum, item) => sum + (Number(item.weight) || 0), 0);
   const sortedResearch = useMemo(() => [...research].sort((a, b) => Number(b[sortKey] || 0) - Number(a[sortKey] || 0)), [research, sortKey]);
@@ -1039,11 +1090,10 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
         {tab === "today" && <TodayPage loading={loading} refreshing={busy === "Refreshing market and macro data"||busy==="Refreshing portfolio intelligence"} briefing={homeBriefing} overview={portfolioOverview} portfolios={portfolios} selectedPortfolioId={portfolioId} hasSavedPortfolio={holdings.length>0} macroFactors={macroFactors.filter(item => preferences.macro_widgets.includes(item.key))} dataStatus={dataStatus} onRefresh={refreshToday} onRefreshOverview={refreshPortfolioOverview} onSelectPortfolio={id=>void selectPortfolio(id)} onOverviewChange={setPortfolioOverview} onNavigate={navigate} onExplore={navigateExplore} onPortfolio={navigatePortfolio} onAdvanced={navigateAdvanced} request={apiRequest} />}
         {tab === "plan" && <PlanPage profile={profile} setProfile={setProfile} goals={goals} projections={goalProjections} policy={investmentPolicy} setPolicy={setInvestmentPolicy} guidance={planGuidance} onSavePolicy={()=>saveInvestmentPolicy(false)} onApprovePolicy={()=>saveInvestmentPolicy(true)} onSaveProfile={savePlanProfile} onSaveGoal={saveGoal} onDeleteGoal={deleteGoal} onProject={projectGoal} onOpenPortfolio={()=>navigatePortfolio("analysis")} />}
         {tab === "portfolio" && <PortfolioPage view={portfolioView} setView={navigatePortfolio} request={apiRequest} portfolioId={portfolioId} portfolios={portfolios} onSelectPortfolio={id=>void selectPortfolio(id)} onNewPortfolio={newPortfolio} holdings={holdings} setHoldings={setHoldings} name={portfolioName} setName={setPortfolioName} total={currentWeightTotal} dirty={portfolioDirty} errors={portfolioErrors} saving={busy === "Saving portfolio"} onSave={savePortfolio} onImport={importCsv} profile={profile} goals={goals} setProfile={setProfile} onObjectiveProfileChange={updateObjectiveProfile} analysis={analysis} monitoring={monitoring} guidance={planGuidance} diagnostics={portfolioDiagnostics} performance={terminalPerformance} presentationLevel={preferences.presentation_level} selected={selectedAlternative} setSelected={setSelectedAlternative} onRun={runOptimization} analysisBusy={busy === "Running scenario analysis"} narrative={narrative} onNarrative={generateNarrative} portfolioChatMessages={portfolioChatMessages} portfolioChatQuestion={portfolioChatQuestion} setPortfolioChatQuestion={setPortfolioChatQuestion} onAskPortfolio={askPortfolioChat} portfolioChatBusy={portfolioChatBusy} portfolioConversationControls={{conversations:portfolioConversations,currentId:portfolioConversationId,artifacts:portfolioChatArtifacts,onNew:()=>void newChatConversation("portfolio"),onOpen:id=>void openChatConversation("portfolio",id),onRename:id=>void renameChatConversation("portfolio",id),onDelete:id=>void deleteChatConversation("portfolio",id),onBuildBoard:()=>buildBoardFromConversation("portfolio")}} />}
-        {tab === "decisions" && <DecisionsPage request={apiRequest} portfolioId={portfolioId} holdings={holdings} profile={profile} goals={goals} onOpenPortfolio={()=>navigatePortfolio("holdings")} />}
         {tab === "climate" && <MarketClimatePage macro={macro} factors={macroFactors} scenarios={scenarios} regimeHistory={regimeHistory} request={apiRequest} onRefresh={refreshMarkets} onAsk={question=>{setResearchChatQuestion(question);navigate("ask");}} />}
-        {tab === "explore" && <ExplorePage view={exploreView} setView={navigateExplore} request={(path,init)=>apiFetch(`${API}${path}`,init)} onManageUniverse={()=>navigatePortfolio("holdings")} scenarios={scenarios} contracts={contracts} fetchedAt={scenarioFetchedAt} regimeHistory={regimeHistory} warnings={scenarioWarnings} onRefreshMarkets={refreshMarkets} rows={sortedResearch} holdings={holdings} profile={profile} presentationLevel={preferences.presentation_level} sortKey={sortKey} setSortKey={setSortKey} onRefreshResearch={refreshResearch} widgets={preferences.research_widgets} macro={macro} macroFactors={macroFactors} watchlist={profile.watchlist} researchChatMessages={researchChatMessages} researchChatQuestion={researchChatQuestion} setResearchChatQuestion={setResearchChatQuestion} onAskResearch={askResearchChat} researchChatBusy={researchChatBusy} researchConversationControls={{conversations:researchConversations,currentId:researchConversationId,artifacts:researchChatArtifacts,onNew:()=>void newChatConversation("research"),onOpen:id=>void openChatConversation("research",id),onRename:id=>void renameChatConversation("research",id),onDelete:id=>void deleteChatConversation("research",id),onBuildBoard:()=>buildBoardFromConversation("research")}} />}
+        {tab === "explore" && <ExplorePage view={exploreView} setView={navigateExplore} request={(path,init)=>apiFetch(`${API}${path}`,init)} onManageUniverse={()=>navigatePortfolio("holdings")} scenarios={scenarios} contracts={contracts} fetchedAt={scenarioFetchedAt} regimeHistory={regimeHistory} warnings={scenarioWarnings} onRefreshMarkets={refreshMarkets} rows={sortedResearch} holdings={holdings} profile={profile} presentationLevel={preferences.presentation_level} sortKey={sortKey} setSortKey={setSortKey} onRefreshResearch={refreshResearch} widgets={preferences.research_widgets} macro={macro} macroFactors={macroFactors} watchlist={profile.watchlist} portfolioId={portfolioId} onWatchlistChange={tickers=>setProfile(current=>({...current,watchlist:tickers}))} researchChatMessages={researchChatMessages} researchChatQuestion={researchChatQuestion} setResearchChatQuestion={setResearchChatQuestion} onAskResearch={askResearchChat} researchChatBusy={researchChatBusy} researchConversationControls={{conversations:researchConversations,currentId:researchConversationId,artifacts:researchChatArtifacts,onNew:()=>void newChatConversation("research"),onOpen:id=>void openChatConversation("research",id),onRename:id=>void renameChatConversation("research",id),onDelete:id=>void deleteChatConversation("research",id),onBuildBoard:()=>buildBoardFromConversation("research")}} />}
         {tab === "learn" && <LearnPage request={apiRequest} moduleSlug={learningModule} lessonId={learningLesson} onOpenLesson={navigateLearn} onOpenHub={()=>navigateLearn()} onDeepLink={navigateDeepLink} />}
-        {tab === "ask" && <AskPage messages={researchChatMessages} question={researchChatQuestion} setQuestion={setResearchChatQuestion} onSend={askResearchChat} loading={researchChatBusy} controls={{conversations:researchConversations,currentId:researchConversationId,artifacts:researchChatArtifacts,onNew:()=>void newChatConversation("research"),onOpen:id=>void openChatConversation("research",id),onRename:id=>void renameChatConversation("research",id),onDelete:id=>void deleteChatConversation("research",id),onBuildBoard:()=>buildBoardFromConversation("research")}} contextTicker={new URL(window.location.href).searchParams.get("ticker")} enabledContext={askEnabledContext} onToggleContext={key=>setAskEnabledContext(items=>items.includes(key)?items.filter(item=>item!==key):[...items,key])} job={dashboardJob} views={dashboardViews} catalog={dashboardCatalog} selectedView={selectedDashboardView} prompt={dashboardPrompt} setPrompt={setDashboardPrompt} busy={dashboardBusy} presentationLevel={preferences.presentation_level} onCreate={createAIDashboard} onRevise={reviseAIDashboard} onCancel={cancelAIDashboard} onSave={saveAIDashboard} onDiscard={() => { setDashboardJob(null); setSelectedDashboardView(null); setDashboardSourceConversationId(null); }} onOpenView={openDashboardView} onRefreshView={refreshDashboardView} onDuplicateView={duplicateDashboardView} onRenameView={renameDashboardView} onDeleteView={deleteDashboardView} onMoveWidget={moveDashboardWidget} onResizeWidget={resizeDashboardWidget} onRemoveWidget={removeDashboardWidget} onAddWidget={addDashboardWidget} />}
+        {tab === "ask" && <AskPage messages={researchChatMessages} question={researchChatQuestion} setQuestion={setResearchChatQuestion} onSend={askResearchChat} loading={researchChatBusy} controls={{conversations:researchConversations,currentId:researchConversationId,artifacts:researchChatArtifacts,onNew:()=>void newChatConversation("research"),onOpen:id=>void openChatConversation("research",id),onRename:id=>void renameChatConversation("research",id),onDelete:id=>void deleteChatConversation("research",id),onBuildBoard:()=>buildBoardFromConversation("research"),onOpenArtifact:artifact=>{if(artifact.artifact_type==="dashboard_view")void openDashboardView(artifact.artifact_id);}}} contextTicker={new URL(window.location.href).searchParams.get("ticker")} enabledContext={askEnabledContext} onToggleContext={key=>setAskEnabledContext(items=>items.includes(key)?items.filter(item=>item!==key):[...items,key])} job={dashboardJob} views={dashboardViews} catalog={dashboardCatalog} selectedView={selectedDashboardView} prompt={dashboardPrompt} setPrompt={setDashboardPrompt} busy={dashboardBusy} presentationLevel={preferences.presentation_level} onCreate={createAIDashboard} onRevise={reviseAIDashboard} onCancel={cancelAIDashboard} onSave={saveAIDashboard} onDiscard={() => { setDashboardJob(null); setSelectedDashboardView(null); setDashboardSourceConversationId(null); }} onOpenView={openDashboardView} onRefreshView={refreshDashboardView} onDuplicateView={duplicateDashboardView} onRenameView={renameDashboardView} onDeleteView={deleteDashboardView} onMoveWidget={moveDashboardWidget} onResizeWidget={resizeDashboardWidget} onRemoveWidget={removeDashboardWidget} onAddWidget={addDashboardWidget} />}
         {tab === "advanced" && <AdvancedPage view={advancedView} setView={navigateAdvanced} layouts={terminalLayouts} selectedLayout={selectedTerminalLayout} onOpenLayout={openTerminalLayout} onSaveLayout={saveTerminalLayout} onDuplicateLayout={duplicateTerminalLayout} onDeleteLayout={deleteTerminalLayout} terminal={<ResearchTerminal widgets={preferences.terminal_widgets} catalogOpen={terminalCatalogOpen} setCatalogOpen={setTerminalCatalogOpen} onAdd={addTerminalWidget} onRemove={id=>saveTerminalWidgets(preferences.terminal_widgets.filter(widget=>widget.id!==id))} onMove={moveTerminalWidget} onResize={resizeTerminalWidget} onReset={()=>saveTerminalWidgets(defaultTerminalWidgets)} dragged={draggedTerminalWidget} setDragged={setDraggedTerminalWidget} onDrop={dropTerminalWidget} performance={terminalPerformance} holdings={holdings} macro={macro} macroFactors={macroFactors} marketIndicators={terminalMarketIndicators} scenarios={scenarios} contracts={contracts} research={research} analysis={analysis} monitoring={monitoring} dataStatus={dataStatus} selectedTicker={terminalTicker} setSelectedTicker={setTerminalTicker} contractSearch={terminalContractSearch} setContractSearch={setTerminalContractSearch} />} analysis={analysis} monitoring={monitoring} dataStatus={dataStatus} regimeHistory={regimeHistory} request={apiRequest} />}
     </AppShell>
   );

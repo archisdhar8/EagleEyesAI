@@ -1,6 +1,15 @@
 export const AI_DASHBOARD_SPEC_VERSION = "dashboard-spec-v2";
 export const AI_DASHBOARD_LAYOUT_VERSION = "dashboard-layout-v2";
 
+export type DashboardDataBinding = {
+  metric: string;
+  portfolio?: string | null;
+  benchmark?: string | null;
+  period: "1M" | "3M" | "6M" | "1Y" | "3Y" | "5Y" | "7Y" | "10Y" | "20Y";
+  tickers: string[];
+  filters: Array<{ field: string; operator: "eq" | "neq" | "contains" | "in"; value: string | string[] }>;
+};
+
 export type DashboardWidgetSpec = {
   id: string;
   task_id: string;
@@ -8,6 +17,27 @@ export type DashboardWidgetSpec = {
   title: string;
   visualization: string;
   grid: { x: number; y: number; w: number; h: number };
+  binding?: DashboardDataBinding | null;
+};
+
+export type DashboardAction =
+  | { type: "CREATE_WIDGET"; widget: Omit<DashboardWidgetSpec, "id"> & { id?: string } }
+  | { type: "UPDATE_WIDGET"; widget_id: string; changes: { title?: string; visualization?: string; binding?: DashboardDataBinding } }
+  | { type: "DELETE_WIDGET"; widget_id: string }
+  | { type: "MOVE_WIDGET"; widget_id: string; to_index?: number; position?: { x: number; y: number } }
+  | { type: "RESIZE_WIDGET"; widget_id: string; width: number; height: number }
+  | { type: "CLEAR_DASHBOARD" }
+  | { type: "RENAME_DASHBOARD"; name: string };
+
+export type DashboardActionStatus = "SUCCESS" | "FAILED" | "INVALID" | "UNSUPPORTED";
+
+export type DashboardActionResult<TDashboard = unknown> = {
+  version: "dashboard-action-v1";
+  status: DashboardActionStatus;
+  action?: DashboardAction | null;
+  dashboard?: TDashboard | null;
+  revision?: Record<string, unknown> | null;
+  error?: string | null;
 };
 
 export type DashboardSpecification = {

@@ -7,10 +7,10 @@ const routes = readFileSync(new URL("app/lib/routes.ts", root), "utf8");
 const workspace = readFileSync(new URL("app/components/shared/workspace-implementations.tsx", root), "utf8");
 const etfs = readFileSync(new URL("app/components/research/ETFResearch.tsx", root), "utf8");
 
-test("Research exposes a dedicated ETF catalog route and tab", () => {
+test("Research keeps ETF research discoverable under More research", () => {
   assert.match(routes, /"etfs"/);
-  assert.match(workspace, /\["etfs","ETFs"\]/);
-  assert.match(workspace, /<ETFResearch request=\{request\}/);
+  assert.match(workspace, /More research/);
+  assert.match(workspace, /\["etfs","ETF research"\]/);
 });
 
 test("ETF detail discloses holdings availability and required analytics", () => {

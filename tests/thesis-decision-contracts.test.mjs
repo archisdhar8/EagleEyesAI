@@ -40,10 +40,10 @@ test("decision reports auto-build complete scenarios and use compact editable ro
   assert.match(guided, /guided-edit-row/);
 });
 
-test("research and portfolio bridge into persistent decision context", () => {
-  assert.match(research, /Decision memory/);
-  assert.match(research, /Research evidence is not automatically a decision/);
-  assert.match(research, /\/decisions\?ticker=/);
+test("research retires decision editing while preserved history remains portfolio context", () => {
+  assert.match(research, /Generated research case; not saved as your belief/);
+  assert.match(research, /saved thesis history/);
+  assert.doesNotMatch(research, /\/decisions\?ticker=/);
   assert.match(portfolio, /Decision memory/);
   assert.match(portfolio, /No thesis/);
   assert.match(portfolio, /Optional context/);

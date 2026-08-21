@@ -6,11 +6,10 @@ const research = readFileSync(new URL("../app/components/research/ResearchDiscov
 const backend = readFileSync(new URL("../backend/main.py", import.meta.url), "utf8");
 
 test("company research exposes a bounded what-changed review surface", () => {
-  assert.match(research, /What changed\?/);
-  assert.match(research, /Mark evidence reviewed/);
-  assert.match(research, /Coverage and missing evidence/);
-  assert.match(research, /evidence\/securities\/\$\{ticker\}\/changes/);
-  assert.match(research, /LAST_RESEARCH_REVIEW/);
+  assert.match(research, /Recent material changes/);
+  assert.match(research, /latest saved research review/);
+  assert.match(research, /Partial evidence/);
+  assert.match(backend, /evidence\.get_changes\(user\.id, normalized, baseline_type="LAST_RESEARCH_REVIEW"\)/);
 });
 
 test("typed evidence routes stay authenticated and AI-callable", () => {

@@ -3455,7 +3455,9 @@ def save_dashboard_view(user_id: str, job_id: str, name: str | None = None,
                  _jsonb(job["widget_results"]),job.get("narrative"),_jsonb([line for item in job["widget_results"] for line in item.get("lineage",[])]),
                  _jsonb(job["warnings"]),_jsonb({"compiler":job["specification"].get("compiler_version"),"guidance":(job["specification"].get("guidance_decision") or {}).get("calculation_version")}),job["state"],spec_version,layout_version),
             )
-        return _dashboard_view(row)
+        saved = _dashboard_view(row)
+        save_dashboard_revision(saved, user_id, "created", source_view_id=job.get("source_view_id"))
+        return get_dashboard_view(view_id, user_id)
     with sqlite_connection() as conn:
         conn.execute(
             """INSERT INTO dashboard_views(id,user_id,name,original_prompt,plan_json,specification_json,
@@ -3531,6 +3533,73 @@ def get_dashboard_view(view_id: str, user_id: str) -> dict[str, Any]:
     return view
 
 
+def persist_dashboard_widget_results(view_id: str, user_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Append one refreshed widget result without mutating historical view runs."""
+    view = get_dashboard_view(view_id, user_id)
+    latest = view.get("latest_run") or {}
+    results = [dict(item) for item in latest.get("widget_results") or []]
+    result_id = str(result.get("widget_id") or result.get("task_id") or result.get("id") or "")
+    results = [item for item in results if str(item.get("widget_id") or item.get("task_id") or item.get("id") or "") != result_id]
+    results.append(result)
+    lineage = [line for item in results for line in item.get("lineage", [])]
+    warnings = list(dict.fromkeys(str(warning) for item in results for warning in item.get("warnings", []) if warning))
+    now = utc_now()
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            original = None
+            if latest.get("id"):
+                original = conn.execute(
+                    "SELECT * FROM public.dashboard_view_runs WHERE id=%s AND user_id=%s",
+                    (latest["id"], user_id),
+                ).fetchone()
+            conn.execute(
+                """INSERT INTO public.dashboard_view_runs(
+                    view_id,job_id,user_id,input_snapshot,widget_results,narrative,lineage,warnings,
+                    model_versions,status,spec_version,layout_version
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    view_id,
+                    original["job_id"] if original else latest.get("job_id"),
+                    user_id,
+                    original["input_snapshot"] if original else _jsonb({"source": "conversational-widget"}),
+                    _jsonb(results),
+                    original["narrative"] if original else None,
+                    _jsonb(lineage),
+                    _jsonb(warnings),
+                    original["model_versions"] if original else _jsonb({"dashboard_actions": "dashboard-action-v1"}),
+                    "READY",
+                    view.get("spec_version", "dashboard-spec-v1"),
+                    view.get("layout_version", "dashboard-layout-v2"),
+                ),
+            )
+            conn.execute("UPDATE public.dashboard_views SET updated_at=now() WHERE id=%s AND user_id=%s", (view_id, user_id))
+    else:
+        with sqlite_connection() as conn:
+            original = None
+            if latest.get("id"):
+                original = conn.execute(
+                    "SELECT * FROM dashboard_view_runs WHERE id=? AND user_id=?",
+                    (latest["id"], user_id),
+                ).fetchone()
+            conn.execute(
+                """INSERT INTO dashboard_view_runs(
+                    id,view_id,job_id,user_id,input_snapshot_json,widget_results_json,narrative,
+                    lineage_json,warnings_json,model_versions_json,status,created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(uuid.uuid4()), view_id,
+                    original["job_id"] if original else latest.get("job_id"), user_id,
+                    original["input_snapshot_json"] if original else json.dumps({"source": "conversational-widget"}),
+                    json.dumps(results, default=str), original["narrative"] if original else None,
+                    json.dumps(lineage, default=str), json.dumps(warnings, default=str),
+                    original["model_versions_json"] if original else json.dumps({"dashboard_actions": "dashboard-action-v1"}),
+                    "READY", now,
+                ),
+            )
+            conn.execute("UPDATE dashboard_views SET updated_at=? WHERE id=? AND user_id=?", (now, view_id, user_id))
+    return get_dashboard_view(view_id, user_id)
+
+
 def _layout_diff(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> dict[str, Any]:
     old = {str(item.get("id")): item for item in before}
     new = {str(item.get("id")): item for item in after}
@@ -3593,6 +3662,76 @@ def list_dashboard_revisions(view_id: str, user_id: str, limit: int = 50) -> lis
              "layout":json.loads(row["layout_json"]),"diff":json.loads(row["diff_json"])} for row in rows]
 
 
+def restore_previous_dashboard_revision(
+    view_id: str,
+    user_id: str,
+    widget_id: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Restore the state immediately before the latest relevant saved-view change.
+
+    Revisions are full snapshots, so this uses the existing durable history rather
+    than maintaining an AI-specific undo log.  A widget-scoped revert finds the
+    newest revision whose layout diff mentions that widget, then restores the
+    preceding snapshot.
+    """
+    revisions = list_dashboard_revisions(view_id, user_id, limit=100)
+    if len(revisions) < 2:
+        raise ValueError("There is no earlier saved dashboard revision to restore")
+    current_index = 0
+    if widget_id:
+        current_index = next((
+            index for index, revision in enumerate(revisions[:-1])
+            if widget_id in {
+                str(value)
+                for key in ("added", "removed", "resized", "moved")
+                for value in (revision.get("diff") or {}).get(key, [])
+            }
+        ), -1)
+        if current_index < 0:
+            raise ValueError("No saved revision changed that widget")
+    target = revisions[current_index + 1]
+    before = get_dashboard_view(view_id, user_id)
+    specification = dict(target.get("specification") or {})
+    layout = list(target.get("layout") or specification.get("widgets") or [])
+    specification["widgets"] = layout
+    restored_name = str(specification.get("title") or before.get("name") or "Saved dashboard")[:120]
+    now = utc_now()
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                """UPDATE public.dashboard_views
+                SET name=%s,original_prompt=%s,plan=%s,specification=%s,layout=%s,
+                    spec_version=%s,layout_version=%s,updated_at=now()
+                WHERE id=%s AND user_id=%s RETURNING id""",
+                (restored_name, target.get("prompt") or before.get("original_prompt"),
+                 _jsonb(target.get("plan") or {}), _jsonb(specification), _jsonb(layout),
+                 target.get("spec_version") or before.get("spec_version"),
+                 target.get("layout_version") or before.get("layout_version"), view_id, user_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(view_id)
+    else:
+        with sqlite_connection() as conn:
+            cursor = conn.execute(
+                """UPDATE dashboard_views SET name=?,original_prompt=?,plan_json=?,specification_json=?,
+                layout_json=?,spec_version=?,layout_version=?,updated_at=? WHERE id=? AND user_id=?""",
+                (restored_name, target.get("prompt") or before.get("original_prompt"),
+                 json.dumps(target.get("plan") or {}), json.dumps(specification), json.dumps(layout),
+                 target.get("spec_version") or before.get("spec_version"),
+                 target.get("layout_version") or before.get("layout_version"), now, view_id, user_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(view_id)
+    restored = get_dashboard_view(view_id, user_id)
+    revision = save_dashboard_revision(
+        restored,
+        user_id,
+        f"reverted_to_{target.get('revision_number')}",
+        before.get("layout") or [],
+    )
+    return get_dashboard_view(view_id, user_id), revision
+
+
 def update_dashboard_view(view_id: str, user_id: str, name: str | None = None,
                           layout: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     before = get_dashboard_view(view_id, user_id)
@@ -3620,27 +3759,61 @@ def update_dashboard_view(view_id: str, user_id: str, name: str | None = None,
     return get_dashboard_view(view_id,user_id)
 
 
+def persist_dashboard_action(view_id: str, user_id: str, *, name: str | None,
+                             layout: list[dict[str, Any]], specification: dict[str, Any],
+                             revision_type: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Persist one validated dashboard action and exactly one compatible revision."""
+    before = get_dashboard_view(view_id, user_id)
+    now = utc_now()
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            row = conn.execute(
+                """UPDATE public.dashboard_views
+                SET name=%s,layout=%s,specification=%s,layout_version=%s,updated_at=now()
+                WHERE id=%s AND user_id=%s RETURNING *""",
+                (name, _jsonb(layout), _jsonb(specification), "dashboard-layout-v2", view_id, user_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(view_id)
+    else:
+        with sqlite_connection() as conn:
+            cursor = conn.execute(
+                """UPDATE dashboard_views
+                SET name=?,layout_json=?,specification_json=?,layout_version=?,updated_at=?
+                WHERE id=? AND user_id=?""",
+                (name, json.dumps(layout), json.dumps(specification), "dashboard-layout-v2", now, view_id, user_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(view_id)
+    updated = get_dashboard_view(view_id, user_id)
+    revision = save_dashboard_revision(updated, user_id, revision_type, before.get("layout") or [])
+    return get_dashboard_view(view_id, user_id), revision
+
+
 def mutate_dashboard_layout(view_id: str, user_id: str, widget_id: str, operation: str,
                             width: int | None = None, height: int | None = None,
                             direction: int | None = None) -> dict[str, Any]:
-    view=get_dashboard_view(view_id,user_id)
-    layout=[dict(item) for item in view.get("layout") or []]
-    index=next((position for position,item in enumerate(layout) if str(item.get("id"))==widget_id),-1)
-    if index < 0: raise KeyError(widget_id)
+    # Compatibility adapter: callers of the legacy database helper still use the
+    # same validated action executor as the HTTP and canvas paths.
+    view = get_dashboard_view(view_id, user_id)
+    layout = view.get("layout") or []
+    index = next((position for position, item in enumerate(layout) if str(item.get("id")) == widget_id), -1)
+    if index < 0:
+        raise KeyError(widget_id)
     if operation == "remove":
-        layout.pop(index)
+        action = {"type": "DELETE_WIDGET", "widget_id": widget_id}
     elif operation == "resize":
-        if width not in {4,6,8,12} or height is None or not 2 <= height <= 6:
-            raise ValueError("Widget size must use width 4, 6, 8, or 12 and height 2 through 6")
-        layout[index] = {**layout[index],"grid":{**(layout[index].get("grid") or {}),"w":width,"h":height}}
+        action = {"type": "RESIZE_WIDGET", "widget_id": widget_id, "width": width, "height": height}
     elif operation == "move":
-        step=-1 if (direction or 0)<0 else 1
-        target=index+step
-        if target<0 or target>=len(layout): raise ValueError("Widget cannot move farther in that direction")
-        layout[index],layout[target]=layout[target],layout[index]
+        action = {"type": "MOVE_WIDGET", "widget_id": widget_id,
+                  "to_index": index + (-1 if (direction or 0) < 0 else 1)}
     else:
         raise ValueError("Unsupported deterministic layout operation")
-    return update_dashboard_view(view_id,user_id,layout=layout)
+    from .dashboard_workspace import run_dashboard_action
+    result = run_dashboard_action(user_id, "view", view_id, action)
+    if result.status.value != "SUCCESS":
+        raise ValueError(result.error or "Dashboard action failed")
+    return result.dashboard or view
 
 
 def duplicate_dashboard_view(view_id: str, user_id: str, name: str | None = None) -> dict[str, Any]:
