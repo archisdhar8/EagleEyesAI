@@ -10,12 +10,10 @@ const backend = readFileSync("backend/main.py", "utf8");
 
 test("primary Ask is chat-first with a contextual calculated canvas", () => {
   assert.match(ask, /ResearchChat/);
-  assert.match(ask, /ask-split-shell/);
-  assert.match(ask, /role="separator"/);
   assert.match(ask, /CanvasState = "closed" \| "open"/);
   assert.match(ask, /useState<CanvasState>\("closed"\)/);
-  assert.match(ask, /Chat<\/button>/);
-  assert.match(ask, /Analysis<\/button>/);
+  assert.match(ask, /ask-content-shell/);
+  assert.match(ask, /!canvasOpen && <section className="ask-chat-pane"/);
   assert.match(ask, /<AIWorkspace \{\.\.\.dashboardProps\} variant="canvas" onClose=\{closeCanvas\}/);
   assert.doesNotMatch(ask, /Expert tool/);
   assert.match(shared, /Start your analysis/);

@@ -40,7 +40,7 @@ test("Ask EagleEyes starts as full-width chat and reveals a contextual canvas", 
   assert.match(ask, /ask-conversational-workspace/);
   assert.match(ask, /useState<CanvasState>\("closed"\)/);
   assert.match(ask, /variant="canvas"/);
-  assert.match(css, /\.ask-split-shell\{display:grid/);
-  assert.match(css, /\.canvas-closed \.ask-split-shell\{display:block/);
-  assert.match(css, /\.ask-mobile-tabs/);
+  assert.match(ask, /className="ask-content-shell"/);
+  assert.match(css, /\.ask-content-shell>\.ask-chat-pane/);
+  assert.match(ask, /!canvasOpen && <section className="ask-chat-pane"/);
 });

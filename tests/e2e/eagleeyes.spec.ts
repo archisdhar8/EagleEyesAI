@@ -19,7 +19,7 @@ async function buildBoard(page: Page, prompt = "Show my portfolio return and ris
   await expect(page.getByText("Required evidence verified")).toBeVisible();
 }
 
-test("Ask starts chat-first, opens a resizable canvas for visuals, and preserves mobile state", async ({ page }) => {
+test("Ask starts chat-first and opens analysis only for visual requests", async ({ page }) => {
   await installApiMock(page);
   await signIn(page);
   await page.goto("/ask");
@@ -35,24 +35,16 @@ test("Ask starts chat-first, opens a resizable canvas for visuals, and preserves
 
   await askInput.fill("Show my portfolio performance against SPY.");
   await page.getByRole("button", { name: "Ask EagleEyes →" }).click();
-  const divider = page.getByRole("separator", { name: "Resize chat and analysis" });
-  await expect(divider).toHaveAttribute("aria-valuenow", "38");
-  await divider.press("ArrowRight");
-  await expect(divider).toHaveAttribute("aria-valuenow", "40");
+  await expect(page.locator(".ask-canvas-pane")).toBeVisible();
+  await expect(page.locator(".ask-chat-pane")).toHaveCount(0);
   const themeButton = page.getByRole("button", { name: /Light mode|Dark mode/ });
   const themeBefore = await themeButton.textContent();
   await themeButton.click();
   await expect(themeButton).not.toHaveText(themeBefore || "");
 
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole("tab", { name: "Analysis" }).click();
-  await expect(page.locator(".ask-canvas-pane")).toBeVisible();
-  await expect(page.locator(".ask-chat-pane")).toBeHidden();
-  await page.getByRole("tab", { name: "Chat" }).click();
-  await expect(askInput).toHaveValue("");
-  await page.getByRole("tab", { name: "Analysis" }).click();
   await page.getByRole("button", { name: "Close analysis canvas" }).click();
   await expect(page.locator(".ask-canvas-pane")).toHaveCount(0);
+  await expect(page.locator(".ask-chat-pane")).toBeVisible();
 });
 
 test("conversational dashboard edits persist through undo, save, and reload", async ({ page }) => {

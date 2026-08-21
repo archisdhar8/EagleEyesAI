@@ -2993,6 +2993,7 @@ def _security_ranking_chat_tools(user_id: str, question: str, portfolio_id: str 
     payload = research_search_payload(
         rows, holdings=tickers, requested=tickers, limit=min(100, len(tickers)),
     )
+    holding_context = {str(item.get("ticker") or "").upper(): item for item in holdings}
     ranked = [{
         "ticker": row.get("ticker"), "company": row.get("company"),
         "relative_rank": row.get("relative_rank"), "evidence_bucket": row.get("evidence_bucket"),
@@ -3001,6 +3002,8 @@ def _security_ranking_chat_tools(user_id: str, question: str, portfolio_id: str 
         "freshness": (row.get("freshness") or {}).get("status"),
         "strengths": row.get("strengths") or [], "weaknesses": row.get("weaknesses") or [],
         "missing_components": (row.get("field_coverage") or {}).get("missing") or [],
+        "portfolio_weight": holding_context.get(str(row.get("ticker") or "").upper(), {}).get("weight"),
+        "portfolio_risk_contribution": holding_context.get(str(row.get("ticker") or "").upper(), {}).get("risk_contribution"),
     } for row in payload.get("results", [])]
     covered = {str(item.get("ticker", "")).upper() for item in ranked}
     missing = [ticker for ticker in tickers if ticker not in covered]
@@ -3260,16 +3263,26 @@ def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]]) 
         strongest, weakest = ranked[0], ranked[-1]
         missing = list(summary.get("missing") or [])
         if summary.get("focus") == "weakest":
-            weaknesses = ", ".join(item["label"] for item in weakest.get("weaknesses", [])) or "insufficient component coverage"
-            missing_components = ", ".join(weakest.get("missing_components") or [])
+            review_rows = list(reversed(ranked[-5:]))
+            def weakest_line(row: dict[str, Any]) -> str:
+                weaknesses = ", ".join(item.get("label", "") for item in row.get("weaknesses", []) if item.get("label")) or "no covered weakness"
+                missing_components = ", ".join(row.get("missing_components") or []) or "none reported"
+                weight = row.get("portfolio_weight")
+                risk = row.get("portfolio_risk_contribution")
+                portfolio_context = (
+                    f"; portfolio weight **{float(weight):.1%}**" if isinstance(weight, (int, float)) else ""
+                ) + (f"; modeled risk contribution **{float(risk):.1%}**" if isinstance(risk, (int, float)) else "")
+                return (
+                    f"**{row.get('ticker')}** — {row.get('evidence_bucket')} evidence; "
+                    f"covered weaknesses: {weaknesses}; missing: {missing_components}{portfolio_context} [S1]"
+                )
+            review_text = "\n".join(f"{index}. {weakest_line(row)}" for index, row in enumerate(review_rows, 1))
             return (
-                f"Based on the stored comparative research for **{len(ranked)} holdings in your active saved portfolio**, "
-                f"**{weakest['ticker']}** is currently the weakest evidence-ranked holding "
-                f"(**{weakest['evidence_bucket']}**) [S1]. Its weakest covered areas are **{weaknesses}** [S1]."
-                + (f" The missing evidence components are **{missing_components}** [S1]." if missing_components else "")
-                + "\n\nThis means it has the weakest stored evidence profile in this portfolio. It does **not** mean it will have the worst future return, that it is your largest portfolio risk, or that you should sell it."
+                f"I can rank the weakest **stored evidence profiles**, but not declare a future-return loser. "
+                f"Here are the five weakest of **{len(ranked)} covered holdings**, with their missing evidence and portfolio relevance:\n\n{review_text}"
+                + "\n\nThe ordering is evidence quality, not a sell list. A weakly covered small position and a well-covered high-risk position are different problems, so both the evidence gaps and portfolio weight/risk are shown."
                 + (f"\n\nNo comparable stored result was available for: {', '.join(missing)}." if missing else "")
-                + "\n\n**What to verify:** review its evidence freshness, missing components, valuation method, position size, tax impact, and role in the portfolio before making a decision."
+                + "\n\n**What to verify:** refresh missing fundamentals, valuation, business-quality, and industry evidence first; then review position size, tax lots, correlations, and thesis before making a decision."
             )
         middle = ranked[1:-1]
         middle_text = ", ".join(f"**{row['ticker']}** ({row['evidence_bucket']})" for row in middle[:6])
@@ -3991,7 +4004,7 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
     # Both renderers consume this one verified contract. Raw tool evidence is
     # retained for source metadata but cannot bypass the verification gates.
     evidence = [{"label": "Verified Ask analysis", "as_of": datetime.now(timezone.utc).isoformat(),
-                 "url": None, "data": analysis_result, "claim_type": "MODEL_OUTPUT"}]
+                 "url": None, "data": analysis_result, "claim_type": "MODEL_OUTPUT"}, *evidence_rows[:8]]
     try:
         preference_context = product_preferences.ask_context(user.id)
     except Exception as exc:

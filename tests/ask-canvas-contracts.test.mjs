@@ -29,13 +29,13 @@ test("history and saved views are contextual controls instead of rails", () => {
   assert.match(css, /#ask-history-drawer/);
 });
 
-test("analysis can close, reopen, and switch to full-screen mobile panes", () => {
+test("analysis can close and reopen as a contextual full-screen surface", () => {
   assert.match(ask, /onClose=\{closeCanvas\}/);
   assert.match(ask, /analysisLabel} ↗/);
   assert.match(shared, /Open analysis ↗/);
-  assert.match(ask, /role="tab"[\s\S]*Chat<\/button>/);
-  assert.match(ask, /role="tab"[\s\S]*Analysis<\/button>/);
-  assert.match(css, /\.canvas-open \.ask-chat-pane\.mobile-active/);
+  assert.match(ask, /!canvasOpen && <section className="ask-chat-pane"/);
+  assert.match(ask, /canvasOpen && <section className="ask-canvas-pane"/);
+  assert.match(css, /\.ask-content-shell>\.ask-chat-pane/);
 });
 
 test("conversation changes close visible canvas context without deleting artifacts", () => {
