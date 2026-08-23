@@ -154,6 +154,23 @@ def test_visual_suggestion_never_mutates_without_explicit_request() -> None:
     assert interpret_dashboard_request("How concentrated am I?", WIDGETS).intent == DashboardChatIntent.NORMAL_ANSWER
 
 
+def test_phase8_conversational_flow_separates_chat_visual_and_new_analysis() -> None:
+    prior = {"dashboard_widget_id": "sectors", "intent": "PORTFOLIO_RISK", "analytical_context": {
+        "active_capabilities": ["portfolio_risk"], "recent_result_ids": ["result_1234567890abcdef"],
+    }}
+    assert interpret_dashboard_request("Where am I most concentrated?", WIDGETS, prior).intent == DashboardChatIntent.NORMAL_ANSWER
+    visualize = interpret_dashboard_request("Visualize that.", WIDGETS, prior)
+    assert visualize.intent == DashboardChatIntent.CREATE_WIDGET and visualize.requires_new_analysis
+    risk = interpret_dashboard_request("Add my largest risk contributors.", WIDGETS, prior)
+    assert risk.intent == DashboardChatIntent.CREATE_WIDGET and risk.requires_new_analysis
+    market = interpret_dashboard_request("Compare against the current market regime.", WIDGETS, prior)
+    assert market.intent == DashboardChatIntent.CREATE_WIDGET and market.requires_new_analysis
+    backtest = interpret_dashboard_request("Add a five-year backtest against SPY.", WIDGETS, prior)
+    assert backtest.intent == DashboardChatIntent.CREATE_WIDGET and backtest.requires_new_analysis
+    refresh = interpret_dashboard_request("Refresh this analysis using the latest verified data.", WIDGETS, prior)
+    assert refresh.intent == DashboardChatIntent.CREATE_WIDGET and refresh.requires_new_analysis
+
+
 def _ready_dashboard_draft() -> dict:
     plan = deterministic_plan("Show portfolio return and drawdown")
     specification = compile_spec(plan)
@@ -338,6 +355,26 @@ def test_successful_create_uses_typed_executor_and_persists_stable_binding(monke
 
 
 def test_chat_endpoint_returns_typed_dashboard_operation_without_financial_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    request_row = {}
+    monkeypatch.setattr(database, "reserve_ask_request", lambda _user, request_id, question_hash: request_row.setdefault(
+        "row", {"request_id": request_id, "question_hash": question_hash, "state": "RECEIVED"},
+    ))
+    monkeypatch.setattr(database, "bind_ask_request_turn", lambda _user, _request, conversation_id, *_args: request_row["row"].update(
+        {"conversation_id": conversation_id, "state": "EXECUTING"},
+    ) or request_row["row"])
+    monkeypatch.setattr(database, "stage_ask_request_result", lambda _user, _request, staged: request_row["row"].update(
+        {"staged_result": staged, "state": "EXECUTED"},
+    ) or request_row["row"])
+
+    def complete_request(_user, _request, final_state="COMPLETED"):
+        staged = request_row["row"]["staged_result"]
+        return {"conversation_id": request_row["row"]["conversation_id"], "message": {
+            "id": "message-1", "role": "assistant", "content": staged["answer"],
+            "structured_content": staged["structured_content"], "model": staged["model"],
+        }, "sources": staged["sources"], "tool_results": staged["tool_results"]}
+
+    monkeypatch.setattr(database, "complete_ask_request", complete_request)
+    monkeypatch.setattr(database, "fail_ask_request", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(database, "DATABASE_URL", "postgresql://fixture")
     monkeypatch.setattr(database, "initialize", lambda: None)
     monkeypatch.setattr(database, "get_conversation", lambda *_args: {

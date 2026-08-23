@@ -451,6 +451,17 @@ class ModelPortfolioCompareRequest(BaseModel):
 class ModelPortfolioBacktestRequest(BaseModel):
     alternatives: dict[str, dict[str, float]] = Field(min_length=1, max_length=12)
     benchmark: str = Field(default="SPY", min_length=1, max_length=10)
+    start_date: date | None = None
+    end_date: date | None = None
+    rebalance_policy: Literal["monthly", "quarterly", "annual", "buy_and_hold"] = "monthly"
+    transaction_cost_bps: float | None = Field(default=None, ge=0, le=500)
+
+    @model_validator(mode="after")
+    def validate_period(self) -> "ModelPortfolioBacktestRequest":
+        if self.start_date and self.end_date and self.start_date >= self.end_date:
+            raise ValueError("Backtest start_date must be before end_date")
+        self.benchmark = self.benchmark.strip().upper()
+        return self
 
 
 class ModelPortfolioPayload(BaseModel):

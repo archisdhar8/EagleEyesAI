@@ -18,6 +18,12 @@ export type DashboardWidgetSpec = {
   visualization: string;
   grid: { x: number; y: number; w: number; h: number };
   binding?: DashboardDataBinding | null;
+  source_result_id?: string;
+  source_capability?: string;
+  source_category?: "VERIFIED" | "MODEL_OUTPUT" | "MARKET_IMPLIED" | "USER_THESIS";
+  field_mapping?: { data_path: string; shape: "scalar" | "category" | "time_series" | "matrix" | "records" | "distribution"; label_field?: string | null; value_field?: string | null; time_field?: string | null };
+  state?: "CURRENT" | "STALE" | "REFRESHING" | "PARTIAL" | "UNAVAILABLE" | "FAILED" | "PENDING";
+  job_reference?: Record<string, unknown> | null;
 };
 
 export type DashboardAction =
@@ -26,6 +32,9 @@ export type DashboardAction =
   | { type: "DELETE_WIDGET"; widget_id: string }
   | { type: "MOVE_WIDGET"; widget_id: string; to_index?: number; position?: { x: number; y: number } }
   | { type: "RESIZE_WIDGET"; widget_id: string; width: number; height: number }
+  | { type: "CHANGE_VISUALIZATION"; widget_id: string; visualization: string }
+  | { type: "UPDATE_FILTER"; widget_id: string; filters: DashboardDataBinding["filters"] }
+  | { type: "UPDATE_DATE_RANGE"; widget_id: string; period: DashboardDataBinding["period"] }
   | { type: "CLEAR_DASHBOARD" }
   | { type: "RENAME_DASHBOARD"; name: string };
 

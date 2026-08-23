@@ -196,14 +196,19 @@ def verify_results(intent: str, context: PortfolioContext | None, scenario_facto
                    tool_results: list[dict[str, Any]]) -> AskVerification:
     warnings: list[str] = []
     failures: list[str] = []
-    requested = context.total_positions if context else 0
-    coverages = [row.get("coverage") for row in tool_results if isinstance(row.get("coverage"), dict)]
-    evaluated = min((int(row.get("evaluated") or 0) for row in coverages), default=requested)
-    percent = round((evaluated / requested * 100.0) if requested else 100.0, 1)
-    if requested and percent < FULL_COVERAGE_PERCENT:
-        warnings.append(f"Portfolio coverage is {evaluated}/{requested} ({percent:.1f}%).")
-    if requested and percent < PARTIAL_COVERAGE_PERCENT:
-        failures.append("Coverage is too low for a whole-portfolio conclusion.")
+    coverages = [
+        row.get("coverage") for row in tool_results
+        if isinstance(row.get("coverage"), dict) and int((row.get("coverage") or {}).get("requested") or 0) > 0
+    ]
+    coverage_requested = max((int(row.get("requested") or 0) for row in coverages), default=0)
+    evaluated = min(
+        (int(row.get("evaluated") or 0) for row in coverages if int(row.get("requested") or 0) == coverage_requested),
+        default=0,
+    )
+    percent = round((evaluated / coverage_requested * 100.0) if coverage_requested else 100.0, 1)
+    if coverage_requested and percent < FULL_COVERAGE_PERCENT:
+        warnings.append(f"Analytical coverage is {evaluated}/{coverage_requested} ({percent:.1f}%).")
+    low_coverage = bool(coverage_requested and percent < PARTIAL_COVERAGE_PERCENT)
 
     if context:
         mismatched = [
@@ -273,11 +278,16 @@ def verify_results(intent: str, context: PortfolioContext | None, scenario_facto
     ]
     for row in optimizer_rows:
         summary = row.get("summary") or {}
-        optimizer = summary.get("optimizer") or row.get("optimizer") or {}
+        simulation = summary.get("simulation") or summary.get("latest_simulation") or {}
+        optimizer = summary.get("optimizer") or row.get("optimizer") or (
+            simulation.get("optimizer") if isinstance(simulation, dict) else None
+        ) or {}
+        if not optimizer:
+            continue
         diagnostics = summary.get("model_diagnostics") or row.get("model_diagnostics") or {}
         diagnostic_status = diagnostics.get("constraint_status") if isinstance(diagnostics, dict) else ""
         status = str(optimizer.get("status") or optimizer.get("constraint_status") or diagnostic_status or "").upper()
-        optimizer_text = json.dumps(row, default=str).lower()
+        optimizer_text = json.dumps(optimizer, default=str).lower()
         if status in {"INFEASIBLE", "FAILED"} or "infeasible" in optimizer_text or "constraints incompatible" in optimizer_text:
             optimizer_feasible = False
             failures.append("The optimizer did not produce a feasible solution; attempted weights are not recommendations.")
@@ -294,12 +304,17 @@ def verify_results(intent: str, context: PortfolioContext | None, scenario_facto
         if snapshots and not any(row.get("exists") for row in snapshots):
             warnings.append("No previous historical snapshot exists; a since-last-review comparison is unavailable.")
 
+    bounded_screen_intents = {"OPPORTUNITY_RANKING", "VALUATION_RANKING", "MULTIFACTOR_SCREEN"}
+    coverage_blocks_answer = low_coverage and not unavailable and intent not in bounded_screen_intents
+    if coverage_blocks_answer:
+        failures.append("Coverage is too low for a whole-portfolio conclusion.")
+
     recommendation_intents = {"PORTFOLIO_ANALYSIS", "THESIS_REPLACEMENT", "WATCHLIST_COMPARISON", "CASH_ALLOCATION"}
     recommendation_allowed = intent not in recommendation_intents or not failures
-    answer_allowed = not (requested and percent < PARTIAL_COVERAGE_PERCENT)
+    answer_allowed = not coverage_blocks_answer
     status = "FAILED" if not answer_allowed else "PARTIAL" if warnings or failures else "SUCCESS"
-    return AskVerification(status, {"requested": requested, "evaluated": evaluated,
-        "missing": max(0, requested - evaluated), "percent": percent}, scenario_valid,
+    return AskVerification(status, {"requested": coverage_requested, "evaluated": evaluated,
+        "missing": max(0, coverage_requested - evaluated), "percent": percent}, scenario_valid,
         optimizer_feasible is not False, optimizer_feasible, answer_allowed,
         recommendation_allowed, warnings, failures)
 

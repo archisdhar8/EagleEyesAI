@@ -2,11 +2,17 @@
 
 ## Release gate
 
-1. Apply additive migrations in order and record the migration commit.
-2. Run the complete local suite, then the live provider/RLS suite against test users.
-3. Create and restore-test a database backup in an isolated Supabase project.
-4. Deploy a candidate, run the production smoke test, and inspect operational metrics.
-5. Promote only when provider freshness, coverage, board verification, and financial wording checks pass.
+The active path is local/test → controlled production → private beta → limited beta.
+A separate staging environment is not required. Follow
+`EAGLEEYES_CONTROLLED_PRODUCTION_BETA_PLAN_2026-08-22.md` and require its
+fail-closed preflight before any production mutation.
+
+1. Run the complete local suite and disposable PostgreSQL migration validation.
+2. Freeze a clean expected revision and verify a current production backup.
+3. Run `python scripts/phase10_production_preflight.py --phase pre-deploy`.
+4. Apply additive migrations in order, backfill bounded internal scopes, reconcile, and verify.
+5. Deploy privately, run owner smoke plus two-user API/RLS isolation, and inspect operational metrics/alerts.
+6. Expand only after stable elapsed-time private soak evidence.
 
 ## Live isolation and provider checks
 
@@ -34,3 +40,7 @@ EagleEyes provides comparative research and deterministic portfolio analysis. It
 ## Production smoke
 
 Set `RUN_PRODUCTION_SMOKE=1`, `PRODUCTION_API_URL`, and a short-lived `PRODUCTION_SMOKE_ACCESS_TOKEN`, then run `pytest backend/tests/test_production_smoke.py`. The test verifies health, authenticated briefing and Research, operational monitoring, trading-disabled status, request IDs, and security headers.
+
+For the controlled-production owner workflow, use
+`scripts/run_controlled_production_smoke.py` as documented in the active beta
+plan. Do not run provider-refresh or the full local suite against production.

@@ -94,7 +94,7 @@ def test_stock_builder_discloses_universe_and_requested_benchmark(monkeypatch):
     assert "BUY" not in str(result).upper()
 
 
-def test_simulation_api_persists_and_reopens(monkeypatch):
+def test_simulation_api_persists_queued_job_before_work(monkeypatch):
     rows = price_fixture(["AAA", "BBB", "VTI"])
     monkeypatch.setattr(database, "price_history", lambda tickers, limit=10000: [row for row in rows if row["ticker"] in tickers])
     with TestClient(app) as client:
@@ -102,9 +102,9 @@ def test_simulation_api_persists_and_reopens(monkeypatch):
             "holdings": [{"ticker": "AAA", "weight": .6}, {"ticker": "BBB", "weight": .4}],
             "paths": 250, "horizon_years": 2, "seed": 7,
         })
-        assert response.status_code == 200, response.text
+        assert response.status_code == 202, response.text
         created = response.json()
-        reopened = client.get(f"/api/simulations/runs/{created['id']}")
-        compared = client.post(f"/api/simulations/runs/{created['id']}/compare")
-        assert reopened.status_code == 200
-        assert compared.json()["shared_path_fingerprint"] == created["shared_path_fingerprint"]
+        assert created["status"] == "PENDING"
+        job = client.get(f"/api/analytics/jobs/{created['job']['id']}")
+        assert job.status_code == 200
+        assert job.json()["status"] == "QUEUED"

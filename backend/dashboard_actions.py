@@ -87,6 +87,15 @@ class DashboardWidget(BaseModel):
     visualization: str = Field(min_length=2, max_length=80)
     grid: DashboardGrid
     binding: DashboardDataBinding | None = None
+    source_result_id: str | None = Field(default=None, pattern=r"^(?:result|composed)_[a-f0-9]{16,20}$")
+    source_capability: str | None = Field(default=None, min_length=2, max_length=100)
+    source_category: Literal["VERIFIED", "MODEL_OUTPUT", "MARKET_IMPLIED", "USER_THESIS"] | None = None
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "DashboardWidget":
+        if self.widget_type == "canonical_result" and (not self.source_result_id or not self.source_capability):
+            raise ValueError("Canonical result widgets require a verified result reference and capability")
+        return self
 
 
 class DashboardWidgetUpdate(BaseModel):
@@ -150,6 +159,27 @@ class ResizeWidgetAction(BaseModel):
     height: int = Field(ge=2, le=6)
 
 
+class ChangeVisualizationAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal[DashboardActionType.CHANGE_VISUALIZATION]
+    widget_id: str = Field(min_length=1, max_length=120)
+    visualization: str = Field(min_length=2, max_length=80)
+
+
+class UpdateFilterAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal[DashboardActionType.UPDATE_FILTER]
+    widget_id: str = Field(min_length=1, max_length=120)
+    filters: list[DashboardFilter] = Field(max_length=12)
+
+
+class UpdateDateRangeAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal[DashboardActionType.UPDATE_DATE_RANGE]
+    widget_id: str = Field(min_length=1, max_length=120)
+    period: str = Field(pattern=r"^(?:1M|3M|6M|1Y|3Y|5Y|7Y|10Y|20Y)$")
+
+
 class ClearDashboardAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
     type: Literal[DashboardActionType.CLEAR_DASHBOARD]
@@ -163,7 +193,8 @@ class RenameDashboardAction(BaseModel):
 
 DashboardAction = Annotated[
     CreateWidgetAction | UpdateWidgetAction | DeleteWidgetAction | MoveWidgetAction |
-    ResizeWidgetAction | ClearDashboardAction | RenameDashboardAction,
+    ResizeWidgetAction | ChangeVisualizationAction | UpdateFilterAction | UpdateDateRangeAction |
+    ClearDashboardAction | RenameDashboardAction,
     Field(discriminator="type"),
 ]
 DASHBOARD_ACTION_ADAPTER = TypeAdapter(DashboardAction)
@@ -187,9 +218,6 @@ def parse_dashboard_action(value: Any) -> DashboardAction | DashboardActionResul
     action_type = value.get("type") if isinstance(value, dict) else None
     if action_type in {
         DashboardActionType.DUPLICATE_WIDGET.value,
-        DashboardActionType.CHANGE_VISUALIZATION.value,
-        DashboardActionType.UPDATE_FILTER.value,
-        DashboardActionType.UPDATE_DATE_RANGE.value,
     }:
         return _failure(DashboardActionStatus.UNSUPPORTED, f"{action_type} is reserved but not supported in Phase 2", value)
     try:
@@ -281,6 +309,25 @@ def apply_dashboard_action(
             grid = {**(widgets[index].get("grid") or {}), "w": action.width, "h": action.height}
             validated = DashboardGrid.model_validate(grid).model_dump(mode="json")
             widgets[index] = {**widgets[index], "grid": validated}
+        elif isinstance(action, ChangeVisualizationAction):
+            index = _widget_index(widgets, action.widget_id)
+            if index < 0:
+                return _failure(DashboardActionStatus.INVALID, f"Widget not found: {action.widget_id}", action_payload)
+            if action.visualization not in ALLOWED_VISUALIZATIONS or not _visualization_supported(str(widgets[index].get("widget_type")), action.visualization):
+                return _failure(DashboardActionStatus.UNSUPPORTED, "That visualization is not supported for this widget", action_payload)
+            widgets[index] = {**widgets[index], "visualization": action.visualization}
+        elif isinstance(action, (UpdateFilterAction, UpdateDateRangeAction)):
+            index = _widget_index(widgets, action.widget_id)
+            if index < 0:
+                return _failure(DashboardActionStatus.INVALID, f"Widget not found: {action.widget_id}", action_payload)
+            binding = widgets[index].get("binding")
+            if not isinstance(binding, dict):
+                return _failure(DashboardActionStatus.UNSUPPORTED, "Changing data scope requires a new verified analysis", action_payload)
+            if isinstance(action, UpdateFilterAction):
+                binding = {**binding, "filters": [row.model_dump(mode="json") for row in action.filters]}
+            else:
+                binding = {**binding, "period": action.period}
+            widgets[index] = {**widgets[index], "binding": DashboardDataBinding.model_validate(binding).model_dump(mode="json")}
         elif isinstance(action, ClearDashboardAction):
             widgets = []
         elif isinstance(action, RenameDashboardAction):

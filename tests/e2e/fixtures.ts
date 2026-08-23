@@ -190,7 +190,7 @@ export async function installApiMock(page: Page, options: { portfolio?: boolean;
       }
       let resourceType:"draft"|"view"="draft";
       let resourceId=state.job.id;
-      let response="Updated dashboard.";
+      let response="The validated return evidence is available.";
       let actionType="UPDATE_WIDGET";
       if(lower.includes("build me a portfolio overview")){
         state.job=makeJob("conversation-draft",false);

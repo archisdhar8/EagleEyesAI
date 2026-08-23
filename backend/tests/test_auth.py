@@ -31,3 +31,14 @@ def test_auth_rejects_malformed_token_before_network(monkeypatch) -> None:
     with pytest.raises(HTTPException) as error:
         auth.require_user("Bearer bad token")
     assert error.value.status_code == 401
+
+
+def test_production_auth_failure_does_not_spend_a_second_retry_budget(monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("SUPABASE_PUBLISHABLE_KEY", "publishable-key")
+    monkeypatch.setattr(auth.httpx, "get", lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("dns")))
+    monkeypatch.setattr(auth.subprocess, "run", lambda *args, **kwargs: pytest.fail("production must not use curl fallback"))
+    with pytest.raises(HTTPException) as error:
+        auth.require_user("Bearer header.payload.signature")
+    assert error.value.status_code == 503

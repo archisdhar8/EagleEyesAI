@@ -23,7 +23,7 @@ export function shouldOpenCanvasForQuestion(question: string, hasAnalysis: boole
   if (!value) return false;
   if (/\b(dashboard|chart|graph|plot|visual(?:ize|ise|ly|ization|isation)?|heatmap|canvas|widget)\b/.test(value)) return true;
   if (/\b(compare|comparison)\b.*\btable\b|\btable\b.*\b(compare|comparison)\b/.test(value)) return true;
-  if (/\b(show|display|open|view)\b.*\b(performance|exposure|allocation|drawdown|analysis|research view|risk view|portfolio view)\b/.test(value)) return true;
+  if (/\b(show|display|open|view)\b.*\b(performance|return|exposure|allocation|drawdown|analysis|research view|risk view|portfolio view|portfolio risk)\b/.test(value)) return true;
   if (hasAnalysis && /\b(add|remove|delete|move|resize|bigger|smaller|wider|underneath|above|below|rename|save|undo|revert|refresh|duplicate)\b/.test(value)) return true;
   if (hasAnalysis && /\b(make that|change that|compare against|benchmark against)\b/.test(value)) return true;
   return false;
@@ -33,6 +33,7 @@ export function AskPage({ messages, question, setQuestion, onSend, loading, cont
   const pendingQuestionRef = useRef<string | null>(null);
   const [canvasState, setCanvasState] = useState<CanvasState>("closed");
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [mobilePane, setMobilePane] = useState<"chat" | "analysis">("chat");
 
   const dashboardArtifact = controls.artifacts.find(artifact => artifact.artifact_type === "dashboard_view");
   const hasAnalysis = Boolean(dashboardProps.job || dashboardArtifact);
@@ -51,16 +52,19 @@ export function AskPage({ messages, question, setQuestion, onSend, loading, cont
 
   function openCanvas() {
     setCanvasState("open");
+    setMobilePane("analysis");
   }
 
   function closeCanvas() {
     setCanvasState("closed");
+    setMobilePane("chat");
   }
 
   function sendFromChat(value?: string) {
     const request = value ?? question;
-    pendingQuestionRef.current = request;
-    if (shouldOpenCanvasForQuestion(request, hasAnalysis)) openCanvas();
+    const visualRequest = shouldOpenCanvasForQuestion(request, hasAnalysis);
+    pendingQuestionRef.current = visualRequest ? request : null;
+    if (visualRequest) openCanvas();
     onSend(value);
   }
 
@@ -94,11 +98,15 @@ export function AskPage({ messages, question, setQuestion, onSend, loading, cont
     </header>
 
     <div className="ask-content-shell">
-      {!canvasOpen && <section className="ask-chat-pane" aria-label="Conversation">
+      {canvasOpen && <nav className="ask-mobile-pane-tabs" aria-label="Ask workspace view">
+        <button className={mobilePane === "chat" ? "active" : ""} aria-pressed={mobilePane === "chat"} onClick={() => setMobilePane("chat")}>Chat</button>
+        <button className={mobilePane === "analysis" ? "active" : ""} aria-pressed={mobilePane === "analysis"} onClick={() => setMobilePane("analysis")}>Analysis</button>
+      </nav>}
+      <section className={`ask-chat-pane ${mobilePane === "chat" ? "mobile-active" : ""}`} aria-label="Conversation">
         <ResearchChat messages={messages} question={question} setQuestion={setQuestion} onSend={sendFromChat} loading={loading} controls={workspaceControls} variant="workspace" historyOpen={historyOpen} onCloseHistory={() => setHistoryOpen(false)} canvasOpen={canvasOpen} analysisLabel={analysisLabel} onOpenAnalysis={hasAnalysis ? openCanvas : undefined} />
-      </section>}
-      {canvasOpen && <section className="ask-canvas-pane" aria-label="Analysis canvas">
-          <AIWorkspace {...dashboardProps} variant="canvas" onClose={closeCanvas} />
+      </section>
+      {canvasOpen && <section className={`ask-canvas-pane ${mobilePane === "analysis" ? "mobile-active" : ""}`} aria-label="Analysis canvas">
+          <AIWorkspace {...dashboardProps} variant="canvas" onClose={closeCanvas} onRequestAnalysisRefresh={() => sendFromChat("Refresh this analysis using the latest verified data.")} />
         </section>}
     </div>
   </main>;

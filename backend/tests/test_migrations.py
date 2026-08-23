@@ -120,3 +120,13 @@ def test_phase10_preferences_and_alerts_are_additive_and_owner_secured() -> None
         assert f"alter table public.{table} enable row level security" in sql
     assert "in_app_only" in sql and "group_key" in sql and "supersedes_id" in sql
     assert "drop table" not in sql and "drop column" not in sql
+
+
+def test_phase9_scope_migration_supports_company_global_and_portfolio_models() -> None:
+    path = Path(__file__).resolve().parents[2] / "supabase/migrations/202608220005_analytical_scope_keys.sql"
+    sql = path.read_text().lower()
+    assert "add column if not exists scope_key text" in sql
+    assert "alter column portfolio_id drop not null" in sql
+    assert "primary key(user_id,scope_key,dataset_type)" in sql
+    assert "capability_read_models_scope_lookup_idx" in sql
+    assert "drop table" not in sql and "drop column" not in sql

@@ -1,3 +1,4 @@
+import copy
 import time
 
 import pytest
@@ -6,9 +7,43 @@ from fastapi.testclient import TestClient
 from backend import ask_portfolio, database
 from backend.main import (
     _benchmark_outlook_chat_tools, _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
-    _cors_allowed_origins, _decision_workspace_inputs, _execute_chat_plan_tools, _portfolio_chat_tools, _portfolio_risk_chat_tools,
+    _cors_allowed_origins, _cors_allow_origin_regex, _decision_workspace_inputs, _execute_chat_plan_tools, _portfolio_chat_tools, _portfolio_risk_chat_tools,
     _security_ranking_chat_tools, app,
 )
+
+
+def _mock_chat_idempotency(monkeypatch) -> None:
+    requests = {}
+
+    def reserve(user_id, request_id, question_hash):
+        return copy.deepcopy(requests.setdefault(request_id, {
+            "request_id": request_id, "question_hash": question_hash, "state": "RECEIVED",
+        }))
+
+    def bind(user_id, request_id, conversation_id, question, structured):
+        requests[request_id].update({"conversation_id": conversation_id, "state": "EXECUTING"})
+        return copy.deepcopy(requests[request_id])
+
+    def stage(user_id, request_id, staged_result):
+        requests[request_id].update({"staged_result": copy.deepcopy(staged_result), "state": "EXECUTED"})
+        return copy.deepcopy(requests[request_id])
+
+    def complete(user_id, request_id, final_state="COMPLETED"):
+        staged = requests[request_id]["staged_result"]
+        message = {
+            "id": f"assistant-{request_id}", "role": "assistant", "content": staged["answer"],
+            "model": staged["model"], "structured_content": staged["structured_content"],
+        }
+        response = {"conversation_id": requests[request_id]["conversation_id"], "message": message,
+                    "sources": staged["sources"], "tool_results": staged["tool_results"]}
+        requests[request_id].update({"state": final_state, "response": copy.deepcopy(response)})
+        return response
+
+    monkeypatch.setattr("backend.main.database.reserve_ask_request", reserve)
+    monkeypatch.setattr("backend.main.database.bind_ask_request_turn", bind)
+    monkeypatch.setattr("backend.main.database.stage_ask_request_result", stage)
+    monkeypatch.setattr("backend.main.database.complete_ask_request", complete)
+    monkeypatch.setattr("backend.main.database.fail_ask_request", lambda *args, **kwargs: None)
 
 
 def test_health_reports_storage_and_disables_trading() -> None:
@@ -30,6 +65,29 @@ def test_remote_storage_failure_does_not_block_health(monkeypatch) -> None:
         response = client.get("/api/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_readiness_is_separate_and_fails_closed_without_required_schema(monkeypatch) -> None:
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def execute(self, *_):
+            return self
+
+        def fetchone(self):
+            return {"core": True, "read_models": False, "jobs": True}
+
+    monkeypatch.setattr(database, "DATABASE_URL", "postgresql://configured")
+    monkeypatch.setattr(database, "postgres_connection", Connection)
+    with TestClient(app) as client:
+        response = client.get("/api/health/readiness")
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready", "storage": "supabase"}
+    assert response.headers["cache-control"] == "no-store"
 
 
 def test_production_guard_adds_request_id_security_headers_and_metrics() -> None:
@@ -73,6 +131,8 @@ def test_production_cors_accepts_only_exact_configured_origins() -> None:
         _cors_allowed_origins("*")
     with pytest.raises(RuntimeError, match="exact http"):
         _cors_allowed_origins("eagleeyes-ai.vercel.app")
+    assert _cors_allow_origin_regex("production") is None
+    assert "localhost" in (_cors_allow_origin_regex("development") or "")
 
 
 def test_provider_status_has_safe_sqlite_fallback() -> None:
@@ -164,16 +224,10 @@ def test_move_out_ten_stocks_returns_long_rebalance_review_with_saved_context(mo
     tools, evidence = _portfolio_chat_tools(
         "user-1", "Rebalance the portfolio by identifying the 10 stocks to move out"
     )
-    review = next(item for item in tools if item["tool_name"] == "portfolio_rebalance_review")
-    assert len(review["summary"]["candidates"]) == 10
-    assert review["summary"]["candidates"][0]["ticker"] == "S11"
-    assert evidence[-1]["claim_type"] == "MODEL_OUTPUT"
-    answer = _deterministic_chat_answer("PORTFOLIO_ANALYSIS", tools)
-    assert answer is not None
-    assert "10 holdings" in answer
-    assert "S11" in answer and "S2" in answer
-    assert "exit-or-replacement review" in answer
-    assert "tax" in answer.lower() and "thesis" in answer.lower()
+    review = next(item for item in tools if item["tool_name"] == "portfolio_exit_review")
+    assert review["status"] == "pending"
+    assert review["job_id"]
+    assert evidence == []
 
 
 def test_benchmark_outlook_compares_saved_holdings_with_spy_without_promising_returns(monkeypatch) -> None:
@@ -191,14 +245,9 @@ def test_benchmark_outlook_compares_saved_holdings_with_spy_without_promising_re
     monkeypatch.setattr("backend.main.theses.decision_contexts", lambda user_id, tickers: {ticker: {} for ticker in tickers})
     tools, _ = _benchmark_outlook_chat_tools("user-1")
     summary = tools[0]["summary"]
-    assert summary["outperform_candidates"][0]["ticker"] == "AAPL"
-    assert summary["underperform_candidates"][0]["ticker"] == "MU"
-    answer = _deterministic_chat_answer("BENCHMARK_OUTLOOK", tools)
-    assert answer is not None
-    assert "No system can know" in answer
-    assert "AAPL" in answer and "+5.0%" in answer
-    assert "MU" in answer and "-4.0%" in answer
-    assert "guaranteed forecast" in answer
+    assert tools[0]["status"] == "unavailable"
+    assert summary["benchmark"] == "SPY"
+    assert "not return forecasts" in summary["message"]
 
 
 def test_saved_portfolio_risk_answer_never_needs_provider_calls(monkeypatch) -> None:
@@ -588,10 +637,10 @@ def test_research_refresh_updates_saved_universe(monkeypatch) -> None:
         )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["searched"] == 2
-    assert payload["markets_found"] == 1
+    assert payload["status"] == "PENDING"
+    assert payload["job_id"]
     assert payload["evidence_refresh"] == {"tickers": ["NVDA"], "providers": {"tiingo": 252}, "warnings": []}
-    assert {row["ticker"] for row in payload["research"]} == {"AAPL", "NVDA"}
+    assert payload["research"] == []
 
 
 def test_portfolio_update_and_research_include_new_holding() -> None:
@@ -626,7 +675,12 @@ def test_new_workspace_starts_without_a_portfolio() -> None:
     assert response.json() == []
 
 
-def test_chat_returns_grounded_reply(monkeypatch) -> None:
+def test_chat_returns_grounded_deterministic_reply(monkeypatch) -> None:
+    _mock_chat_idempotency(monkeypatch)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("ASK_GEMINI_ENRICHMENT", "1")
+    monkeypatch.setattr("backend.main.record_metric", lambda *args, **kwargs: None)
+    monkeypatch.setattr("backend.main.record_capability_request", lambda *args, **kwargs: None)
     monkeypatch.setattr("backend.main.database.DATABASE_URL", "postgresql://test")
     monkeypatch.setattr("backend.main.database.initialize", lambda: None)
     monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{"id": "portfolio-1"}])
@@ -639,11 +693,17 @@ def test_chat_returns_grounded_reply(monkeypatch) -> None:
     with TestClient(app) as client:
         response = client.post("/api/chat/messages", json={"question": "What changed?"})
     assert response.status_code == 200
-    assert response.json()["message"]["content"] == "Grounded answer [S1]"
+    assert response.json()["message"]["model"].startswith("deterministic")
+    assert response.json()["message"]["content"]
     assert response.json()["sources"][0]["id"] == "S1"
 
 
-def test_chat_returns_tool_fallback_instead_of_502_when_gemini_times_out(monkeypatch) -> None:
+def test_chat_returns_tool_reply_instead_of_502_when_gemini_is_optional(monkeypatch) -> None:
+    _mock_chat_idempotency(monkeypatch)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("ASK_GEMINI_ENRICHMENT", "1")
+    monkeypatch.setattr("backend.main.record_metric", lambda *args, **kwargs: None)
+    monkeypatch.setattr("backend.main.record_capability_request", lambda *args, **kwargs: None)
     monkeypatch.setattr("backend.main.database.DATABASE_URL", "postgresql://test")
     monkeypatch.setattr("backend.main.database.initialize", lambda: None)
     monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{"id": "portfolio-1"}])
@@ -656,34 +716,34 @@ def test_chat_returns_tool_fallback_instead_of_502_when_gemini_times_out(monkeyp
     with TestClient(app) as client:
         response = client.post("/api/chat/messages", json={"question": "Explain the available stored evidence."})
     assert response.status_code == 200
-    assert response.json()["message"]["model"] == "deterministic-timeout-fallback-v1"
-    assert "did not respond within the interactive deadline" in response.json()["message"]["content"]
+    assert response.json()["message"]["model"].startswith("deterministic")
+    assert response.json()["message"]["content"]
 
 
-def test_chat_analysis_tools_execute_sequentially_without_background_futures(monkeypatch) -> None:
-    order = []
+def test_chat_analysis_tools_execute_independent_nodes_concurrently(monkeypatch) -> None:
+    intervals = {}
 
-    def fake_tool(tool, user_id, question):
-        order.extend([f"start:{tool}", f"finish:{tool}"])
+    def fake_tool(tool, user_id, question, *args, **kwargs):
+        started = time.monotonic()
+        time.sleep(.15)
+        intervals[tool] = (started, time.monotonic())
         return ([{"tool_name": tool, "status": "complete", "title": tool}], [
             {"label": tool, "as_of": "2026-08-18", "data": {}}
         ])
 
     monkeypatch.setattr("backend.main._instrumented_ask_tool", fake_tool)
-    results, evidence, steps = _execute_chat_plan_tools(
+    results, evidence, steps, outcomes = _execute_chat_plan_tools(
         ("first", "second"), "user-1", "question", time.monotonic(),
     )
 
-    assert order == ["start:first", "finish:first", "start:second", "finish:second"]
+    assert max(intervals["first"][0], intervals["second"][0]) < min(intervals["first"][1], intervals["second"][1])
     assert [item["tool_name"] for item in results] == ["first", "second"]
     assert [item["label"] for item in evidence] == ["first", "second"]
-    assert steps == [
-        {"tool_name": "first", "state": "SUCCESS"},
-        {"tool_name": "second", "state": "SUCCESS"},
-    ]
+    assert [step["state"] for step in steps] == ["SUCCESS", "SUCCESS"]
+    assert all(outcome.status.value == "SUCCESS" for outcome in outcomes if outcome.required)
 
 
-def test_portfolio_chat_runs_simulation_as_visible_tool(monkeypatch) -> None:
+def test_portfolio_chat_queues_simulation_as_visible_tool(monkeypatch) -> None:
     monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{"id": "portfolio-1", "holdings": [{"ticker": "SPY", "weight": 1.0}]}])
     monkeypatch.setattr("backend.main.database.load_profile", lambda user_id: {"horizon_years": 10})
     monkeypatch.setattr("backend.main.database.list_goals", lambda user_id: [])
@@ -700,14 +760,10 @@ def test_portfolio_chat_runs_simulation_as_visible_tool(monkeypatch) -> None:
     })
     tools, evidence = _portfolio_chat_tools("user-1", "Simulate a recession with accelerating inflation and an oil shock")
     assert tools[0]["tool_name"] == "portfolio_decision_lab"
-    assert tools[0]["status"] == "complete"
-    assert tools[0]["input_summary"]["scenario"] == {
-        "economic_state": "recession", "inflation_state": "accelerating",
-        "rate_state": "unconditioned", "shocks": ["oil"],
-    }
-    assert tools[0]["summary"]["strategies"][0]["median_wealth"] == 125000.0
-    assert evidence[0]["label"] == "Portfolio Decision Lab tool result"
-    assert simulation_calls == [{"price_limit_per_ticker": 1260}]
+    assert tools[0]["status"] == "pending"
+    assert tools[0]["job_id"]
+    assert evidence == []
+    assert simulation_calls == []
 
 
 def test_scenario_fast_answer_compares_paths_without_claiming_a_twenty_year_recession() -> None:
@@ -752,12 +808,10 @@ def test_security_ranking_is_limited_to_saved_holdings(monkeypatch) -> None:
         lambda tickers, price_limit=756: requested.append((list(tickers), price_limit)) or rows,
     )
     tools, evidence = _security_ranking_chat_tools("user-1", "Which holdings have the strongest and weakest research evidence?")
-    assert requested == [(["AAPL", "MU"], 260)]
-    assert tools[0]["summary"]["universe"]["tickers"] == ["AAPL", "MU"]
-    assert [row["ticker"] for row in tools[0]["summary"]["ranked"]] == ["AAPL", "MU"]
-    answer = _deterministic_chat_answer("RESEARCH_RANKING", tools)
-    assert answer is not None and "AAPL" in answer and "MU" in answer
-    assert "expected return" in answer
+    assert requested == []
+    assert tools[0]["status"] == "unavailable"
+    assert "versioned portfolio context" in tools[0]["summary"]["message"]
+    assert evidence == []
 
 
 def test_worst_holding_answer_focuses_on_weakest_evidence_not_a_sell_call(monkeypatch) -> None:
@@ -776,13 +830,8 @@ def test_worst_holding_answer_focuses_on_weakest_evidence_not_a_sell_call(monkey
     ]
     monkeypatch.setattr("backend.main.security_research", lambda tickers, price_limit=756: rows)
     tools, _ = _security_ranking_chat_tools("user-1", "what is my worst stock holding")
-    assert tools[0]["summary"]["focus"] == "weakest"
-    answer = _deterministic_chat_answer("RESEARCH_RANKING", tools)
-    assert answer is not None
-    assert "**MU**" in answer
-    assert "weakest evidence-ranked" in answer
-    assert "does **not** mean it will have the worst future return" in answer
-    assert "sell" in answer
+    assert tools[0]["status"] == "unavailable"
+    assert "versioned portfolio context" in tools[0]["summary"]["message"]
 
 
 def test_slow_narrator_fallback_preserves_company_tool_evidence() -> None:
@@ -819,7 +868,7 @@ def test_earnings_fallback_formats_period_values_and_thesis_status() -> None:
     assert "{'fiscal_period'" not in answer
 
 
-def test_company_chat_uses_cached_research_and_returns_article_lineage(monkeypatch) -> None:
+def test_company_chat_queues_deep_research_without_inline_provider_work(monkeypatch) -> None:
     monkeypatch.setattr("backend.main.database.DATABASE_URL", "postgresql://test")
     monkeypatch.setattr("backend.main.database.search_security_master", lambda query, limit=5: {
         "results": [{"ticker": "MU", "name": "Micron Technology, Inc."}] if query.upper() == "MU" else [],
@@ -845,16 +894,15 @@ def test_company_chat_uses_cached_research_and_returns_article_lineage(monkeypat
         "metadata": {"source": "Example Wire", "summary": "Management discussed demand."},
     }]})
 
-    tools, evidence = _company_research_chat_tools("What is the latest outlook for MU and memory pricing?")
+    monkeypatch.setattr("backend.main.analytics_jobs.compatible_completed", lambda **kwargs: None)
+    monkeypatch.setattr("backend.main.analytics_jobs.submit_job", lambda **kwargs: type("Job", (), {"job_id": "job-1"})())
+    tools, evidence = _company_research_chat_tools("What is the latest outlook for MU and memory pricing?", "user-1")
 
     assert refreshed == []
     assert tools[0]["tool_name"] == "company_research_refresh"
-    assert tools[0]["status"] == "complete"
-    assert tools[0]["summary"]["news"]["article_count"] == 1
-    assert tools[0]["summary"]["revenue_growth"] == .18
-    assert tools[0]["input_summary"]["cache_only"] is True
-    assert evidence[0]["label"] == "MU cached company research"
-    assert evidence[1]["url"] == "https://example.com/mu-outlook"
+    assert tools[0]["status"] == "pending"
+    assert tools[0]["job_id"] == "job-1"
+    assert evidence == []
 
 
 def test_conversation_memory_summary_is_bounded_and_tracks_tools() -> None:

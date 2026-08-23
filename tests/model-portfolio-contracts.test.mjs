@@ -42,5 +42,5 @@ test("Ask EagleEyes starts as full-width chat and reveals a contextual canvas", 
   assert.match(ask, /variant="canvas"/);
   assert.match(ask, /className="ask-content-shell"/);
   assert.match(css, /\.ask-content-shell>\.ask-chat-pane/);
-  assert.match(ask, /!canvasOpen && <section className="ask-chat-pane"/);
+  assert.match(ask, /<section className={`ask-chat-pane/);
 });

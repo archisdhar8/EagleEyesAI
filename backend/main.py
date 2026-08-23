@@ -21,17 +21,23 @@ import pandas as pd
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import database, ask_orchestration, ask_portfolio, attention, dashboard_chat, decision_journal, earnings_intelligence, evidence, forecasting, model_portfolios, portfolio_intelligence, portfolio_overview, product_preferences, thesis_monitor, theses
+from . import analytics_jobs, database, ask_execution, ask_orchestration, ask_portfolio, attention, capability_planner, dashboard_chat, dashboard_presentation, decision_journal, earnings_intelligence, evidence, feature_flags, forecasting, model_portfolios, phase6_domains, portfolio_intelligence, portfolio_overview, product_preferences, read_models, thesis_monitor, theses
 from .ask_runtime import (
     PortfolioContext, attach_coverage as attach_ask_coverage, build_portfolio_context, parse_scenario_factors,
-    scenario_payload, verified_analysis_result, verify_results,
+    scenario_payload, verify_results,
 )
+from .analytical_contract import (
+    AnalysisResult, AnalysisStatus, DependencyResult, adapt_legacy_tool_result, apply_request_verification,
+    with_canonical_result, stable_fingerprint,
+)
+from .analytical_telemetry import DeadlineContext, record_dependency as record_capability_dependency
+from .analytical_telemetry import record_request as record_capability_request, utc_now as telemetry_utc_now
 from .analysis import latest_macro, macro_factor_dashboard, run_analysis, security_research
 from .auth import AuthenticatedUser, optional_user, require_user
-from .chat import ask_gemini, retrieve_evidence
+from .chat import ask_gemini, clear_gemini_deadline, plan_capabilities_gemini, retrieve_evidence, set_gemini_deadline
 from .company_markets import refresh_company_markets
 from .dashboard_workspace import (
     DraftRequest, RevisionRequest, SaveViewRequest, UpdateViewRequest, WidgetAddRequest,
@@ -123,6 +129,16 @@ ERROR_MONITORING = configure_error_monitoring()
 app.middleware("http")(production_guard)
 
 
+@app.exception_handler(analytics_jobs.JobCapacityError)
+async def analytical_job_capacity_error(_: Request, exc: analytics_jobs.JobCapacityError) -> JSONResponse:
+    return JSONResponse({"detail": str(exc)}, status_code=429, headers={"Retry-After": "30"})
+
+
+@app.exception_handler(analytics_jobs.HeavyAnalyticsDisabledError)
+async def heavy_analytics_disabled(_: Request, exc: analytics_jobs.HeavyAnalyticsDisabledError) -> JSONResponse:
+    return JSONResponse({"detail": str(exc)}, status_code=503, headers={"Retry-After": "60"})
+
+
 def _cors_allowed_origins(raw: str | None = None) -> list[str]:
     configured = os.getenv("CORS_ALLOWED_ORIGINS", "") if raw is None else raw
     origins = []
@@ -136,10 +152,17 @@ def _cors_allowed_origins(raw: str | None = None) -> list[str]:
     return list(dict.fromkeys(origins))
 
 
+def _cors_allow_origin_regex(app_env: str | None = None) -> str | None:
+    environment = os.getenv("APP_ENV", "development") if app_env is None else app_env
+    if environment.strip().lower() == "production":
+        return None
+    return r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_allowed_origins(),
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origin_regex=_cors_allow_origin_regex(),
     allow_credentials=False,
     allow_methods=["*"] ,
     allow_headers=["*"] ,
@@ -202,6 +225,7 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = None
     workspace: Literal["general", "research", "portfolio"] = "general"
     page_context: ChatPageContext | None = None
+    request_id: str | None = Field(default=None, min_length=8, max_length=120, pattern=r"^[A-Za-z0-9._:-]+$")
 
 
 class EvidenceReviewRequest(BaseModel):
@@ -331,7 +355,30 @@ def health() -> dict[str, Any]:
     }
 
 
-def _overview(user: AuthenticatedUser, include_research: bool = True) -> dict[str, Any]:
+@app.get("/api/health/readiness")
+def readiness() -> JSONResponse:
+    try:
+        if database.DATABASE_URL:
+            with database.postgres_connection() as conn:
+                row = conn.execute(
+                    "SELECT to_regclass('public.portfolios') IS NOT NULL AS core, "
+                    "to_regclass('public.capability_read_models') IS NOT NULL AS read_models, "
+                    "to_regclass('public.analytical_jobs') IS NOT NULL AS jobs"
+                ).fetchone()
+            ready = bool(row["core"] and row["read_models"] and row["jobs"])
+        else:
+            database.initialize()
+            ready = True
+    except Exception:
+        ready = False
+    return JSONResponse(
+        {"status": "ready" if ready else "not_ready", "storage": database.storage_mode()},
+        status_code=200 if ready else 503,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _overview(user: AuthenticatedUser, include_research: bool = False) -> dict[str, Any]:
     database.ensure_user_workspace(user.id, InvestorProfile().model_dump(mode="json"))
     # Supabase-backed reads each establish an isolated connection.  These
     # datasets are independent, so fetch them concurrently to keep the shared
@@ -493,9 +540,9 @@ def home_briefing(background_tasks: BackgroundTasks,
         if portfolio_id:
             nightly = database.portfolio_health_history(user.id, portfolio_id, 1, "NIGHTLY")
             if not nightly or str(nightly[0].get("effective_at", ""))[:10] != datetime.now(timezone.utc).date().isoformat():
-                background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio_id, "NIGHTLY")
+                _recalculate_portfolio_overview_safely(user.id, portfolio_id, "NIGHTLY")
             elif any(str(item.get("materiality")) in {"CRITICAL", "HIGH"} for item in composed.get("items", [])):
-                background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio_id, "MATERIAL_EVENT")
+                _recalculate_portfolio_overview_safely(user.id, portfolio_id, "MATERIAL_EVENT")
     return payload
 
 
@@ -663,12 +710,33 @@ def portfolios(user: AuthenticatedUser = Depends(require_user)) -> list[dict[str
     return database.list_portfolios(user.id)
 
 
+def _invalidate_read_models_safely(user_id: str, dataset_type: str, version: str, *,
+                                   tickers: list[str] | None = None,
+                                   effective_through: str | None = None) -> None:
+    """Bound invalidation to the user's portfolios that contain changed securities."""
+    selected = {str(value).upper() for value in (tickers or [])}
+    try:
+        for portfolio in database.list_portfolios(user_id):
+            owned = {str(row.get("ticker") or "").upper() for row in portfolio.get("holdings") or []}
+            if selected and not selected.intersection(owned):
+                continue
+            read_models.invalidate_for_upstream_change(
+                user_id, str(portfolio["id"]), dataset_type, version, effective_through,
+            )
+    except Exception as exc:
+        record_metric("ask.read_model.invalidation.failure", tags={"error_class": type(exc).__name__,
+                      "upstream_dependency": dataset_type}, persist=True)
+
+
 @app.post("/api/portfolios")
 def create_portfolio(payload: PortfolioPayload, background_tasks: BackgroundTasks,
                      user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     portfolio = database.save_portfolio(payload.name, [item.model_dump(mode="json") for item in payload.holdings], user_id=user.id)
     _invalidate_research_overview_cache(user.id)
-    background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio["id"], "PORTFOLIO_CHANGE")
+    _invalidate_read_models_safely(user.id, "portfolio_holdings", build_portfolio_context(portfolio).version,
+                                   tickers=[str(row.get("ticker") or "") for row in portfolio.get("holdings") or []],
+                                   effective_through=portfolio.get("updated_at"))
+    _recalculate_portfolio_overview_safely(user.id, portfolio["id"], "PORTFOLIO_CHANGE")
     return portfolio
 
 
@@ -678,7 +746,10 @@ def update_portfolio(portfolio_id: str, payload: PortfolioPayload, background_ta
     try:
         portfolio = database.save_portfolio(payload.name, [item.model_dump(mode="json") for item in payload.holdings], portfolio_id, user.id)
         _invalidate_research_overview_cache(user.id)
-        background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio_id, "PORTFOLIO_CHANGE")
+        _invalidate_read_models_safely(user.id, "portfolio_holdings", build_portfolio_context(portfolio).version,
+                                       tickers=[str(row.get("ticker") or "") for row in portfolio.get("holdings") or []],
+                                       effective_through=portfolio.get("updated_at"))
+        _recalculate_portfolio_overview_safely(user.id, portfolio_id, "PORTFOLIO_CHANGE")
         return portfolio
     except KeyError as exc:
         raise HTTPException(404, "Portfolio not found") from exc
@@ -702,7 +773,10 @@ def import_portfolio(payload: CsvImport, background_tasks: BackgroundTasks,
     holdings = result["holdings"]
     portfolio = database.save_portfolio(payload.name, holdings, user_id=user.id)
     _invalidate_research_overview_cache(user.id)
-    background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio["id"], "PORTFOLIO_CHANGE")
+    _invalidate_read_models_safely(user.id, "portfolio_holdings", build_portfolio_context(portfolio).version,
+                                   tickers=[str(row.get("ticker") or "") for row in portfolio.get("holdings") or []],
+                                   effective_through=portfolio.get("updated_at"))
+    _recalculate_portfolio_overview_safely(user.id, portfolio["id"], "PORTFOLIO_CHANGE")
     return {
         "portfolio": portfolio,
         "validated_rows": len(holdings),
@@ -819,8 +893,28 @@ def _calculate_portfolio_overview(user_id: str, portfolio_id: str | int,
         "scenarios": list((latest_briefing or {}).get("scenarios") or [])[:12],
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+    snapshot_hash = portfolio_overview.input_hash(input_payload)
+    # Phase 2 compatibility migration: the legacy snapshot remains the source
+    # for the Today UI, while Ask reads independently versioned projections.
+    # A projection failure must not destroy the completed legacy snapshot.
+    try:
+        read_models.build_capability_read_models(
+            user_id, portfolio, result,
+            input_fingerprint=build_portfolio_context(portfolio).version,
+            profile=profile, thesis_rows=active_theses, security_bundle=security_bundle,
+            watchlist_bundle=watchlist_bundle, briefing=latest_briefing,
+            baseline_available=previous_nightly is not None,
+            snapshot_identity={"input_hash": snapshot_hash, "effective_at": result.get("as_of")},
+            baseline_identity=({"id": previous_nightly_rows[0].get("id"),
+                                "input_hash": previous_nightly_rows[0].get("input_hash"),
+                                "effective_at": previous_nightly_rows[0].get("effective_at")}
+                               if previous_nightly_rows else None),
+        )
+    except Exception as exc:
+        record_metric("ask.read_model.build_batch.failure", tags={"error_class": type(exc).__name__}, persist=True)
+        LOGGER.warning("Capability read-model projection failed for %s: %s", portfolio_id, type(exc).__name__)
     snapshot = database.save_portfolio_health_snapshot(
-        user_id, portfolio_id, result, trigger, portfolio_overview.input_hash(input_payload),
+        user_id, portfolio_id, result, trigger, snapshot_hash,
     )
     database.sync_portfolio_actions(user_id, portfolio_id, result.get("actions", []))
     return _portfolio_overview_response(user_id, portfolio_id, snapshot)
@@ -828,10 +922,26 @@ def _calculate_portfolio_overview(user_id: str, portfolio_id: str | int,
 
 def _recalculate_portfolio_overview_safely(user_id: str, portfolio_id: str | int, trigger: str) -> None:
     try:
-        _calculate_portfolio_overview(user_id, portfolio_id, trigger)
+        _queue_portfolio_overview_rebuild(user_id, portfolio_id, trigger)
     except Exception as exc:
         record_metric("portfolio.overview.refresh.failure", tags={"error_type": type(exc).__name__, "trigger": trigger})
         LOGGER.warning("Portfolio overview refresh failed for %s: %s", portfolio_id, type(exc).__name__)
+
+
+def _queue_portfolio_overview_rebuild(user_id: str, portfolio_id: str | int,
+                                      trigger: str) -> analytics_jobs.AnalyticsJob:
+    portfolio = database.get_portfolio(portfolio_id, user_id)
+    tickers = sorted({str(row.get("ticker") or "").upper() for row in portfolio.get("holdings") or []
+                      if row.get("ticker") and str(row.get("ticker")).upper() != "CASH"})
+    versions = database.analytical_dataset_versions(
+        user_id, str(portfolio_id), ["portfolio_holdings", "prices", "fundamentals", "theses", "thesis_monitor"],
+    )
+    payload = {"operation": "portfolio_overview_rebuild", "portfolio_id": str(portfolio_id),
+               "tickers": tickers, "trigger": trigger}
+    fingerprint = stable_fingerprint({"portfolio": build_portfolio_context(portfolio).version,
+                                      "dataset_versions": versions, "tickers": tickers})
+    return analytics_jobs.submit_job(job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD,
+        user_id=user_id, portfolio_id=str(portfolio_id), payload=payload, input_fingerprint=fingerprint)
 
 
 @app.get("/api/portfolios/{portfolio_id}/overview")
@@ -841,7 +951,10 @@ def get_portfolio_overview(portfolio_id: str, user: AuthenticatedUser = Depends(
     except KeyError as exc:
         raise HTTPException(404, "Portfolio not found") from exc
     cached = database.latest_portfolio_health(user.id, portfolio_id)
-    return _portfolio_overview_response(user.id, portfolio_id, cached) if cached else _calculate_portfolio_overview(user.id, portfolio_id, "MANUAL")
+    if cached:
+        return _portfolio_overview_response(user.id, portfolio_id, cached)
+    job = _queue_portfolio_overview_rebuild(user.id, portfolio_id, "MANUAL")
+    return analytics_jobs.pending_analysis(job, "portfolio_overview").model_dump(mode="json")
 
 
 @app.post("/api/portfolios/{portfolio_id}/overview/recalculate")
@@ -853,11 +966,13 @@ def recalculate_portfolio_overview(portfolio_id: str, background_tasks: Backgrou
         raise HTTPException(404, "Portfolio not found") from exc
     cached = database.latest_portfolio_health(user.id, portfolio_id)
     if cached:
-        background_tasks.add_task(_recalculate_portfolio_overview_safely, user.id, portfolio_id, "MANUAL")
+        job = _queue_portfolio_overview_rebuild(user.id, portfolio_id, "MANUAL")
         response = _portfolio_overview_response(user.id, portfolio_id, cached)
         response["refresh_queued"] = True
+        response["job_id"] = job.job_id
         return response
-    return _calculate_portfolio_overview(user.id, portfolio_id, "MANUAL")
+    job = _queue_portfolio_overview_rebuild(user.id, portfolio_id, "MANUAL")
+    return analytics_jobs.pending_analysis(job, "portfolio_overview").model_dump(mode="json")
 
 
 @app.put("/api/portfolio-actions/{action_id}/state")
@@ -1064,6 +1179,8 @@ def post_learning_tutor_message(thread_id: str, payload: LearningTutorMessagePay
 def put_profile(profile: InvestorProfile, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     saved = database.save_profile(profile.model_dump(mode="json"), user.id)
     _invalidate_research_overview_cache(user.id)
+    _invalidate_read_models_safely(user.id, "portfolio_profile", str(read_models.dataset_descriptor(saved)["version"]),
+                                   effective_through=saved.get("updated_at"))
     return saved
 
 
@@ -1145,8 +1262,15 @@ def plan_guidance(user: AuthenticatedUser = Depends(require_user)) -> dict[str, 
 
 
 @app.post("/api/providers/refresh")
-def refresh_providers(force: bool = Query(default=True), _: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    return refresh_scenarios(force=force)
+def refresh_providers(force: bool = Query(default=True), user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    payload = refresh_scenarios(force=force)
+    version = str(read_models.dataset_descriptor(payload)["version"])
+    _invalidate_read_models_safely(user.id, "prediction_markets", version,
+                                   effective_through=payload.get("fetched_at"))
+    phase6_domains.invalidate_domain(user.id, "prediction_market_observations", version,
+                                     portfolio_ids=[str(row["id"]) for row in database.list_portfolios(user.id)],
+                                     effective_through=payload.get("fetched_at"))
+    return payload
 
 
 @app.get("/api/providers/status")
@@ -1163,7 +1287,7 @@ def providers_health(_: AuthenticatedUser = Depends(require_user)) -> dict[str, 
 def refresh_named_provider(
     provider: Literal["fred", "prices", "prediction_markets", "sec"],
     tickers: str = Query(default="SPY", max_length=200),
-    _: AuthenticatedUser = Depends(require_user),
+    user: AuthenticatedUser = Depends(require_user),
 ) -> dict[str, Any]:
     selected = list(dict.fromkeys(value.strip().upper() for value in tickers.split(",") if value.strip()))[:10]
     if provider == "fred":
@@ -1175,6 +1299,29 @@ def refresh_named_provider(
     else:
         payload = refresh_scenarios(force=True)
         rows = len(payload.get("contracts", []))
+    dataset_type = {"fred": "macro_state", "prices": "prices", "sec": "fundamentals",
+                    "prediction_markets": "prediction_markets"}[provider]
+    _invalidate_read_models_safely(
+        user.id, dataset_type, str(read_models.dataset_descriptor({"provider": provider, "rows": rows,
+        "at": datetime.now(timezone.utc).isoformat()})["version"]),
+        tickers=selected if provider in {"prices", "sec"} else None,
+        effective_through=datetime.now(timezone.utc).isoformat(),
+    )
+    domain_dataset = {"fred": "macro_observations", "prices": "market_prices",
+                      "sec": "fundamentals", "prediction_markets": "prediction_market_observations"}[provider]
+    phase6_domains.invalidate_domain(
+        user.id, domain_dataset,
+        str(read_models.dataset_descriptor({"provider": provider, "rows": rows,
+            "at": datetime.now(timezone.utc).isoformat()})["version"]),
+        tickers=selected if provider in {"prices", "sec"} else None,
+        portfolio_ids=[str(row["id"]) for row in database.list_portfolios(user.id)] if provider == "prediction_markets" else None,
+        effective_through=datetime.now(timezone.utc).isoformat(),
+    )
+    if provider == "prices":
+        phase6_domains.invalidate_domain(
+            user.id, "prices", str(read_models.dataset_descriptor({"rows": rows, "tickers": selected})["version"]),
+            tickers=selected, effective_through=datetime.now(timezone.utc).isoformat(),
+        )
     return {"provider": provider, "rows": rows, "health": build_provider_health()}
 
 
@@ -1189,9 +1336,19 @@ def regimes(limit: int = Query(default=240, ge=1, le=1000), _: AuthenticatedUser
 
 
 @app.get("/api/research")
-def research(tickers: str = Query(default=""), _: AuthenticatedUser = Depends(require_user)) -> list[dict[str, Any]]:
+def research(tickers: str = Query(default=""), user: AuthenticatedUser = Depends(require_user)) -> Any:
     values = [ticker.strip().upper() for ticker in tickers.split(",") if ticker.strip()]
-    return security_research(values[:50])
+    if len(values) <= 3:
+        return security_research(values)
+    payload = {"tickers": values[:50], "price_limit": 756}
+    fingerprint = stable_fingerprint(payload)
+    completed = analytics_jobs.compatible_completed(user_id=user.id, job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD,
+                                                     input_fingerprint=fingerprint)
+    if completed:
+        return completed.result.data
+    job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD, user_id=user.id,
+                                    payload=payload, input_fingerprint=fingerprint)
+    return analytics_jobs.pending_analysis(job, "company_research_build").model_dump(mode="json")
 
 
 def _decision_workspace_inputs(user_id: str, portfolio_id: str | None = None) -> tuple[list[dict[str, Any]], list[str]]:
@@ -1228,7 +1385,10 @@ def investment_theses(
 @app.post("/api/theses", status_code=201)
 def create_investment_thesis(payload: InvestmentThesisPayload, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     try:
-        return theses.create_thesis(user.id, payload)
+        result = theses.create_thesis(user.id, payload)
+        _invalidate_read_models_safely(user.id, "theses", str(read_models.dataset_descriptor(theses.list_theses(user.id))["version"]),
+                                       tickers=[payload.ticker], effective_through=result.get("updated_at") or result.get("created_at"))
+        return result
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -1265,7 +1425,10 @@ def update_investment_thesis(
     thesis_id: str, payload: InvestmentThesisPayload, user: AuthenticatedUser = Depends(require_user),
 ) -> dict[str, Any]:
     try:
-        return theses.update_thesis(user.id, thesis_id, payload)
+        result = theses.update_thesis(user.id, thesis_id, payload)
+        _invalidate_read_models_safely(user.id, "theses", str(read_models.dataset_descriptor(theses.list_theses(user.id))["version"]),
+                                       tickers=[payload.ticker], effective_through=result.get("updated_at") or result.get("created_at"))
+        return result
     except KeyError as exc:
         raise HTTPException(404, "Thesis not found") from exc
     except ValueError as exc:
@@ -1280,27 +1443,28 @@ def investment_thesis_history(thesis_id: str, user: AuthenticatedUser = Depends(
         raise HTTPException(404, "Thesis not found") from exc
 
 
-def _monitor_classifier(enabled: bool):
-    if not enabled:
-        return None
-    from .chat import classify_thesis_evidence
-    calls = 0
-    def classify(item: dict[str, Any], items: list[thesis_monitor.MonitoringEvidence]):
-        nonlocal calls
-        if calls >= 6:
-            raise RuntimeError("Qualitative monitoring call budget reached")
-        calls += 1
-        return classify_thesis_evidence(item, items)
-    return classify
-
-
 @app.get("/api/theses/{thesis_id}/monitor")
 def thesis_monitor_status(
     thesis_id: str, include_ai: bool = Query(default=True),
     user: AuthenticatedUser = Depends(require_user),
-) -> thesis_monitor.ThesisMonitoringResult:
+) -> dict[str, Any]:
     try:
-        return thesis_monitor.evaluate_thesis(user.id, thesis_id, classifier=_monitor_classifier(include_ai))
+        deterministic = thesis_monitor.evaluate_thesis(user.id, thesis_id, classifier=None)
+        if not include_ai:
+            return deterministic.model_dump(mode="json")
+        thesis = theses.get_thesis(user.id, thesis_id)
+        payload = {"thesis_ids": [thesis_id], "include_qualitative": True,
+                   "thesis_versions": {thesis_id: thesis["current_version"]}}
+        fingerprint = stable_fingerprint(payload)
+        completed = analytics_jobs.compatible_completed(user_id=user.id, job_type=analytics_jobs.JobType.THESIS_MONITOR,
+                                                         input_fingerprint=fingerprint)
+        if completed:
+            return completed.result.model_dump(mode="json")
+        job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.THESIS_MONITOR, user_id=user.id,
+                                        payload=payload, input_fingerprint=fingerprint)
+        return analytics_jobs.pending_analysis(job, "thesis_monitor",
+            data={"deterministic_monitor": deterministic.model_dump(mode="json")},
+            limitations=["Qualitative classification is pending; deterministic breakers and thresholds are current."]).model_dump(mode="json")
     except KeyError as exc:
         raise HTTPException(404, "Thesis not found") from exc
 
@@ -1313,13 +1477,15 @@ def security_thesis_monitor(
     item = theses.active_thesis(user.id, ticker.strip().upper())
     if item is None:
         return {"thesis": None, "monitor": None, "message": "No active investment thesis."}
-    return {"thesis": item, "monitor": thesis_monitor.evaluate_thesis(user.id, str(item["id"]), classifier=_monitor_classifier(include_ai))}
+    return {"thesis": item, "monitor": thesis_monitor_status(str(item["id"]), include_ai, user)}
 
 
 @app.post("/api/theses/{thesis_id}/reviews", status_code=201)
 def mark_thesis_reviewed(thesis_id: str, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     try:
-        result = thesis_monitor.evaluate_thesis(user.id, thesis_id, classifier=_monitor_classifier(True), use_cache=False)
+        # A review action records the deterministic state immediately. Qualitative
+        # monitoring is a separate durable analytical dependency.
+        result = thesis_monitor.evaluate_thesis(user.id, thesis_id, classifier=None, use_cache=False)
         return thesis_monitor.mark_reviewed(user.id, thesis_id, result)
     except KeyError as exc:
         raise HTTPException(404, "Thesis not found") from exc
@@ -2206,7 +2372,7 @@ def portfolio_forecast_scenario(payload: PortfolioForecastScenarioRequest,
 
 
 @app.post("/api/research/refresh")
-def refresh_research(payload: ResearchRefresh, _: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+def refresh_research(payload: ResearchRefresh, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     values = list(dict.fromkeys(
         ticker.strip().upper() for ticker in payload.tickers if ticker.strip() and ticker.upper() != "CASH"
     ))[:50]
@@ -2216,25 +2382,27 @@ def refresh_research(payload: ResearchRefresh, _: AuthenticatedUser = Depends(re
     ))
     evidence = refresh_security_evidence(ingest_values)
     master_records = database.sync_security_master(ingest_values) if ingest_values else 0
-    current = security_research(values)
-    coverage_snapshots = database.save_security_coverage_snapshots(current) if ingest_values else 0
-    companies = {row["ticker"]: row.get("company") or row["ticker"] for row in current}
-    provider = refresh_company_markets(companies)
+    if ingest_values:
+        _invalidate_read_models_safely(
+            user.id, "fundamentals", str(read_models.dataset_descriptor(evidence)["version"]),
+            tickers=ingest_values, effective_through=datetime.now(timezone.utc).isoformat(),
+        )
+    job_payload = {"tickers": values, "price_limit": 756}
+    fingerprint = stable_fingerprint({"request": job_payload, "ingestion": evidence})
+    job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD,
+                                    user_id=user.id, payload=job_payload, input_fingerprint=fingerprint)
     return {
-        "research": security_research(values),
-        "provider": "Polymarket",
-        "searched": provider["searched"],
-        "markets_found": len(provider["markets"]),
-        "warnings": [*evidence["warnings"], *provider["warnings"]],
+        "status": "PENDING", "job_id": job.job_id, "research": [],
+        "warnings": evidence["warnings"],
         "evidence_refresh": evidence, "security_master_records": master_records,
-        "coverage_snapshots": coverage_snapshots,
+        "coverage_snapshots": 0,
     }
 
 
-@app.post("/api/analyses")
-def create_analysis(request: AnalysisRequest, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+def _optimization_job_input(request: AnalysisRequest, user: AuthenticatedUser) -> tuple[dict[str, Any], str | None]:
     if request.portfolio is not None:
         holdings = [item.model_dump(mode="json") for item in request.portfolio.holdings]
+        portfolio_id = request.portfolio_id
     else:
         portfolios = database.list_portfolios(user.id)
         portfolio_id = request.portfolio_id or (portfolios[0]["id"] if portfolios else None)
@@ -2261,38 +2429,30 @@ def create_analysis(request: AnalysisRequest, user: AuthenticatedUser = Depends(
         [{key: item.get(key) for key in sorted(item)} for item in analysis_holdings],
         key=lambda item: (str(item.get("ticker", "")), str(item.get("account_type", ""))),
     )
-    cache_payload = {
-        "cache_version": "portfolio-analysis-equity-session-v2",
+    payload = {
+        "cache_version": "portfolio-optimization-job-input-v1",
         "market_session": market_session,
         "holdings": normalized_holdings,
         "profile": profile.model_dump(mode="json"),
+        "constraints": {"restrictions": profile.restrictions, "objectives": profile.objectives.model_dump(mode="json")},
+        "turnover_limits": None, "trading_cost_model": None,
+        "tax_lot_state": {"available": False, "coverage": 0},
     }
-    cache_key = hashlib.sha256(
-        json.dumps(cache_payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-    ).hexdigest()
-    cached = database.cached_analysis(cache_key, user.id)
-    if cached is not None:
-        return {
-            **cached,
-            "cache_status": "hit",
-            "analysis_cache_key": cache_key,
-            "market_session": market_session,
-        }
-    result = run_analysis(holdings, profile)
-    result = {
-        **result,
-        "cache_status": "miss",
-        "analysis_cache_key": cache_key,
-        "market_session": market_session,
-    }
-    request_snapshot = {
-        **request.model_dump(mode="json"),
-        "analysis_cache_key": cache_key,
-        "market_session": market_session,
-        "cache_version": "portfolio-analysis-equity-session-v2",
-    }
-    database.save_analysis(result["id"], request_snapshot, result, user.id)
-    return result
+    return payload, str(portfolio_id) if portfolio_id is not None else None
+
+
+@app.post("/api/analyses", status_code=202)
+def create_analysis(request: AnalysisRequest, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    payload, portfolio_id = _optimization_job_input(request, user)
+    fingerprint = stable_fingerprint(payload)
+    completed = analytics_jobs.compatible_completed(user_id=user.id, job_type=analytics_jobs.JobType.OPTIMIZATION,
+                                                     input_fingerprint=fingerprint)
+    if completed:
+        return completed.result.model_dump(mode="json") | {"job": completed.model_dump(mode="json", exclude={"result"})}
+    job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.OPTIMIZATION, user_id=user.id,
+                                    portfolio_id=portfolio_id, payload=payload, input_fingerprint=fingerprint)
+    return analytics_jobs.pending_analysis(job, "portfolio_optimization",
+        data={"deterministic_evidence": {"eligible_holdings": len(payload["holdings"]), "market_session": payload["market_session"]}}).model_dump(mode="json")
 
 
 @app.get("/api/analyses/latest")
@@ -2305,18 +2465,33 @@ def get_latest_analysis(
 
 
 @app.post("/api/portfolio/analysis")
-def portfolio_analysis(request: AnalysisRequest, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+def portfolio_analysis(request: AnalysisRequest, background_tasks: BackgroundTasks,
+                       user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     return create_analysis(request, user)
 
 
-@app.post("/api/simulations/runs")
-def create_simulation_run(payload: SimulationRunInput, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+@app.post("/api/simulations/runs", status_code=202)
+def create_simulation_run(payload: SimulationRunInput, background_tasks: BackgroundTasks,
+                          user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    request_payload = payload.model_dump(mode="json")
+    fingerprint = stable_fingerprint({"request": request_payload, "price_dataset": read_models.dataset_descriptor(
+        database.price_history([row.ticker for row in payload.holdings], 1))})
+    completed = analytics_jobs.compatible_completed(user_id=user.id, job_type=analytics_jobs.JobType.SIMULATION,
+                                                     input_fingerprint=fingerprint)
+    if completed:
+        return completed.result.model_dump(mode="json") | {"job": completed.model_dump(mode="json", exclude={"result"})}
+    job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.SIMULATION, user_id=user.id,
+                                    portfolio_id=str(payload.portfolio_id) if payload.portfolio_id else None,
+                                    payload=request_payload, input_fingerprint=fingerprint)
+    return analytics_jobs.pending_analysis(job, "portfolio_simulation").model_dump(mode="json")
+
+
+@app.get("/api/analytics/jobs/{job_id}")
+def analytical_job_status(job_id: str, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     try:
-        result = run_simulation(payload)
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-    database.save_simulation_run(user.id, result)
-    return result
+        return analytics_jobs.get_job(user.id, job_id).model_dump(mode="json")
+    except KeyError as exc:
+        raise HTTPException(404, "Analytical job not found") from exc
 
 
 @app.get("/api/simulations/runs/{run_id}")
@@ -2360,30 +2535,50 @@ def optimize_simulation_run(run_id: str, user: AuthenticatedUser = Depends(requi
     return {"id": run_id, "decision_frontier": choices, "diagnostics": [], "note": "No option is labeled the single best portfolio."}
 
 
-@app.post("/api/builders/etf/optimize")
+def _queue_optimizer_operation(user_id: str, operation: str, request_payload: dict[str, Any],
+                               portfolio_id: str | None = None) -> dict[str, Any]:
+    payload = {"operation": operation, "request": request_payload,
+               "tax_lot_state": {"available": False, "coverage": 0}, "trading_cost_model": None}
+    fingerprint = stable_fingerprint(payload)
+    completed = analytics_jobs.compatible_completed(user_id=user_id, job_type=analytics_jobs.JobType.OPTIMIZATION,
+                                                     input_fingerprint=fingerprint)
+    if completed:
+        return completed.result.model_dump(mode="json") | {"job": completed.model_dump(mode="json", exclude={"result"})}
+    job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.OPTIMIZATION, user_id=user_id,
+                                    portfolio_id=portfolio_id, payload=payload, input_fingerprint=fingerprint)
+    return analytics_jobs.pending_analysis(job, "portfolio_optimization").model_dump(mode="json")
+
+
+@app.post("/api/builders/etf/optimize", status_code=202)
 def build_etf_allocation(payload: ETFAllocationRequest, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    result = optimize_etfs(payload)
-    result["id"] = database.save_builder_run(user.id, "etf", payload.model_dump(mode="json"), result)
-    return result
+    return _queue_optimizer_operation(user.id, "etf_allocation", payload.model_dump(mode="json"))
 
 
-@app.post("/api/builders/stocks/optimize")
+@app.post("/api/builders/stocks/optimize", status_code=202)
 def build_stock_basket(payload: StockBasketRequest, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    result = optimize_stocks(payload)
-    result["id"] = database.save_builder_run(user.id, "stock", payload.model_dump(mode="json"), result)
-    return result
+    return _queue_optimizer_operation(user.id, "stock_basket", payload.model_dump(mode="json"))
 
 
-@app.post("/api/model-portfolios/compare")
+@app.post("/api/model-portfolios/compare", status_code=202)
 def compare_model_portfolio(payload: ModelPortfolioCompareRequest,
-                            _: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    return model_portfolios.compare(payload)
+                            user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    return _queue_optimizer_operation(user.id, "model_portfolio_compare", payload.model_dump(mode="json"))
 
 
-@app.post("/api/model-portfolios/backtest")
+@app.post("/api/model-portfolios/backtest", status_code=202)
 def backtest_model_portfolio(payload: ModelPortfolioBacktestRequest,
-                             _: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    return model_portfolios.backtest(payload)
+                             user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    request_payload = payload.model_dump(mode="json")
+    symbols = sorted({ticker for weights in payload.alternatives.values() for ticker in weights} | {payload.benchmark, "SPY"})
+    fingerprint = stable_fingerprint({"request": request_payload, "price_dataset": read_models.dataset_descriptor(
+        database.price_history(symbols, limit_per_ticker=1))})
+    completed = analytics_jobs.compatible_completed(user_id=user.id, job_type=analytics_jobs.JobType.BACKTEST,
+                                                     input_fingerprint=fingerprint)
+    if completed:
+        return completed.result.model_dump(mode="json") | {"job": completed.model_dump(mode="json", exclude={"result"})}
+    job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.BACKTEST, user_id=user.id,
+                                    payload=request_payload, input_fingerprint=fingerprint)
+    return analytics_jobs.pending_analysis(job, "portfolio_backtest").model_dump(mode="json")
 
 
 @app.get("/api/model-portfolios")
@@ -2515,6 +2710,7 @@ def operations_metrics(_: AuthenticatedUser = Depends(require_user)) -> dict[str
             "latest_validation": database.validation_history(1),
         },
         "error_monitoring": ERROR_MONITORING,
+        "analytics_jobs": analytics_jobs.operational_health(),
     }
 
 
@@ -2620,14 +2816,6 @@ _CHAT_SECURITY_STOPWORDS = {
 }
 
 _CHAT_RESEARCH_CACHE = TTLCache(max_entries=128)
-# Render's free instance has a 512 MB memory ceiling. Chat tools can build
-# pandas/numpy research matrices, so running several of them concurrently (and
-# leaving timed-out futures alive) can exhaust the process even after the HTTP
-# request has already returned. One bounded analysis slot keeps peak memory
-# predictable; narration and ordinary API traffic remain concurrent.
-_CHAT_ANALYSIS_SLOTS = threading.BoundedSemaphore(
-    max(1, min(2, int(os.getenv("CHAT_ANALYSIS_CONCURRENCY", "1"))))
-)
 
 
 def _resolve_chat_tickers(question: str) -> list[str]:
@@ -2719,79 +2907,40 @@ def _thesis_monitor_chat_tools(user_id: str, question: str) -> tuple[list[dict[s
             tools.append({"tool_name": "thesis_monitor", "status": "complete", "title": f"{ticker} thesis monitor", "ticker": ticker,
                           "summary": {"thesis": None, "message": "No active investment thesis."}})
             continue
-        result = thesis_monitor.evaluate_thesis(user_id, str(item["id"]), classifier=_monitor_classifier(True))
+        result = thesis_monitor.evaluate_thesis(user_id, str(item["id"]), classifier=None)
+        job_payload = {"thesis_ids": [str(item["id"])], "include_qualitative": True,
+                       "thesis_versions": {str(item["id"]): item.get("current_version", 1)}}
+        fingerprint = stable_fingerprint(job_payload)
+        completed = analytics_jobs.compatible_completed(user_id=user_id, job_type=analytics_jobs.JobType.THESIS_MONITOR,
+                                                         input_fingerprint=fingerprint)
+        job = completed or analytics_jobs.submit_job(job_type=analytics_jobs.JobType.THESIS_MONITOR, user_id=user_id,
+                                                      payload=job_payload, input_fingerprint=fingerprint)
         payload = result.model_dump(mode="json")
-        tools.append({"tool_name": "thesis_monitor", "status": "complete", "title": f"{ticker} thesis monitor", "ticker": ticker, "summary": payload})
-        grounded.append({"label": f"{ticker} structured thesis monitor", "as_of": result.evaluated_at.isoformat(), "url": None, "data": payload})
+        tools.append({"tool_name": "thesis_monitor", "status": "complete" if completed else "pending",
+                      "title": f"{ticker} thesis monitor", "ticker": ticker, "job_id": job.job_id,
+                      "summary": {**payload, "qualitative_classification": "complete" if completed else "pending"}})
+        grounded.append({"label": f"{ticker} deterministic thesis monitor", "as_of": result.evaluated_at.isoformat(), "url": None, "data": payload})
     return tools, grounded
 
 
-def _company_research_chat_tools(question: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _company_research_chat_tools(question: str, user_id: str = "anonymous") -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     tickers = _resolve_chat_tickers(question)
     if not tickers:
         return [], []
-    cache_key = ",".join(sorted(tickers))
-    cached = _CHAT_RESEARCH_CACHE.get(cache_key)
-    if cached is not None:
-        from .operational_monitoring import record_metric
-        record_metric("chat.company_research_cache_hit")
-        return cached
-    raw = database.security_data(tickers, price_limit=260) if database.DATABASE_URL else {"news": []}
-    try:
-        stored_rows = security_research(tickers, price_limit=260, stored=raw)
-    except TypeError:  # Compatibility for injected/test research adapters.
-        stored_rows = security_research(tickers)
-    rows = {row["ticker"]: row for row in stored_rows}
-    news_by_ticker: dict[str, list[dict[str, Any]]] = {}
-    for item in raw.get("news", []):
-        news_by_ticker.setdefault(str(item.get("ticker", "")).upper(), []).append(item)
-    tools: list[dict[str, Any]] = []
-    evidence: list[dict[str, Any]] = []
-    for ticker in tickers:
-        row = rows.get(ticker, {})
-        articles = news_by_ticker.get(ticker, [])[:12]
-        article_summaries = [{
-            "title": item.get("title"), "published_at": item.get("published_at"), "source_url": item.get("source_url"),
-            "source": (item.get("metadata") or {}).get("source"), "summary": (item.get("metadata") or {}).get("summary"),
-        } for item in articles]
-        missing = [label for key, label in (
-            ("price", "current price history"), ("fundamentals_as_of", "recent fundamentals"),
-        ) if row.get(key) is None]
-        if not articles:
-            missing.append("recent company news")
-        warnings = []
-        if missing:
-            warnings.append(f"Missing: {', '.join(missing)}.")
-        tool = {
-            "tool_name": "company_research_refresh", "status": "partial" if warnings else "complete", "title": f"{ticker} company evidence", "ticker": ticker,
-            "input_summary": {"news_lookback_days": 90, "cache_only": True, "refresh_queued": bool(missing)},
-            "summary": {
-                "company": row.get("company") or ticker, "price": row.get("price"), "price_as_of": row.get("price_as_of"),
-                "fundamentals_as_of": row.get("fundamentals_as_of"), "revenue_growth": row.get("revenue_growth"),
-                "net_margin": row.get("net_margin"), "valuation": row.get("valuation_evidence") or {},
-                "market_statistics": row.get("market_statistics") or {}, "component_coverage": row.get("component_coverage") or {},
-                "news": {"article_count": len(articles), "articles": article_summaries},
-                "warnings": warnings, "model_version": "company-chat-research-v2-cached",
-            },
-        }
-        tools.append(tool)
-        evidence.append({
-            "label": f"{ticker} cached company research", "as_of": row.get("price_as_of") or row.get("fundamentals_as_of"),
-            "url": row.get("fundamental_statistics", {}).get("source") or row.get("source"),
-            "data": {key: row.get(key) for key in (
-                "ticker", "company", "sector", "industry", "price", "price_as_of", "fundamentals_as_of", "revenue_growth",
-                "net_margin", "valuation_evidence", "market_statistics", "fundamental_statistics", "news_sentiment",
-                "component_coverage", "risk_flags", "data_quality",
-            )} | {"refresh_warnings": warnings},
-        })
-        for article in article_summaries[:8]:
-            evidence.append({
-                "label": f"{ticker} news: {article.get('title') or 'Untitled article'}", "as_of": article.get("published_at"),
-                "url": article.get("source_url"), "data": {"ticker": ticker, **article},
-            })
-    result = (tools, evidence)
-    _CHAT_RESEARCH_CACHE.put(cache_key, result, ttl_seconds=120)
-    return result
+    payload = {"tickers": sorted(tickers), "price_limit": 756}
+    fingerprint = stable_fingerprint({"request": payload, "stored_dataset": read_models.dataset_descriptor(
+        database.security_data(tickers, price_limit=1) if database.DATABASE_URL else {"tickers": tickers})})
+    completed = analytics_jobs.compatible_completed(user_id=user_id, job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD,
+                                                     input_fingerprint=fingerprint)
+    if completed and completed.result:
+        return ([{"tool_name": "company_research_refresh", "status": "complete",
+                  "title": "Materialized company research", "job_id": completed.job_id,
+                  "summary": completed.result.data}], [])
+    job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD,
+                                    user_id=user_id, payload=payload, input_fingerprint=fingerprint)
+    return ([{"tool_name": "company_research_refresh", "status": "pending",
+              "title": "Company research rebuild", "job_id": job.job_id, "summary": {"tickers": tickers,
+              "message": "The deep company research build is queued; no provider refresh or broad calculation ran in Ask."}}], [])
 
 
 def _simulation_scenario_from_question(question: str) -> dict[str, Any]:
@@ -2826,36 +2975,31 @@ def _portfolio_chat_tools(user_id: str, question: str, portfolio_id: str | None 
                     "profile": database.load_profile(user_id) or {},
                     "goals": database.list_goals(user_id),
                     "scenario": _simulation_scenario_from_question(question),
-                    # Keep interactive portfolio chat within the free Render
-                    # instance's memory envelope; the full Decision Lab still
-                    # supports larger user-requested runs.
                     "paths": 300 if len(portfolio["holdings"]) > 40 else 500,
                     "seed": 90210,
                 })
-                result = run_simulation(simulation_input, price_limit_per_ticker=1260)
-                if re.search(r"\b\d{1,2}\s*%", question):
-                    result.setdefault("warnings", []).append(
-                        "The engine conditions on historical states; it does not impose the question's exact percentage as an instantaneous market shock."
-                    )
-                database.save_simulation_run(user_id, result)
-                strategies = [{
-                    "key": item["strategy_key"], "label": item.get("label") or item["strategy_key"].replace("_", " ").title(),
-                    "median_wealth": item["wealth_percentiles"]["p50"],
-                    "probability_of_loss": item["probability_of_loss"],
-                    "modeled_drawdown": item["drawdown_percentiles"]["p10"],
-                    "robustness": item["robustness"],
-                } for item in result["outcomes"]]
-                tool_result = {
-                    "tool_name": "portfolio_decision_lab", "status": "complete", "title": "Portfolio simulation",
-                    "run_id": result["id"],
-                    "input_summary": {"paths": simulation_input.paths, "horizon_years": simulation_input.horizon_years or simulation_input.profile.horizon_years, "scenario": simulation_input.scenario.model_dump()},
-                    "summary": {"strategies": strategies, "warnings": result.get("warnings", []), "model_version": result["model_version"]},
-                }
-                tool_results.append(tool_result)
-                tool_evidence.append({
-                    "label": "Portfolio Decision Lab tool result", "as_of": result["created_at"], "url": None,
-                    "data": {"run_id": result["id"], "input": tool_result["input_summary"], "outcomes": strategies, "warnings": result.get("warnings", []), "assumptions": result.get("assumptions", []), "lineage": result.get("lineage", [])},
-                })
+                job_payload = simulation_input.model_dump(mode="json")
+                fingerprint = stable_fingerprint({"request": job_payload, "price_dataset": read_models.dataset_descriptor(
+                    database.price_history([row.ticker for row in simulation_input.holdings], 1))})
+                completed = analytics_jobs.compatible_completed(user_id=user_id, job_type=analytics_jobs.JobType.SIMULATION,
+                                                                 input_fingerprint=fingerprint)
+                job = completed or analytics_jobs.submit_job(job_type=analytics_jobs.JobType.SIMULATION, user_id=user_id,
+                    portfolio_id=str(portfolio.get("id")) if portfolio.get("id") else None,
+                    payload=job_payload, input_fingerprint=fingerprint)
+                if completed and completed.result:
+                    result = completed.result.data
+                    strategies = [{"key": item["strategy_key"], "median_wealth": item["wealth_percentiles"]["p50"],
+                                   "probability_of_loss": item["probability_of_loss"], "modeled_drawdown": item["drawdown_percentiles"]["p10"]}
+                                  for item in result.get("outcomes") or []]
+                    tool_results.append({"tool_name": "portfolio_decision_lab", "status": "complete",
+                        "title": "Compatible portfolio simulation", "run_id": result.get("id"), "job_id": job.job_id,
+                        "summary": {"strategies": strategies, "warnings": result.get("warnings", []), "model_version": result.get("model_version")}})
+                    tool_evidence.append({"label": "Compatible completed portfolio simulation", "as_of": result.get("created_at"),
+                                          "url": None, "data": result})
+                else:
+                    tool_results.append({"tool_name": "portfolio_decision_lab", "status": "pending",
+                        "title": "Portfolio simulation", "job_id": job.job_id,
+                        "summary": {"message": "An updated compatible simulation is queued. Current concentration and risk evidence remain available now."}})
             except Exception as exc:
                 tool_results.append({
                     "tool_name": "portfolio_decision_lab", "status": "failed", "title": "Portfolio simulation",
@@ -2902,12 +3046,28 @@ def _portfolio_chat_tools(user_id: str, question: str, portfolio_id: str | None 
         "move out", "remove", "exit", "sell", "trim", "reduce", "replace",
     ))
     if exit_review_requested and active_portfolio and active_portfolio.get("holdings"):
+        research_tickers = sorted({str(row.get("ticker") or "").upper() for row in active_portfolio["holdings"]
+                                   if row.get("ticker") and str(row.get("ticker")).upper() != "CASH"})
+        research_payload = {"tickers": research_tickers, "price_limit": 756}
+        research_fingerprint = stable_fingerprint(research_payload)
+        completed_research = analytics_jobs.compatible_completed(user_id=user_id,
+            job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD, input_fingerprint=research_fingerprint)
+        if not completed_research:
+            research_job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD,
+                user_id=user_id, portfolio_id=str((active_portfolio or {}).get("id")) if (active_portfolio or {}).get("id") else None,
+                payload=research_payload, input_fingerprint=research_fingerprint)
+            tool_results.append({"tool_name": "portfolio_exit_review", "status": "pending",
+                "title": "Portfolio exit review", "job_id": research_job.job_id,
+                "summary": {"message": "Deep holding research is queued; no broad company calculation ran in Ask."}})
+            exit_review_requested = False
+    if exit_review_requested and active_portfolio and active_portfolio.get("holdings"):
         holdings = list(active_portfolio.get("holdings") or [])
         tickers = list(dict.fromkeys(
             str(item.get("ticker") or "").upper() for item in holdings
             if item.get("ticker") and str(item.get("ticker") or "").upper() != "CASH"
         ))
-        rows = security_research(tickers, price_limit=260)
+        materialized = completed_research.result.data if completed_research and completed_research.result else {}
+        rows = list((materialized or {}).get("research") or [])
         payload = research_search_payload(rows, holdings=tickers, requested=tickers, limit=min(100, len(tickers)))
         contexts = theses.decision_contexts(user_id, tickers)
         weights = {str(item.get("ticker") or "").upper(): float(item.get("weight") or 0) for item in holdings}
@@ -2986,25 +3146,36 @@ def _security_ranking_chat_tools(user_id: str, question: str, portfolio_id: str 
         result = {"tool_name": "security_ranking", "status": "unavailable", "title": "Holdings research ranking",
                   "summary": {"message": "Save supported security holdings before ranking their research evidence."}}
         return [result], []
-    # A comparative ranking needs a recent trading year, not the broader default
-    # history. Keeping this bounded matters for large saved portfolios on the
-    # interactive Render request budget.
-    rows = security_research(tickers, price_limit=260)
-    payload = research_search_payload(
-        rows, holdings=tickers, requested=tickers, limit=min(100, len(tickers)),
-    )
+    if not context:
+        return [{"tool_name": "security_ranking", "status": "unavailable", "title": "Holdings research ranking",
+                 "summary": {"message": "A versioned portfolio context is required for fast ranking."}}], []
+    loaded = read_models.load_compatible_read_model(user_id, context.portfolio_id, "portfolio_opportunity", context.version)
+    if not loaded.model:
+        return [{"tool_name": "security_ranking", "status": "unavailable", "title": "Holdings research ranking",
+                 "summary": {"message": loaded.reason},
+                 "read_model": {"type": "portfolio_opportunity", "state": loaded.state.value,
+                                "legacy_adapter_used": False}}], []
+    rows = list(loaded.model.data.get("ranked_holdings") or loaded.model.data.get("holdings") or [])
     holding_context = {str(item.get("ticker") or "").upper(): item for item in holdings}
-    ranked = [{
+    ranked = sorted([{
         "ticker": row.get("ticker"), "company": row.get("company"),
-        "relative_rank": row.get("relative_rank"), "evidence_bucket": row.get("evidence_bucket"),
-        "bucket_explanation": row.get("bucket_explanation"),
-        "research_confidence": (row.get("freshness") or {}).get("coverage"),
-        "freshness": (row.get("freshness") or {}).get("status"),
-        "strengths": row.get("strengths") or [], "weaknesses": row.get("weaknesses") or [],
-        "missing_components": (row.get("field_coverage") or {}).get("missing") or [],
+        "relative_rank": index + 1,
+        "evidence_bucket": ("strong" if float(row.get("health_score") or 0) >= 70 else
+                            "mixed" if float(row.get("health_score") or 0) >= 50 else "weak"),
+        "bucket_explanation": "Versioned portfolio analytical score and component coverage.",
+        "research_confidence": row.get("data_confidence"),
+        "freshness": loaded.model.metadata.freshness.model_dump(mode="json"),
+        "strengths": [{"label": name.replace("_score", "").replace("_", " ")}
+                      for name in ("fundamental_score", "valuation_score", "momentum_score")
+                      if float(row.get(name) or 0) >= 65],
+        "weaknesses": [{"label": name.replace("_score", "").replace("_", " ")}
+                       for name in ("fundamental_score", "valuation_score", "momentum_score")
+                       if row.get(name) is not None and float(row.get(name) or 0) < 45],
+        "missing_components": [name for name in ("fundamental_score", "valuation_score", "momentum_score") if row.get(name) is None],
         "portfolio_weight": holding_context.get(str(row.get("ticker") or "").upper(), {}).get("weight"),
         "portfolio_risk_contribution": holding_context.get(str(row.get("ticker") or "").upper(), {}).get("risk_contribution"),
-    } for row in payload.get("results", [])]
+        "health_score": row.get("health_score"),
+    } for index, row in enumerate(rows) if row.get("ticker")], key=lambda row: float(row.get("health_score") or 0), reverse=True)
     covered = {str(item.get("ticker", "")).upper() for item in ranked}
     missing = [ticker for ticker in tickers if ticker not in covered]
     status = "partial" if missing or not ranked else "complete"
@@ -3016,10 +3187,22 @@ def _security_ranking_chat_tools(user_id: str, question: str, portfolio_id: str 
         "universe": {"type": "saved portfolio holdings", "count": len(tickers), "tickers": tickers},
         "ranked": ranked, "missing": missing,
         "focus": focus,
-        "method": payload.get("method"),
+        "method": "Versioned portfolio-opportunity read model; no security research build runs in Ask.",
         "note": "The stored composite orders eligible evidence; qualitative buckets are the user-facing conclusion.",
     }
-    tool = {"tool_name": "security_ranking", "status": status, "title": "Holdings research ranking", "summary": summary}
+    canonical = phase6_domains._canonical_from_loaded(
+        "security_ranking", loaded, "security-ranking-read-v1", context.version, tickers,
+    )
+    canonical.data = summary
+    tool = with_canonical_result({"tool_name": "security_ranking", "status": status,
+        "title": "Holdings research ranking", "summary": summary,
+        "read_model": {"id": loaded.model.id, "type": "portfolio_opportunity", "state": loaded.state.value,
+                       "schema_version": loaded.model.metadata.schema_version,
+                       "calculation_version": loaded.model.metadata.calculation_version,
+                       "builder_version": loaded.model.metadata.builder_version,
+                       "input_fingerprint_match": loaded.input_fingerprint_match,
+                       "upstream_version_match": loaded.upstream_version_match,
+                       "legacy_adapter_used": False}}, canonical)
     attach_ask_coverage(tool, context, covered)
     evidence_row = {
         "label": "Deterministic holdings research ranking", "as_of": datetime.now(timezone.utc).isoformat(),
@@ -3042,40 +3225,13 @@ def _benchmark_outlook_chat_tools(user_id: str, portfolio_id: str | None = None,
         result = {"tool_name": "benchmark_outlook", "status": "unavailable", "title": "Holdings versus SPY",
                   "summary": {"message": "Save at least one stock holding before comparing it with SPY."}}
         return [result], []
-    rows = security_research([*tickers, "SPY"], price_limit=260)
-    indexed = {str(row.get("ticker") or "").upper(): row for row in rows}
-    benchmark = indexed.get("SPY") or {}
-    benchmark_return = float(benchmark.get("expected_return") or 0)
-    contexts = theses.decision_contexts(user_id, tickers)
-    comparisons = []
-    for ticker in tickers:
-        row = indexed.get(ticker)
-        if not row:
-            continue
-        modeled_return = float(row.get("expected_return") or 0)
-        decision_context = contexts.get(ticker) or {}
-        comparisons.append({
-            "ticker": ticker, "company": row.get("company"), "modeled_return": modeled_return,
-            "spy_modeled_return": benchmark_return, "modeled_excess_return": modeled_return - benchmark_return,
-            "confidence": row.get("confidence"), "data_quality": row.get("data_quality"),
-            "fundamentals_as_of": row.get("fundamentals_as_of"), "price_as_of": row.get("price_as_of"),
-            "risk_flags": row.get("risk_flags") or [], "prediction_market_count": len(row.get("prediction_markets") or []),
-            "thesis_status": decision_context.get("thesis_status"), "latest_decision": decision_context.get("latest_decision"),
-        })
-    comparisons.sort(key=lambda item: float(item["modeled_excess_return"]), reverse=True)
-    summary = {
-        "benchmark": "SPY", "benchmark_modeled_return": benchmark_return,
-        "outperform_candidates": comparisons[:10], "underperform_candidates": list(reversed(comparisons[-10:])),
-        "holding_count": len(tickers), "model_version": "stored-research-relative-outlook-v1",
-        "method": "Existing stored expected-return estimate compared with the same model's SPY estimate; ranking is conditional and not a return guarantee.",
-        "limitations": "The estimate is sensitive to valuation, fundamentals, recent price behavior, data coverage, and model assumptions. It is not a price target or promise of benchmark outperformance.",
-    }
-    result = {"tool_name": "benchmark_outlook", "status": "complete" if comparisons else "unavailable",
-              "title": "Holdings versus SPY", "summary": summary}
-    attach_ask_coverage(result, context, {row["ticker"] for row in comparisons})
-    evidence = {"label": "Modeled saved-holdings outlook versus SPY", "as_of": datetime.now(timezone.utc).isoformat(),
-                "url": None, "data": summary, "claim_type": "MODEL_OUTPUT"}
-    return [result], [evidence]
+    # Phase 6 intentionally does not synthesize an outperformance forecast
+    # from company scores. A future compatible benchmark model may populate a
+    # read model, but Ask will not run security_research to manufacture one.
+    result = {"tool_name": "benchmark_outlook", "status": "unavailable", "title": "Holdings versus SPY",
+              "summary": {"message": "No compatible benchmark-outperformance read model exists. Company scores are not return forecasts.",
+                          "requested": tickers, "benchmark": "SPY"}}
+    return [result], []
 
 
 def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None,
@@ -3132,6 +3288,34 @@ def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None,
 
 def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]]) -> str | None:
     """Answer exact quantitative requests without paying an LLM latency or truncation penalty."""
+    phase6 = next((item for item in tool_results if item.get("tool_name") in {
+        "company_analysis", "company_comparison", "macro_state", "market_state", "prediction_markets", "historical_change"
+    }), None)
+    if phase6 and isinstance(phase6.get("analysis_result"), dict):
+        canonical = AnalysisResult.model_validate(phase6["analysis_result"])
+        if canonical.capability == "company_analysis" and canonical.data:
+            return phase6_domains.render_company(phase6_domains.CompanyAnalysisResult.model_validate(canonical.data))
+        if canonical.capability == "company_comparison" and canonical.data:
+            return phase6_domains.render_comparison(phase6_domains.CompanyComparisonResult.model_validate(canonical.data))
+        if canonical.capability == "macro_state" and canonical.data:
+            return phase6_domains.render_macro(phase6_domains.MacroStateResult.model_validate(canonical.data))
+        if canonical.capability == "market_state" and canonical.data:
+            return phase6_domains.render_market(phase6_domains.MarketStateResult.model_validate(canonical.data))
+        if canonical.capability == "prediction_markets" and canonical.data:
+            return phase6_domains.render_prediction(phase6_domains.PredictionMarketResult.model_validate(canonical.data))
+        if canonical.capability == "historical_change" and canonical.data:
+            comparison = phase6_domains.HistoricalComparison.model_validate(canonical.data)
+            if comparison.status == phase6_domains.HistoricalStatus.NO_BASELINE:
+                return "No genuine compatible baseline exists for that change claim. A stored snapshot is not being relabeled as a user review."
+            if comparison.status == phase6_domains.HistoricalStatus.INCOMPATIBLE_BASELINE:
+                return "A prior snapshot exists, but its schema or calculation version is incompatible, so EagleEyes did not compute a delta."
+            if comparison.status == phase6_domains.HistoricalStatus.NO_MATERIAL_CHANGE:
+                return "A compatible baseline exists, but no supported metric crossed its deterministic materiality threshold."
+            return "Material changes since the compatible baseline:\n" + "\n".join(
+                f"- {row.metric}: {row.previous} → {row.current} ({row.materiality})" for row in comparison.changes
+            )
+        if canonical.status == AnalysisStatus.UNAVAILABLE:
+            return canonical.limitations[0] if canonical.limitations else "No compatible versioned read model is available for this question."
     if intent == "PORTFOLIO_RISK":
         result = next((item for item in tool_results if item.get("tool_name") == "portfolio_risk"
                        and item.get("status") == "complete"), None)
@@ -3632,21 +3816,129 @@ def _decision_journal_chat_tools(user_id: str, question: str) -> tuple[list[dict
 
 
 def _comparison_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    tickers = _resolve_chat_tickers(question)
+    tickers = _resolve_chat_tickers(question) or list(dict.fromkeys(
+        value for value in re.findall(r"\b[A-Z]{1,5}\b", question) if value not in _CHAT_SECURITY_STOPWORDS
+    ))[:3]
     if len(tickers) < 2:
         return [{"tool_name": "company_comparison", "status": "unavailable", "title": "Company comparison",
                  "summary": {"message": "Name at least two supported companies or tickers."}}], []
-    rows = security_research(tickers)
     portfolios = database.list_portfolios(user_id)
-    holdings = [str(item.get("ticker", "")).upper() for item in (portfolios[0].get("holdings", []) if portfolios else [])]
-    payload = research_comparison_payload(rows, tickers, holdings)
-    status = "complete" if len(payload.get("results", [])) == len(tickers) else "partial"
-    return [{"tool_name": "company_comparison", "status": status, "title": f"Compare {' vs '.join(tickers)}",
-             "summary": {"tickers": tickers, "methodology": payload.get("methodology"),
-                         "missing": payload.get("missing", [])}}], [
+    holdings = list(portfolios[0].get("holdings", [])) if portfolios else None
+    canonical = phase6_domains.company_comparison_result(user_id, tickers, holdings)
+    status = "complete" if canonical.status == AnalysisStatus.SUCCESS else canonical.status.value.lower()
+    payload = canonical.data if isinstance(canonical.data, dict) else {}
+    return [with_canonical_result({"tool_name": "company_comparison", "status": status,
+             "title": f"Compare {' vs '.join(tickers)}",
+             "summary": {"tickers": tickers, "methodology": phase6_domains.COMPARISON_CALCULATION_VERSION,
+                         "missing": canonical.coverage.missing_entities},
+             "read_model": {"type": "company_analysis", "state": "CURRENT", "legacy_adapter_used": False}}, canonical)], [
         {"label": "Deterministic company comparison", "as_of": datetime.now(timezone.utc).isoformat(),
          "url": None, "data": payload}
     ]
+
+
+def _phase6_chat_tools(tool: str, user_id: str, question: str,
+                       portfolio_id: str | None = None,
+                       planned_tickers: tuple[str, ...] = (),
+                       context: PortfolioContext | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    tickers = list(planned_tickers) or _resolve_chat_tickers(question)
+    if tool == "company_analysis":
+        if not tickers:
+            canonical = adapt_legacy_tool_result({"tool_name": tool, "status": "unavailable",
+                "summary": {"message": "Name one supported company or ticker."}}, capability=tool)
+        else:
+            canonical = phase6_domains.company_analysis_result(user_id, tickers[0])
+    elif tool == "macro_state":
+        canonical = phase6_domains.macro_state_result(user_id)
+        if canonical.data and context:
+            portfolio_model = read_models.load_compatible_read_model(user_id, context.portfolio_id, "portfolio_risk", context.version)
+            security_rows = list((portfolio_model.model.data if portfolio_model.model else {}).get("holdings") or [])
+            macro = phase6_domains.MacroStateResult.model_validate(canonical.data)
+            macro.portfolio_exposures = [row.model_dump(mode="json") for row in phase6_domains.portfolio_macro_exposures(
+                macro, list(context.positions), security_rows,
+            )]
+            canonical.data = macro.model_dump(mode="json")
+            canonical.dependencies.append(DependencyResult(name="portfolio_risk", required=False,
+                status=AnalysisStatus.SUCCESS if portfolio_model.model else AnalysisStatus.UNAVAILABLE,
+                cache_state=portfolio_model.state.value))
+    elif tool == "market_state":
+        canonical = phase6_domains.market_state_result(user_id)
+        if canonical.data and context:
+            portfolio_model = read_models.load_compatible_read_model(user_id, context.portfolio_id, "portfolio_risk", context.version)
+            security_rows = list((portfolio_model.model.data if portfolio_model.model else {}).get("holdings") or [])
+            market = phase6_domains.MarketStateResult.model_validate(canonical.data)
+            market.portfolio_fit = phase6_domains.market_portfolio_fit(market, list(context.positions), security_rows)
+            canonical.data = market.model_dump(mode="json")
+            canonical.dependencies.append(DependencyResult(name="portfolio_risk", required=False,
+                status=AnalysisStatus.SUCCESS if portfolio_model.model else AnalysisStatus.UNAVAILABLE,
+                cache_state=portfolio_model.state.value))
+    elif tool == "prediction_markets":
+        if feature_flags.prediction_market_enrichment_enabled():
+            canonical = phase6_domains.prediction_market_result(user_id, portfolio_id)
+        else:
+            canonical = adapt_legacy_tool_result({
+                "tool_name": tool,
+                "status": "unavailable",
+                "summary": {"message": "Prediction-market enrichment is disabled for this rollout."},
+            }, capability=tool)
+    elif tool == "historical_change":
+        if "macro" in question.lower():
+            comparison = phase6_domains.historical_comparison(
+                user_id, "macro_state", phase6_domains.scope_id("macro_state"),
+                selection="one_month_ago", baseline_at=datetime.now(timezone.utc) - timedelta(days=30),
+            )
+            has_baseline = comparison.status not in {phase6_domains.HistoricalStatus.NO_BASELINE,
+                                                     phase6_domains.HistoricalStatus.INCOMPATIBLE_BASELINE}
+            now = datetime.now(timezone.utc)
+            canonical = AnalysisResult(
+                capability="historical_change", calculation_version=phase6_domains.HISTORICAL_CALCULATION_VERSION,
+                input_fingerprint=stable_fingerprint(comparison.model_dump(mode="json")),
+                status=AnalysisStatus.SUCCESS if has_baseline else AnalysisStatus.UNAVAILABLE,
+                data=comparison.model_dump(mode="json"), coverage=phase6_domains.Coverage.not_tracked(),
+                freshness=phase6_domains.Freshness(calculated_at=now, stale=None),
+                prerequisites=[phase6_domains.Prerequisite(name="compatible_baseline", satisfied=has_baseline,
+                                                            reason=comparison.baseline.reason_if_incompatible or "Compatible baseline found.")],
+                verification=phase6_domains.VerificationResult(passed=True, answer_allowed=True, recommendation_allowed=False),
+            )
+        elif not tickers:
+            canonical = adapt_legacy_tool_result({"tool_name": tool, "status": "unavailable",
+                "summary": {"message": "A company ticker or explicit supported baseline domain is required."}}, capability=tool)
+        else:
+            last_review = "last review" in question.lower() or "last looked" in question.lower()
+            comparison = phase6_domains.historical_comparison(
+                user_id, "company_analysis", phase6_domains.scope_id("company_analysis", ticker=tickers[0]),
+                selection="last_review" if last_review else "previous_snapshot",
+                baseline_at=phase6_domains.resolve_last_company_review_at(user_id, tickers[0]) if last_review else None,
+            )
+            has_baseline = comparison.status not in {phase6_domains.HistoricalStatus.NO_BASELINE,
+                                                     phase6_domains.HistoricalStatus.INCOMPATIBLE_BASELINE}
+            now = datetime.now(timezone.utc)
+            canonical = AnalysisResult(
+                capability="historical_change", calculation_version=phase6_domains.HISTORICAL_CALCULATION_VERSION,
+                input_fingerprint=stable_fingerprint(comparison.model_dump(mode="json")),
+                status=AnalysisStatus.SUCCESS if has_baseline else AnalysisStatus.UNAVAILABLE,
+                data=comparison.model_dump(mode="json"),
+                coverage=phase6_domains.Coverage(requested_entities=[tickers[0]], evaluated_entities=[tickers[0]] if has_baseline else []),
+                freshness=phase6_domains.Freshness(calculated_at=now, stale=None),
+                prerequisites=[phase6_domains.Prerequisite(name="compatible_baseline", satisfied=has_baseline,
+                                                            reason=comparison.baseline.reason_if_incompatible or "Compatible baseline found.")],
+                verification=phase6_domains.VerificationResult(passed=True, answer_allowed=True, recommendation_allowed=False),
+            )
+    else:
+        canonical = adapt_legacy_tool_result({"tool_name": tool, "status": "unavailable"}, capability=tool)
+    status = "complete" if canonical.status == AnalysisStatus.SUCCESS else canonical.status.value.lower()
+    read_model_type = {"prediction_markets": "prediction_market_state"}.get(tool, tool)
+    result = with_canonical_result({
+        "tool_name": tool, "status": status, "title": tool.replace("_", " ").title(),
+        "summary": {"calculation_version": canonical.calculation_version},
+        "read_model": {"type": read_model_type, "state": canonical.dependencies[0].cache_state if canonical.dependencies else "not_tracked",
+                       "legacy_adapter_used": False, "input_fingerprint_match": True,
+                       "upstream_version_match": True},
+    }, canonical)
+    evidence_rows = [{"label": f"Canonical {tool}",
+                      "as_of": canonical.freshness.effective_through.isoformat() if canonical.freshness.effective_through else None,
+                      "url": None, "data": canonical.data}]
+    return [result], evidence_rows
 
 
 def _execute_ask_tool(tool: str, user_id: str, question: str,
@@ -3669,21 +3961,56 @@ def _execute_ask_tool(tool: str, user_id: str, question: str,
         "portfolio_overview", "thesis_replacement", "portfolio_change", "valuation_ranking",
         "portfolio_intelligence", "portfolio_scenario", "watchlist_comparison", "portfolio_events",
         "data_quality", "score_attribution", "multifactor_screen", "recommendation_countercase",
-        "cash_allocation", "thesis_invalidation",
+        "cash_allocation", "thesis_invalidation", "portfolio_analysis",
     }
     if tool in cached_portfolio_tools:
-        return ask_portfolio.run("thesis_monitor" if tool == "thesis_invalidation" else tool, user_id, portfolio_id, question, tickers, context)
+        tools, grounded = ask_portfolio.run("thesis_monitor" if tool == "thesis_invalidation" else tool, user_id, portfolio_id, question, tickers, context)
+        usable = any(str(item.get("status") or "").lower() in {"complete", "partial", "success"} for item in tools)
+        if not usable and tool in {"portfolio_scenario", "portfolio_analysis"}:
+            try:
+                portfolio = context.portfolio_payload() if context else (database.get_portfolio(portfolio_id, user_id) if portfolio_id else next(iter(database.list_portfolios(user_id)), None))
+                if portfolio and portfolio.get("holdings"):
+                    if tool == "portfolio_scenario":
+                        request = SimulationRunInput.model_validate({
+                            "portfolio_id": portfolio.get("id"), "holdings": portfolio["holdings"],
+                            "profile": database.load_profile(user_id) or {}, "goals": database.list_goals(user_id),
+                            "scenario": _simulation_scenario_from_question(question), "paths": 500, "seed": 90210,
+                        })
+                        payload = request.model_dump(mode="json")
+                        fingerprint = stable_fingerprint({"request": payload, "portfolio_fingerprint": context.version if context else None})
+                        job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.SIMULATION, user_id=user_id,
+                            portfolio_id=str(portfolio.get("id")) if portfolio.get("id") else None,
+                            payload=payload, input_fingerprint=fingerprint)
+                    else:
+                        payload = {"operation": "portfolio_analysis", "holdings": portfolio["holdings"],
+                                   "profile": database.load_profile(user_id) or {}, "portfolio_fingerprint": context.version if context else None,
+                                   "tax_lot_state": {"available": False, "coverage": 0}, "trading_cost_model": None}
+                        job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.OPTIMIZATION, user_id=user_id,
+                            portfolio_id=str(portfolio.get("id")) if portfolio.get("id") else None,
+                            payload=payload, input_fingerprint=stable_fingerprint(payload))
+                    tools.append({"tool_name": f"{tool}_job", "status": "pending", "title": "Updated analysis queued",
+                                  "job_id": job.job_id, "summary": {"message": "The heavy calculation is running separately; available deterministic evidence is preserved."}})
+            except Exception as exc:
+                # The generated migration is intentionally not applied by this
+                # phase. A missing job table must not turn the existing safe
+                # analytical answer into a runtime failure.
+                tools[0].setdefault("summary", {}).setdefault("warnings", []).append(
+                    f"Durable analytics queue unavailable ({type(exc).__name__}); existing evidence was preserved."
+                )
+        return tools, grounded
     if tool == "stored_evidence":
         stored = retrieve_evidence(user_id, question, portfolio_id) if portfolio_id else retrieve_evidence(user_id, question)
         return [{"tool_name": tool, "status": "complete", "title": "Stored evidence"}], stored
     if tool == "company_research":
-        return _company_research_chat_tools(routed_question)
+        return _company_research_chat_tools(routed_question, user_id)
+    if tool in {"company_analysis", "macro_state", "market_state", "prediction_markets", "historical_change"}:
+        return _phase6_chat_tools(tool, user_id, routed_question, portfolio_id, tickers, context)
     if tool == "evidence_changes":
-        return _evidence_change_chat_tools(user_id, routed_question)
+        return _phase6_chat_tools("historical_change", user_id, routed_question, portfolio_id, tickers, context)
     if tool == "thesis_monitor":
         return _thesis_monitor_chat_tools(user_id, routed_question)
     if tool == "forecasting":
-        return _forecasting_chat_tools(user_id, routed_question)
+        return _phase6_chat_tools("prediction_markets", user_id, routed_question, portfolio_id, tickers, context)
     if tool == "today_attention":
         return _today_attention_chat_tools(user_id, routed_question)
     if tool in {"earnings_intelligence", "portfolio_intelligence"}:
@@ -3696,6 +4023,35 @@ def _execute_ask_tool(tool: str, user_id: str, question: str,
         return _portfolio_chat_tools(user_id, routed_question, portfolio_id, context)
     if tool == "portfolio_risk":
         return _portfolio_risk_chat_tools(user_id, portfolio_id, context)
+    if tool == "portfolio_backtest":
+        if not context or not context.normalized_weights:
+            return [{"tool_name": tool, "status": "unavailable", "title": "Portfolio backtest",
+                     "summary": {"message": "Select a portfolio with supported holdings before requesting a backtest."}}], []
+        end = date.today()
+        years_match = re.search(r"\b(\d{1,2})\s+years?\b", question.lower())
+        years = max(1, min(20, int(years_match.group(1)) if years_match else 5))
+        payload = {
+            "alternatives": {"current_portfolio": context.normalized_weights}, "benchmark": "SPY",
+            "start_date": date(end.year - years, end.month, min(end.day, 28)).isoformat(),
+            "end_date": end.isoformat(), "rebalance_policy": "monthly", "transaction_cost_bps": None,
+        }
+        fingerprint = stable_fingerprint({"request": payload, "portfolio_fingerprint": context.version})
+        completed = analytics_jobs.compatible_completed(user_id=user_id, job_type=analytics_jobs.JobType.BACKTEST,
+                                                         input_fingerprint=fingerprint)
+        if completed and completed.result:
+            canonical = completed.result
+        else:
+            job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.BACKTEST, user_id=user_id,
+                                            portfolio_id=context.portfolio_id, payload=payload,
+                                            input_fingerprint=fingerprint)
+            canonical = analytics_jobs.pending_analysis(job, "portfolio_backtest")
+        status = canonical.status.value.lower()
+        return [with_canonical_result({"tool_name": tool, "status": status, "title": "Portfolio backtest",
+                 "job_id": canonical.job.id if canonical.job else None,
+                 "summary": canonical.summary or {"message": "The durable backtest is pending."}}, canonical)], [{
+                     "label": "Durable portfolio backtest", "as_of": canonical.freshness.calculated_at.isoformat(),
+                     "url": None, "data": canonical.model_dump(mode="json", exclude_none=True), "claim_type": "MODEL_OUTPUT",
+                 }]
     if tool == "decision_journal":
         return _decision_journal_chat_tools(user_id, routed_question)
     if tool == "company_comparison":
@@ -3710,93 +4066,206 @@ def _execute_ask_tool(tool: str, user_id: str, question: str,
 def _instrumented_ask_tool(tool: str, user_id: str, question: str,
                            portfolio_id: str | None = None,
                            tickers: tuple[str, ...] = (),
-                           context: PortfolioContext | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    started=time.monotonic()
+                           context: PortfolioContext | None = None, *,
+                           request_id: str | None = None, capability: str | None = None,
+                           deadline: DeadlineContext | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    started=time.monotonic(); started_at=telemetry_utc_now()
+    deadline_start = deadline.remaining_ms() if deadline else None
+    status = "FAILED"; error_class = None; cache_state = "not_tracked"
+    read_model_telemetry: dict[str, Any] = {}
     try:
         result=_execute_ask_tool(tool,user_id,question,portfolio_id,tickers,context)
+        statuses = [str(row.get("status") or "partial").upper() for row in result[0]]
+        status = "FAILED" if "FAILED" in statuses else "UNAVAILABLE" if statuses and all(value == "UNAVAILABLE" for value in statuses) else "PARTIAL" if "PARTIAL" in statuses else "SUCCESS"
+        cache_state = next((
+            str(dependency.get("cache_state"))
+            for row in result[0]
+            for dependency in ((row.get("analysis_result") or {}).get("dependencies") or [])
+            if dependency.get("cache_state")
+        ), "not_tracked")
+        read_model_row = next((row.get("read_model") for row in result[0] if row.get("read_model")), None) or {}
+        read_model_telemetry = {
+            "read_model_type": read_model_row.get("type"), "read_model_id": read_model_row.get("id"),
+            "read_model_state": read_model_row.get("state"), "schema_version": read_model_row.get("schema_version"),
+            "calculation_version": read_model_row.get("calculation_version"),
+            "builder_version": read_model_row.get("builder_version"),
+            "cache_hit": read_model_row.get("state") in {"CURRENT", "STALE"},
+            "legacy_adapter_used": read_model_row.get("legacy_adapter_used"),
+            "input_fingerprint_match": read_model_row.get("input_fingerprint_match"),
+            "upstream_version_match": read_model_row.get("upstream_version_match"),
+            "stale_reason": read_model_row.get("reason"),
+        }
         record_metric("ask.tool.success", tags={"tool":tool})
         return result
-    except Exception:
+    except Exception as exc:
+        error_class = type(exc).__name__
         record_metric("ask.tool.failure", tags={"tool":tool})
         raise
     finally:
-        record_metric("ask.tool.latency_ms",(time.monotonic()-started)*1000,tags={"tool":tool})
+        latency_ms = (time.monotonic()-started)*1000
+        record_metric("ask.tool.latency_ms",latency_ms,tags={"tool":tool})
+        if request_id:
+            record_capability_dependency(
+                request_id=request_id, capability=capability or tool, dependency=tool, required=True,
+                started_at=started_at, completed_at=telemetry_utc_now(), latency_ms=round(latency_ms, 2),
+                deadline_remaining_at_start_ms=deadline_start,
+                deadline_remaining_at_end_ms=deadline.remaining_ms() if deadline else None,
+                status=status, cache_state=cache_state, error_class=error_class,
+                **read_model_telemetry,
+            )
 
 
 def _execute_chat_plan_tools(
     tools: tuple[str, ...], user_id: str, question: str, started: float,
     portfolio_id: str | None = None, tickers: tuple[str, ...] = (),
     context: PortfolioContext | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Execute a chat plan without orphaned background analysis threads.
+    request_id: str | None = None, capability: str | None = None,
+    deadline: DeadlineContext | None = None,
+    compositional_plan: capability_planner.CapabilityPlan | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[ask_execution.NodeOutcome]]:
+    """Execute the approved read-only capability graph with per-request bounded concurrency."""
+    request_id = request_id or str(uuid.uuid4())
+    capability = capability or "GENERAL"
+    deadline = deadline or DeadlineContext.from_budget(started, ask_orchestration.OVERALL_BUDGET_SECONDS)
+    parent = ("portfolio_context",) if context else ()
+    nodes: list[ask_execution.ExecutionNode] = []
+    if context:
+        nodes.append(ask_execution.ExecutionNode(
+            node_id="portfolio_context", dependency_name="portfolio_context", required=True,
+            expected_latency_class=ask_execution.ExpectedLatencyClass.MEMORY, configured_timeout_ms=100,
+            executor=lambda *_: ask_execution.NodeExecutionValue(
+                status=ask_execution.NodeStatus.SUCCESS,
+                metadata={"input_fingerprint": context.version, "read_model_state": "REQUEST_CONTEXT"},
+            ),
+        ))
 
-    Python cannot cancel a running thread. The previous executor-based timeout
-    returned a fallback while expensive pandas/numpy work continued in the
-    background, allowing retries to stack until Render killed the process. This
-    bounded sequential path favors a slightly longer first answer over a crash
-    that interrupts every user.
-    """
+    spec = ask_execution.CAPABILITY_EXECUTION_SPECS.get(capability)
+    required_names = ({step.capability for step in compositional_plan.steps if step.required}
+                      if compositional_plan else set(spec.required if spec else tools))
+
+    def tool_executor(tool: str):
+        def execute(_: ask_execution.NodeExecutionContext, __: dict[str, ask_execution.NodeOutcome]) -> ask_execution.NodeExecutionValue:
+            results, grounded = _instrumented_ask_tool(
+                tool, user_id, question, portfolio_id, tickers, context,
+                deadline=deadline,
+            )
+            results = results or [{"tool_name": tool, "status": "unavailable",
+                                   "title": tool.replace("_", " ").title(),
+                                   "summary": {"message": "No matching stored evidence was available."}}]
+            for result in results:
+                if not isinstance(result.get("analysis_result"), dict):
+                    result.update(with_canonical_result({}, adapt_legacy_tool_result(
+                        result, capability=tool, input_fingerprint=context.version if context else None,
+                    )))
+                canonical = AnalysisResult.model_validate(result["analysis_result"])
+                result.setdefault("coverage", {
+                    "requested": len(canonical.coverage.requested_entities),
+                    "evaluated": len(canonical.coverage.evaluated_entities),
+                    "missing": len(canonical.coverage.missing_entities),
+                    "missing_symbols": canonical.coverage.missing_entities,
+                    "percent": canonical.coverage.entity_coverage_percent,
+                })
+                result["execution_state"] = ask_orchestration.execution_state(str(result.get("status", "partial")))
+            statuses = {str(row.get("status") or "partial").upper() for row in results}
+            node_status = (ask_execution.NodeStatus.FAILED if "FAILED" in statuses else
+                           ask_execution.NodeStatus.UNAVAILABLE if statuses and statuses <= {"UNAVAILABLE"} else
+                           ask_execution.NodeStatus.SUCCESS)
+            read_model_row = next((row.get("read_model") for row in results if row.get("read_model")), None) or {}
+            return ask_execution.NodeExecutionValue(
+                status=node_status, tool_results=tuple(results), evidence_rows=tuple(grounded),
+                metadata={"read_model_type": read_model_row.get("type"), "read_model_id": read_model_row.get("id"),
+                          "read_model_state": read_model_row.get("state"),
+                          "input_fingerprint_match": read_model_row.get("input_fingerprint_match"),
+                          "upstream_version_match": read_model_row.get("upstream_version_match")},
+            )
+        return execute
+
+    node_ids = {tool: f"tool:{tool}:{index}" for index, tool in enumerate(tools)}
+    planned_steps = {step.step_id: step for step in (compositional_plan.steps if compositional_plan else [])}
+    planned_by_capability = {step.capability: step for step in planned_steps.values()}
+    for index, tool in enumerate(tools):
+        planned_dependencies = tuple(
+            node_ids[planned_steps[parent].capability]
+            for parent in planned_by_capability.get(tool, capability_planner.CapabilityPlanStep(
+                step_id="fallback", capability=tool, reason_code=capability_planner.ReasonCode.PRIMARY_QUESTION,
+                expected_output="AnalysisResult",
+            )).depends_on
+            if parent in planned_steps and planned_steps[parent].capability in node_ids
+        )
+        nodes.append(ask_execution.ExecutionNode(
+            node_id=f"tool:{tool}:{index}", dependency_name=tool, required=tool in required_names,
+            depends_on=tuple(dict.fromkeys((*parent, *planned_dependencies))), expected_latency_class=ask_execution.ExpectedLatencyClass.DATABASE,
+            configured_timeout_ms=float(os.getenv("ASK_TOOL_NODE_TIMEOUT_MS", "5000")), executor=tool_executor(tool),
+        ))
+
+    optional_read_models = tuple(spec.optional if spec else ())
+
+    def read_model_executor(model_type: str):
+        def execute(_: ask_execution.NodeExecutionContext, __: dict[str, ask_execution.NodeOutcome]) -> ask_execution.NodeExecutionValue:
+            if not context:
+                return ask_execution.NodeExecutionValue(status=ask_execution.NodeStatus.UNAVAILABLE)
+            loaded = read_models.load_compatible_read_model(user_id, context.portfolio_id, model_type, context.version)
+            status = (ask_execution.NodeStatus.SUCCESS if loaded.state in {
+                read_models.CompatibilityState.CURRENT, read_models.CompatibilityState.STALE,
+            } else ask_execution.NodeStatus.UNAVAILABLE)
+            return ask_execution.NodeExecutionValue(status=status, metadata={
+                "read_model_type": model_type, "read_model_id": loaded.model.id if loaded.model else None,
+                "read_model_state": loaded.state.value, "input_fingerprint_match": loaded.input_fingerprint_match,
+                "upstream_version_match": loaded.upstream_version_match,
+            })
+        return execute
+
+    for model_type in optional_read_models:
+        nodes.append(ask_execution.ExecutionNode(
+            node_id=f"optional:{model_type}", dependency_name=model_type, required=False,
+            depends_on=parent, expected_latency_class=ask_execution.ExpectedLatencyClass.DATABASE,
+            configured_timeout_ms=float(os.getenv("ASK_OPTIONAL_NODE_TIMEOUT_MS", "1800")),
+            executor=read_model_executor(model_type),
+        ))
+
+    plan = ask_execution.CapabilityExecutionPlan(
+        request_id=request_id, capability=capability,
+        absolute_deadline_monotonic=deadline.absolute_deadline_monotonic,
+        initial_budget_ms=max(0.0, (deadline.absolute_deadline_monotonic - deadline.started_monotonic) * 1000),
+        nodes=tuple(nodes), max_concurrency=max(1, min(4, int(os.getenv("ASK_DAG_CONCURRENCY", "3")))),
+    )
+    outcomes = ask_execution.execute_capability_plan(plan)
     tool_results: list[dict[str, Any]] = []
     evidence_rows: list[dict[str, Any]] = []
     execution_steps: list[dict[str, Any]] = []
-    wait_budget = max(0.1, ask_orchestration.OVERALL_BUDGET_SECONDS - (time.monotonic() - started))
-    acquired = _CHAT_ANALYSIS_SLOTS.acquire(timeout=wait_budget)
-    if not acquired:
-        for tool in tools:
+    for outcome in outcomes:
+        if outcome.value:
+            tool_results.extend(outcome.value.tool_results)
+            evidence_rows.extend(outcome.value.evidence_rows)
+        if outcome.required and not (outcome.value and outcome.value.tool_results) and outcome.dependency_name != "portfolio_context":
+            failed = outcome.status == ask_execution.NodeStatus.FAILED
             tool_results.append({
-                "tool_name": tool, "status": "failed", "execution_state": "FAILED",
-                "title": tool.replace("_", " ").title(),
-                "error": "Another portfolio analysis is still running. Retry when it finishes.",
+                "tool_name": outcome.dependency_name,
+                "status": "failed" if failed else "unavailable",
+                "execution_state": "FAILED" if failed else "UNAVAILABLE",
+                "title": outcome.dependency_name.replace("_", " ").title(),
+                "summary": {"message": (
+                    "The required dependency failed unexpectedly; no result was invented."
+                    if failed else "The required dependency did not complete within the request deadline."
+                )},
             })
-            execution_steps.append({"tool_name": tool, "state": "FAILED"})
-        record_metric("ask.analysis.busy")
-        return tool_results, evidence_rows, execution_steps
-
-    try:
-        for tool in tools:
-            if time.monotonic() - started >= ask_orchestration.OVERALL_BUDGET_SECONDS:
-                tool_results.append({
-                    "tool_name": tool, "status": "failed", "execution_state": "FAILED",
-                    "title": tool.replace("_", " ").title(),
-                    "error": "The interactive analysis budget was reached before this step began.",
-                })
-                execution_steps.append({"tool_name": tool, "state": "FAILED"})
-                continue
-            try:
-                if portfolio_id or tickers:
-                    results, grounded = _instrumented_ask_tool(tool, user_id, question, portfolio_id, tickers, context)
-                else:
-                    results, grounded = _instrumented_ask_tool(tool, user_id, question)
-                if not results:
-                    results = [{
-                        "tool_name": tool, "status": "unavailable",
-                        "title": tool.replace("_", " ").title(),
-                        "summary": {"message": "No matching stored evidence was available."},
-                    }]
-                for result in results:
-                    if not isinstance(result.get("coverage"), dict):
-                        attach_ask_coverage(result, context)
-                    result["execution_state"] = ask_orchestration.execution_state(
-                        str(result.get("status", "partial"))
-                    )
-                    tool_results.append(result)
-                evidence_rows.extend(grounded)
-                state = (
-                    "PARTIAL"
-                    if any(item["execution_state"] == "PARTIAL" for item in results)
-                    else results[0]["execution_state"]
-                )
-            except Exception as exc:
-                state = "FAILED"
-                tool_results.append({
-                    "tool_name": tool, "status": "failed", "execution_state": state,
-                    "title": tool.replace("_", " ").title(),
-                    "error": f"The approved analysis failed; no result was invented ({type(exc).__name__}).",
-                })
-            execution_steps.append({"tool_name": tool, "state": state})
-    finally:
-        _CHAT_ANALYSIS_SLOTS.release()
-    return tool_results, evidence_rows, execution_steps
+        payload = outcome.payload(started)
+        execution_steps.append({"tool_name": outcome.dependency_name, "state": outcome.status.value, **payload})
+        record_capability_dependency(
+            request_id=request_id, capability=capability, node_id=outcome.node_id,
+            dependency=outcome.dependency_name, required=outcome.required,
+            depends_on=",".join(outcome.depends_on) or "none", latency_ms=outcome.latency_ms,
+            start_ms=payload.get("start_ms"), end_ms=payload.get("end_ms"),
+            deadline_remaining_at_start_ms=outcome.deadline_remaining_at_start_ms,
+            deadline_remaining_at_end_ms=outcome.deadline_remaining_at_end_ms,
+            configured_timeout_ms=outcome.configured_timeout_ms, effective_timeout_ms=outcome.effective_timeout_ms,
+            status=outcome.status.value, error_class=outcome.error_class,
+            read_model_type=payload.get("read_model_type"), read_model_id=payload.get("read_model_id"),
+            read_model_state=payload.get("read_model_state"),
+            input_fingerprint_match=payload.get("input_fingerprint_match"),
+            upstream_version_match=payload.get("upstream_version_match"),
+        )
+    return tool_results, evidence_rows, execution_steps, outcomes
 
 
 def _conversation_summary(messages: list[dict[str, Any]], previous: str = "") -> str:
@@ -3824,6 +4293,15 @@ def _conversation_summary(messages: list[dict[str, Any]], previous: str = "") ->
 
 def _persist_chat_tool_links(user_id: str, conversation_id: str, message_id: str,
                              tool_results: list[dict[str, Any]]) -> None:
+    for artifact in _chat_tool_artifacts(tool_results):
+        database.link_conversation_artifact(
+            user_id, conversation_id, artifact["artifact_type"], artifact["artifact_id"],
+            artifact["label"], message_id=message_id, metadata=artifact["metadata"],
+        )
+
+
+def _chat_tool_artifacts(tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
     for result in tool_results:
         tool_name = result.get("tool_name")
         artifact_type: str | None = None
@@ -3836,19 +4314,54 @@ def _persist_chat_tool_links(user_id: str, conversation_id: str, message_id: str
             as_of = (result.get("summary") or {}).get("price_as_of") or "latest"
             artifact_type, artifact_id = "research_snapshot", f"{result['ticker']}:{as_of}"
         if artifact_type and artifact_id:
-            database.link_conversation_artifact(
-                user_id, conversation_id, artifact_type, artifact_id,
-                str(result.get("title") or tool_name), message_id=message_id,
-                metadata={"tool_name": tool_name, "status": result.get("status")},
-            )
+            artifacts.append({"artifact_type": artifact_type, "artifact_id": artifact_id,
+                              "label": str(result.get("title") or tool_name),
+                              "metadata": {"tool_name": tool_name, "status": result.get("status")}})
+    return artifacts
 
 
 @app.post("/api/chat/messages")
-def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
-    request_id = str(uuid.uuid4())
+def chat_message(payload: ChatRequest, http_request: Request = None,
+                 user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
+    request_started_monotonic = getattr(getattr(http_request, "state", None), "request_started_monotonic", time.monotonic())
+    request_id = payload.request_id or getattr(getattr(http_request, "state", None), "request_id", None) or str(uuid.uuid4())
+    request_started_at = telemetry_utc_now()
+    deadline = DeadlineContext.from_budget(request_started_monotonic, ask_orchestration.OVERALL_BUDGET_SECONDS)
+    auth_latency_ms = getattr(getattr(http_request, "state", None), "auth_latency_ms", None)
     if not database.DATABASE_URL:
         raise HTTPException(503, "Chat history requires Supabase storage")
-    conversation_id = payload.conversation_id
+    question_hash = hashlib.sha256(json.dumps({
+        "question": payload.question, "workspace": payload.workspace,
+        "page_context": payload.page_context.model_dump(mode="json", exclude_none=True) if payload.page_context else {},
+    }, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    try:
+        request_record = database.reserve_ask_request(user.id, request_id, question_hash)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+    def mark_terminal_failure(error_class: str) -> None:
+        try:
+            database.fail_ask_request(user.id, request_id, error_class, persistence=False)
+        except Exception:
+            LOGGER.exception("ask_request_terminal_state_failed request_id=%s", request_id)
+    if request_record.get("response"):
+        replay = deepcopy(request_record["response"])
+        replay["duplicate_replay"] = True
+        record_capability_request(request_id=request_id, capability="REPLAY", duplicate_replay=True,
+                                  persistence_status="REPLAY", auth_latency_ms=auth_latency_ms)
+        return replay
+    if request_record.get("staged_result") and request_record.get("conversation_id"):
+        try:
+            staged = request_record["staged_result"]
+            replay = database.complete_ask_request(
+                user.id, request_id, final_state=str(staged.get("final_state") or "COMPLETED"),
+            )
+            replay["duplicate_replay"] = True
+            return replay
+        except Exception as exc:
+            database.fail_ask_request(user.id, request_id, type(exc).__name__, persistence=True)
+            raise
+    conversation_id = payload.conversation_id or request_record.get("conversation_id")
     page_context = payload.page_context.model_dump(mode="json", exclude_none=True) if payload.page_context else {}
     requested_portfolio_id = str(page_context.get("portfolio_id") or "").strip() or None
     conversation_meta: dict[str, Any] | None = None
@@ -3857,11 +4370,14 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
         try:
             conversation_meta = database.get_conversation(user.id, conversation_id)
         except KeyError as exc:
+            mark_terminal_failure("ConversationNotFound")
             raise HTTPException(404, "Conversation not found") from exc
         if payload.workspace in {"research", "portfolio"} and conversation_meta.get("workspace") != payload.workspace:
+            mark_terminal_failure("WorkspaceConflict")
             raise HTTPException(409, "This conversation belongs to a different workspace")
         bound_portfolio_id = conversation_meta.get("portfolio_id")
         if requested_portfolio_id and bound_portfolio_id and requested_portfolio_id != bound_portfolio_id:
+            mark_terminal_failure("PortfolioConflict")
             raise HTTPException(409, "This conversation belongs to a different portfolio. Start or restore that portfolio's conversation.")
         requested_portfolio_id = requested_portfolio_id or bound_portfolio_id
         history = database.conversation_messages(user.id, conversation_id)
@@ -3880,6 +4396,7 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
             plan = replace(plan, rationale=plan.rationale + " Resolved one validated company name.")
         elif len(resolved) > 1:
             names = ", ".join(f"{row['name']} ({row['ticker']})" for row in mentions)
+            mark_terminal_failure("AmbiguousSecurity")
             raise HTTPException(422, f"The company reference is ambiguous: {names}. Name the ticker you mean.")
     if plan.tickers:
         try:
@@ -3888,7 +4405,62 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
             valid_tickers = set(plan.tickers)
         invalid = [ticker for ticker in plan.tickers if ticker not in valid_tickers]
         if invalid:
+            mark_terminal_failure("UnsupportedSecurity")
             raise HTTPException(422, f"Unsupported or ambiguous ticker: {', '.join(invalid)}. Name a supported company or ticker.")
+    previous_analytical_context = capability_planner.context_from_previous(previous_context)
+    compositional_plan: capability_planner.CapabilityPlan | None = None
+    planner_telemetry = capability_planner.PlannerTelemetry(
+        invoked=False, model="bypassed-direct-route", latency_ms=0.0, validation_latency_ms=0.0,
+        repair_attempted=False, plan_node_count=len(plan.tools),
+    )
+    if capability_planner.should_use_compositional_planner(
+        payload.question, plan.intent, plan.confidence, previous_analytical_context,
+    ):
+        entities = capability_planner.resolve_entities(
+            payload.question, plan.tickers, portfolio_id=requested_portfolio_id,
+            previous=previous_analytical_context,
+        )
+        planning_started = time.monotonic()
+        try:
+            use_model_planner = (
+                os.getenv("ASK_CAPABILITY_PLANNER_GEMINI", "0").strip().lower() in {"1", "true", "on", "yes"}
+                and bool(os.getenv("GEMINI_API_KEY", "").strip())
+            )
+            if use_model_planner:
+                compositional_plan, planner_telemetry = capability_planner.plan_with_model(
+                    payload.question, entities, portfolio_id=requested_portfolio_id,
+                    model_call=plan_capabilities_gemini,
+                    model_name=os.getenv("GEMINI_PLANNER_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.5-flash")),
+                    conversation=previous_analytical_context,
+                )
+            else:
+                compositional_plan = capability_planner.deterministic_capability_plan(
+                    payload.question, entities, portfolio_id=requested_portfolio_id,
+                    conversation=previous_analytical_context,
+                )
+                planner_telemetry = capability_planner.PlannerTelemetry(
+                    invoked=True, model="deterministic-capability-planner-v1",
+                    latency_ms=round((time.monotonic() - planning_started) * 1000, 2),
+                    validation_latency_ms=0.0, repair_attempted=False,
+                    plan_node_count=len(compositional_plan.steps),
+                )
+            plan = replace(
+                plan, intent="COMPOSED_ANALYSIS",
+                tools=tuple(step.capability for step in compositional_plan.steps),
+                tickers=tuple(entity.canonical_id for entity in entities if entity.kind == capability_planner.EntityKind.SECURITY),
+                confidence=1.0, requires_portfolio=compositional_plan.portfolio_context_required,
+                rationale="Validated minimum-capability composition over the versioned registry.",
+                limits={**plan.limits, "max_tool_calls": capability_planner.MAX_SYNCHRONOUS_CAPABILITIES + capability_planner.MAX_HEAVY_JOBS,
+                        "max_heavy_jobs": capability_planner.MAX_HEAVY_JOBS,
+                        "max_plan_depth": capability_planner.MAX_PLAN_DEPTH,
+                        "max_planner_repairs": capability_planner.MAX_PLANNER_REPAIRS},
+            )
+        except capability_planner.PlanValidationError:
+            # A known deterministic route is the only permitted fallback. A
+            # general question never falls through to unrestricted LLM finance.
+            if plan.intent == "GENERAL":
+                plan = replace(plan, intent="UNSUPPORTED", tools=(), confidence=0.0,
+                               rationale="No registered capability can satisfy the analytical requirement.")
     if not ASK_ROUTER_V2_ENABLED and plan.intent in {
         "OPPORTUNITY_RANKING", "THESIS_REPLACEMENT", "PORTFOLIO_CHANGE", "VALUATION_RANKING",
         "HIDDEN_RISK", "MULTI_SCENARIO", "WATCHLIST_COMPARISON", "PORTFOLIO_EVENTS",
@@ -3897,13 +4469,30 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
     }:
         plan = ask_orchestration.build_plan("general portfolio evidence", payload.workspace, page_context, previous_context)
     if plan.requires_portfolio and not requested_portfolio_id:
+        mark_terminal_failure("PortfolioRequired")
         raise HTTPException(422, "Select a portfolio before asking a portfolio-specific question.")
     portfolio_context: PortfolioContext | None = None
     if requested_portfolio_id:
         try:
             portfolio_context = build_portfolio_context(database.get_portfolio(requested_portfolio_id, user.id))
         except KeyError as exc:
+            mark_terminal_failure("PortfolioNotFound")
             raise HTTPException(404, "Selected portfolio not found") from exc
+    if compositional_plan:
+        validation_started = time.monotonic()
+        try:
+            capability_planner.validate_capability_plan(
+                compositional_plan, {"portfolio_id": requested_portfolio_id, "user_id": user.id,
+                                     "permissions": "owner_scoped_read_only",
+                                     "resolved_entity_ids": [entity.canonical_id for entity in compositional_plan.entities]},
+            )
+        except capability_planner.PlanValidationError as exc:
+            mark_terminal_failure("InvalidCapabilityPlan")
+            raise HTTPException(422, f"The analytical plan is unsupported: {', '.join(exc.errors)}") from exc
+        planner_telemetry = capability_planner.PlannerTelemetry(
+            **{**planner_telemetry.__dict__,
+               "validation_latency_ms": round((time.monotonic() - validation_started) * 1000, 2)},
+        )
     if conversation_id is None:
         workspace = payload.workspace if payload.workspace in {"research", "portfolio"} else "research"
         conversation_meta = database.create_conversation(
@@ -3920,10 +4509,12 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
                                        "portfolio_position_count": portfolio_context.total_positions if portfolio_context else 0,
                                        "portfolio_context_version": portfolio_context.version if portfolio_context else "none"})
     routed_question = payload.question
-    database.save_chat_message(user.id, conversation_id, "user", payload.question,
-                               {"page_context": page_context, "planned_intent": plan.intent,
-                                "route_confidence": plan.confidence})
-    started = time.monotonic()
+    database.bind_ask_request_turn(
+        user.id, request_id, conversation_id, payload.question,
+        {"page_context": page_context, "planned_intent": plan.intent,
+         "route_confidence": plan.confidence, "request_id": request_id, "request_state": "EXECUTING"},
+    )
+    started = request_started_monotonic
     dashboard_execution: dashboard_chat.DashboardChatExecution | None = None
     dashboard_resource_type = page_context.get("dashboard_resource_type")
     dashboard_resource_id = page_context.get("dashboard_resource_id")
@@ -3936,10 +4527,13 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
         except (KeyError, ValueError):
             dashboard_resource_type = None
             dashboard_resource_id = None
-    dashboard_request = dashboard_chat.interpret_dashboard_request(
-        payload.question, dashboard_widgets, previous_context,
+    dashboard_request = (
+        dashboard_chat.interpret_dashboard_request(payload.question, dashboard_widgets, previous_context)
+        if feature_flags.conversational_dashboards_enabled()
+        else dashboard_chat.DashboardChatRequest(intent=dashboard_chat.DashboardChatIntent.NORMAL_ANSWER)
     )
-    if dashboard_request.intent != dashboard_chat.DashboardChatIntent.NORMAL_ANSWER:
+    if (dashboard_request.intent != dashboard_chat.DashboardChatIntent.NORMAL_ANSWER
+            and not dashboard_request.requires_new_analysis):
         dashboard_execution = dashboard_chat.execute_dashboard_chat_request(
             user.id, dashboard_request, dashboard_resource_type, dashboard_resource_id,
             portfolio_id=requested_portfolio_id, conversation_id=conversation_id,
@@ -3978,42 +4572,87 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
                 if dashboard_execution.intent == dashboard_chat.DashboardChatIntent.CREATE_DASHBOARD
                 else "deterministic-dashboard-actions-v1"
             )
-            message = database.save_chat_message(
-                user.id, conversation_id, "assistant",
-                dashboard_execution.response or dashboard_execution.clarification or "I couldn't apply that dashboard change.",
-                structured_content, response_model,
-            )
+            dashboard_answer = dashboard_execution.response or dashboard_execution.clarification or "I couldn't apply that dashboard change."
+            database.stage_ask_request_result(user.id, request_id, {
+                "answer": dashboard_answer, "structured_content": structured_content, "model": response_model,
+                "sources": [], "tool_results": [], "artifacts": [], "final_state": "COMPLETED",
+            })
+            persisted = database.complete_ask_request(user.id, request_id, final_state="COMPLETED")
+            message = persisted["message"]
             record_metric("ask.dashboard_action", tags={
                 "intent": dashboard_execution.intent.value,
                 "status": dashboard_execution.action_result.status.value if dashboard_execution.action_result else "CLARIFICATION",
             })
-            return {"conversation_id": conversation_id, "message": message, "sources": [], "tool_results": []}
-    tool_started = started
-    tool_results, evidence_rows, execution_steps = _execute_chat_plan_tools(
+            return persisted
+    tool_started = time.monotonic()
+    execution_started_at = telemetry_utc_now()
+    tool_results, evidence_rows, execution_steps, execution_outcomes = _execute_chat_plan_tools(
         plan.tools, user.id, routed_question, started, requested_portfolio_id, plan.tickers, portfolio_context,
+        request_id, plan.intent, deadline, compositional_plan,
     )
     tools_elapsed = time.monotonic() - tool_started
+    execution_completed_at = telemetry_utc_now()
     scenario_factors = parse_scenario_factors(payload.question)
     verification = verify_results(plan.intent, portfolio_context, scenario_factors, tool_results)
-    analysis_result = verified_analysis_result(
-        plan.intent, portfolio_context, scenario_factors, tool_results, verification,
-    )
+    canonical_results: list[AnalysisResult] = []
+    execution_dependencies = [DependencyResult(
+        name=f"execution:{outcome.dependency_name}", required=outcome.required,
+        status=(AnalysisStatus.SUCCESS if outcome.status == ask_execution.NodeStatus.SUCCESS else
+                AnalysisStatus.FAILED if outcome.status == ask_execution.NodeStatus.FAILED else
+                AnalysisStatus.UNAVAILABLE),
+        latency_ms=outcome.latency_ms,
+        cache_state=str((outcome.value.metadata if outcome.value else {}).get("read_model_state") or outcome.status.value),
+        error_class=outcome.error_class,
+    ) for outcome in execution_outcomes]
+    optional_execution_warnings = [
+        f"Optional dependency {outcome.dependency_name} was omitted ({outcome.status.value})."
+        for outcome in execution_outcomes if not outcome.required and outcome.status != ask_execution.NodeStatus.SUCCESS
+    ]
+    for result in tool_results:
+        canonical = AnalysisResult.model_validate(result.get("analysis_result") or adapt_legacy_tool_result(
+            result, capability=str(result.get("tool_name") or plan.intent),
+            input_fingerprint=portfolio_context.version if portfolio_context else None,
+        ))
+        existing_dependencies = {dependency.name for dependency in canonical.dependencies}
+        canonical.dependencies.extend(dependency for dependency in execution_dependencies
+                                      if dependency.name not in existing_dependencies)
+        canonical.warnings = list(dict.fromkeys([*canonical.warnings, *optional_execution_warnings]))
+        canonical = apply_request_verification(canonical, verification)
+        result["analysis_result"] = canonical.model_dump(mode="json", exclude_none=True)
+        canonical_results.append(canonical)
+    composed_result: capability_planner.ComposedAnalysisResult | None = None
+    if canonical_results and compositional_plan:
+        composed_result = capability_planner.compose_results(payload.question, compositional_plan, canonical_results)
+        analysis_result = capability_planner.composed_to_analysis_result(composed_result)
+    elif canonical_results:
+        analysis_result = canonical_results[0]
+    else:
+        analysis_result = apply_request_verification(adapt_legacy_tool_result({
+            "tool_name": plan.intent.lower(), "status": "unavailable",
+            "summary": {"message": "No analytical result was produced."},
+        }, capability=plan.intent.lower()), verification)
     # Keep the grounded prompt bounded even when several securities each have
     # multiple articles. On-demand company evidence is ordered first so the
     # tool the user explicitly requested cannot be crowded out by older context.
     # Both renderers consume this one verified contract. Raw tool evidence is
     # retained for source metadata but cannot bypass the verification gates.
-    evidence = [{"label": "Verified Ask analysis", "as_of": datetime.now(timezone.utc).isoformat(),
-                 "url": None, "data": analysis_result, "claim_type": "MODEL_OUTPUT"}, *evidence_rows[:8]]
+    evidence = [{
+        "label": f"Canonical {result.capability} analysis",
+        "as_of": result.freshness.effective_through.isoformat() if result.freshness.effective_through else None,
+        "url": None, "data": result.model_dump(mode="json", exclude_none=True), "claim_type": "MODEL_OUTPUT",
+    } for result in canonical_results] or [{
+        "label": "Canonical unavailable analysis", "as_of": None, "url": None,
+        "data": analysis_result.model_dump(mode="json", exclude_none=True), "claim_type": "MODEL_OUTPUT",
+    }]
     try:
         preference_context = product_preferences.ask_context(user.id)
     except Exception as exc:
         # Optional personalization must not block an otherwise grounded answer.
         record_metric("ask.personalization.failure", tags={"error_type":type(exc).__name__})
         preference_context = None
-    if preference_context and len(evidence) < 36:
-        evidence.append({"label": "User-approved decision preferences", "as_of": datetime.now(timezone.utc).isoformat(),
-                         "url": None, "data": preference_context, "claim_type": "USER_BELIEF"})
+    # Canonical results are the single analytical truth source for both
+    # renderers. Preference context remains available to read-model builders,
+    # but is not injected as an alternative narration-only evidence channel.
     claim_types = {
         "prediction_market_intelligence": "MARKET_IMPLIED", "user_market_probability_comparison": "USER_BELIEF",
         "portfolio_decision_lab": "MODEL_OUTPUT", "portfolio_intelligence": "MODEL_OUTPUT", "portfolio_risk": "MODEL_OUTPUT",
@@ -4027,35 +4666,50 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
     if any(step["state"] in {"PARTIAL","FAILED"} for step in execution_steps):
         record_metric("ask.partial", tags={"intent":plan.intent})
     narration_started = time.monotonic()
-    deterministic_answer = ask_portfolio.compose(plan.intent, tool_results) or _deterministic_chat_answer(plan.intent, tool_results)
-    if not verification.answer_allowed:
+    deterministic_started = narration_started
+    deterministic_answer = (
+        capability_planner.render_composed(composed_result) if composed_result else
+        ask_portfolio.compose(plan.intent, tool_results) or _deterministic_chat_answer(plan.intent, tool_results)
+    )
+    if plan.intent == "UNSUPPORTED":
         deterministic_answer = (
-            f"I evaluated **{verification.coverage['evaluated']} of {verification.coverage['requested']} holdings** "
-            f"(**{verification.coverage['percent']:.1f}% coverage**), so I cannot reliably characterize the whole portfolio. "
+            "I can analyze this question only through EagleEyes' registered capabilities, but I don't yet have a supported "
+            "capability for the requested analytical requirement. No unrestricted AI financial reasoning was used."
+        )
+    canonical_check_messages = [check.message for check in analysis_result.verification.checks if not check.passed]
+    if not analysis_result.verification.answer_allowed:
+        requested_count = len(analysis_result.coverage.requested_entities)
+        evaluated_count = len(analysis_result.coverage.evaluated_entities)
+        percent = analysis_result.coverage.entity_coverage_percent
+        coverage_text = f"{percent:.1f}%" if percent is not None else "not tracked"
+        deterministic_answer = (
+            f"I evaluated **{evaluated_count} of {requested_count} requested entities** "
+            f"(**{coverage_text} coverage**), so I cannot reliably characterize the whole portfolio. "
             "No portfolio-wide conclusion or recommendation was generated.\n\n"
-            + "\n".join(f"- {message}" for message in verification.failures + verification.warnings)
+            + "\n".join(f"- {message}" for message in canonical_check_messages)
             + "\n\n**What to verify:** refresh missing holding evidence and rerun the analysis."
         )
-    elif not verification.recommendation_allowed and plan.intent in {
-        "PORTFOLIO_ANALYSIS", "THESIS_REPLACEMENT", "WATCHLIST_COMPARISON", "CASH_ALLOCATION"
+    elif analysis_result.status != AnalysisStatus.UNAVAILABLE and not analysis_result.verification.recommendation_allowed and plan.intent in {
+        "PORTFOLIO_ANALYSIS", "THESIS_REPLACEMENT", "WATCHLIST_COMPARISON"
     }:
         deterministic_answer = (
             "A valid actionable portfolio recommendation could not be produced. The verified diagnostics are still available, "
             "but attempted optimizer weights and trades have been withheld.\n\n"
-            + "\n".join(f"- {message}" for message in verification.failures + verification.warnings)
+            + "\n".join(f"- {message}" for message in canonical_check_messages)
             + "\n\n**What to verify:** resolve the listed coverage, constraint, or portfolio-state issue before using a rebalance."
         )
-    elif verification.status == "PARTIAL" and deterministic_answer:
-        if verification.coverage["percent"] < 90.0:
+    elif analysis_result.status == AnalysisStatus.PARTIAL and deterministic_answer:
+        if analysis_result.coverage.entity_coverage_percent is not None and analysis_result.coverage.entity_coverage_percent < 90.0:
             disclosure = (
-                f"> **Partial portfolio coverage:** {verification.coverage['evaluated']} of "
-                f"{verification.coverage['requested']} holdings ({verification.coverage['percent']:.1f}%) were evaluated. "
+                f"> **Partial analytical coverage:** {len(analysis_result.coverage.evaluated_entities)} of "
+                f"{len(analysis_result.coverage.requested_entities)} entities ({analysis_result.coverage.entity_coverage_percent:.1f}%) had every required field. "
                 "Treat portfolio-wide conclusions as provisional."
             )
         else:
-            limitations = verification.failures + verification.warnings
+            limitations = canonical_check_messages or analysis_result.warnings or analysis_result.limitations
             disclosure = "> **Verification limitation:** " + " ".join(limitations)
         deterministic_answer = disclosure + "\n\n" + deterministic_answer
+    deterministic_render_ms = round((time.monotonic() - deterministic_started) * 1000, 2)
     # Earnings questions ask for interpretation ("what changed" and thesis
     # impact), not merely a dump of stored fields. Use Gemini when configured,
     # while retaining the polished deterministic answer as a zero-latency and
@@ -4065,12 +4719,14 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
         "HIDDEN_RISK", "MULTI_SCENARIO", "WATCHLIST_COMPARISON", "PORTFOLIO_EVENTS",
         "DATA_QUALITY", "SCORE_ATTRIBUTION", "THESIS_INVALIDATION", "PORTFOLIO_ANALYSIS", "PORTFOLIO_RISK",
         "MULTIFACTOR_SCREEN", "RECOMMENDATION_COUNTERCASE", "CASH_ALLOCATION",
+        "COMPOSED_ANALYSIS",
     }
     # Gemini is an optional renderer, never the request's correctness or
     # availability boundary. Deterministic answers are the default fast path;
     # deployments may opt into synchronous prose enrichment explicitly.
     enrichment_enabled = os.getenv("ASK_GEMINI_ENRICHMENT", "0").strip().lower() in {"1", "true", "on", "yes"}
-    interpret_with_gemini = verification.status == "SUCCESS" and bool(os.getenv("GEMINI_API_KEY", "").strip()) and (
+    minimum_gemini_budget_ms = float(os.getenv("ASK_GEMINI_MINIMUM_BUDGET_MS", "750"))
+    interpret_with_gemini = deadline.remaining_ms() >= minimum_gemini_budget_ms and analysis_result.status == AnalysisStatus.SUCCESS and analysis_result.verification.passed and bool(os.getenv("GEMINI_API_KEY", "").strip()) and (
         deterministic_answer is None or (enrichment_enabled and plan.intent in {"EARNINGS", *synthesis_intents})
     )
     if not interpret_with_gemini:
@@ -4079,11 +4735,15 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
         record_metric("ask.narration.fast_path", tags={"intent": plan.intent})
     else:
         try:
+            narration_budget_ms = min(float(os.getenv("ASK_GEMINI_NARRATION_BUDGET_MS", "2500")), deadline.remaining_ms())
+            set_gemini_deadline(time.monotonic() + max(0.05, narration_budget_ms / 1000))
             answer, model = ask_gemini(payload.question, evidence, history, conversation_meta.get("summary") or "")
         except Exception as exc:
             record_metric("ask.narration.fallback", tags={"intent": plan.intent, "error_type": type(exc).__name__})
             answer = deterministic_answer or _chat_narration_fallback(tool_results)
             model = "deterministic-timeout-fallback-v1"
+        finally:
+            clear_gemini_deadline()
     if dashboard_execution and dashboard_execution.response:
         answer = answer.rstrip() + f"\n\n**Canvas:** {dashboard_execution.response}"
     narration_elapsed = time.monotonic() - narration_started
@@ -4091,6 +4751,18 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
     structured_content = {
         "sources": sources, "tool_results": tool_results,
         "execution_plan": {**plan.payload(), "steps": execution_steps,
+                           "capability_plan": compositional_plan.model_dump(mode="json") if compositional_plan else None,
+                           "registry_version": capability_planner.CAPABILITY_REGISTRY_VERSION,
+                           "planner": planner_telemetry.__dict__,
+                           "request_id": request_id,
+                           "absolute_deadline_monotonic": deadline.absolute_deadline_monotonic,
+                           "initial_budget_ms": round((deadline.absolute_deadline_monotonic - deadline.started_monotonic) * 1000, 2),
+                           "deadline_remaining_ms": deadline.remaining_ms(),
+                           "nodes_total": len(execution_outcomes),
+                           "nodes_started": sum(row.started_monotonic is not None for row in execution_outcomes),
+                           "nodes_completed": sum(row.completed_monotonic is not None for row in execution_outcomes),
+                           "nodes_timed_out": sum(row.status == ask_execution.NodeStatus.TIMED_OUT for row in execution_outcomes),
+                           "nodes_skipped": sum(row.status in {ask_execution.NodeStatus.SKIPPED_DEADLINE, ask_execution.NodeStatus.SKIPPED_DEPENDENCY} for row in execution_outcomes),
                            "elapsed_seconds": round(time.monotonic() - started, 3),
                            "timings": {"tools_seconds": round(tools_elapsed, 3),
                                        "narration_seconds": round(narration_elapsed, 3),
@@ -4102,31 +4774,155 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
                              "request_id": request_id,
                              "portfolio_context_version": portfolio_context.version if portfolio_context else None,
                              "portfolio_position_count": portfolio_context.total_positions if portfolio_context else 0,
-                             "cache_hit": True, "evidence_coverage": verification.coverage,
-                             "verification_status": verification.status,
-                             "recommendation_allowed": verification.recommendation_allowed,
+                             "cache_hit": any(dependency.cache_state in {"read_model_hit", "CURRENT", "STALE"} for dependency in analysis_result.dependencies),
+                             "evidence_coverage": analysis_result.coverage.model_dump(mode="json"),
+                             "verification_status": analysis_result.status.value,
+                             "recommendation_allowed": analysis_result.verification.recommendation_allowed,
                              "gemini_started": interpret_with_gemini,
                              "gemini_completed": not str(model).startswith("deterministic"),
                              "fallback_used": model == "deterministic-timeout-fallback-v1",
+                             "persistence_status": "STAGED",
                              "answer_complete": "answer is incomplete" not in answer.lower(),
                              "router_version": "v2" if ASK_ROUTER_V2_ENABLED else "v1"},
-        "analysis_result": analysis_result,
+        "analysis_result": analysis_result.model_dump(mode="json", exclude_none=True),
+        "canonical_results": [result.model_dump(mode="json", exclude_none=True) for result in canonical_results],
         "actions": ask_orchestration.actions_for(plan, page_context),
         "grounding": {"categories": ["VERIFIED_FACT", "MODEL_OUTPUT", "MARKET_IMPLIED", "USER_BELIEF", "AI_INTERPRETATION"],
                       "tool_claim_types": {item.get("tool_name"): claim_types.get(str(item.get("tool_name")), "VERIFIED_FACT") for item in tool_results}},
     }
+    result_ids = ([finding.result_id for finding in composed_result.supported_findings]
+                  if composed_result else [f"result_{stable_fingerprint({'capability': row.capability, 'fingerprint': row.input_fingerprint})[:16]}" for row in canonical_results])
+    structured_content["analysis_context"].update({
+        "result_ids": result_ids,
+        "composed_result_id": composed_result.result_id if composed_result else None,
+        "analytical_context": capability_planner.ConversationAnalyticalContext(
+            active_entities=(compositional_plan.entities if compositional_plan else [
+                capability_planner.ResolvedEntity(kind=capability_planner.EntityKind.SECURITY, canonical_id=ticker)
+                for ticker in plan.tickers
+            ]),
+            active_portfolio=requested_portfolio_id,
+            active_comparison=list(plan.tickers) if len(plan.tickers) > 1 else [],
+            active_capabilities=list(plan.tools), recent_result_ids=result_ids,
+            active_scenario=[factor.factor + ":" + factor.direction for factor in scenario_factors],
+        ).model_dump(mode="json"),
+    })
+    if composed_result:
+        structured_content["composed_analysis_result"] = composed_result.model_dump(mode="json", exclude_none=True)
     visual_suggestion = dashboard_chat.visual_suggestion_for(payload.question)
     if visual_suggestion:
         structured_content["visual_suggestion"] = visual_suggestion
+    if dashboard_request.requires_new_analysis and canonical_results:
+        try:
+            dashboard_plan, dashboard_draft = dashboard_presentation.materialize_verified_dashboard(
+                user.id, conversation_id, requested_portfolio_id, payload.question, canonical_results,
+                single_widget=dashboard_request.intent != dashboard_chat.DashboardChatIntent.CREATE_DASHBOARD,
+                resource_type=dashboard_resource_type, resource_id=dashboard_resource_id,
+            )
+            dashboard_execution = dashboard_chat.DashboardChatExecution(
+                handled=True, mixed_answer=True, intent=dashboard_request.intent,
+                response=(
+                    f"I built {dashboard_plan.title} from {len(dashboard_plan.source_result_ids)} verified "
+                    f"analytical result{'s' if len(dashboard_plan.source_result_ids) != 1 else ''}."
+                ),
+                resource_type="draft", resource_id=str(dashboard_draft["id"]),
+                widget_id=dashboard_plan.widgets[-1].widget_id if dashboard_plan.widgets else None,
+                action_result=DashboardActionResult(
+                    status=DashboardActionStatus.SUCCESS,
+                    action={"type": dashboard_request.intent.value, "dashboard_plan_version": dashboard_plan.version,
+                            "source_result_ids": dashboard_plan.source_result_ids},
+                    dashboard=dashboard_draft,
+                ),
+            )
+            page_context["dashboard_resource_type"] = "draft"
+            page_context["dashboard_resource_id"] = str(dashboard_draft["id"])
+            structured_content["page_context"] = page_context
+            structured_content["dashboard_plan"] = dashboard_plan.model_dump(mode="json")
+            answer = (
+                f"I built **{dashboard_plan.title}** from the verified analysis. "
+                "The canvas contains the supported results and keeps pending or unavailable work independent."
+            )
+        except (KeyError, ValueError) as exc:
+            record_metric("ask.dashboard_materialization.failure", tags={"error_type": type(exc).__name__})
     if dashboard_execution:
         structured_content["dashboard_operation"] = dashboard_execution.model_dump(mode="json", exclude_none=True)
+        operation_dashboard = (dashboard_execution.action_result.dashboard if dashboard_execution.action_result else None) or {}
+        operation_widgets = operation_dashboard.get("layout") or (operation_dashboard.get("specification") or {}).get("widgets") or []
+        operation_revision = (dashboard_execution.action_result.revision if dashboard_execution.action_result else None) or {}
         structured_content["analysis_context"].update({
             "dashboard_widget_id": dashboard_execution.widget_id,
             "dashboard_resource_type": dashboard_execution.resource_type,
             "dashboard_resource_id": dashboard_execution.resource_id,
+            "active_dashboard_id": dashboard_execution.resource_id,
+            "active_revision_id": operation_revision.get("id"),
+            "canvas_open": True,
+            "active_widget_ids": [str(widget.get("id")) for widget in operation_widgets],
+            "recent_widget_id": dashboard_execution.widget_id,
+            "widget_result_references": {
+                str(widget.get("id")): str(widget.get("source_result_id"))
+                for widget in operation_widgets if widget.get("source_result_id")
+            },
+            "recent_dashboard_actions": [dashboard_execution.action_result.action] if dashboard_execution.action_result else [],
         })
-    message = database.save_chat_message(user.id, conversation_id, "assistant", answer, structured_content, model)
-    _persist_chat_tool_links(user.id, conversation_id, message["id"], tool_results)
+    failed_required = [dependency.name for dependency in analysis_result.dependencies if dependency.required and dependency.status in {AnalysisStatus.FAILED, AnalysisStatus.UNAVAILABLE}]
+    failed_optional = [dependency.name for dependency in analysis_result.dependencies if not dependency.required and dependency.status in {AnalysisStatus.FAILED, AnalysisStatus.UNAVAILABLE}]
+
+    def record_request_outcome(persistence_status: str, error_class: str | None = None) -> None:
+        timed_out = sum(row.status == ask_execution.NodeStatus.TIMED_OUT for row in execution_outcomes)
+        skipped = sum(row.status in {ask_execution.NodeStatus.SKIPPED_DEADLINE, ask_execution.NodeStatus.SKIPPED_DEPENDENCY} for row in execution_outcomes)
+        record_capability_request(
+            request_id=request_id, conversation_id=conversation_id, capability=analysis_result.capability,
+            intent=plan.intent, request_started_at=request_started_at, request_completed_at=telemetry_utc_now(),
+            total_latency_ms=round((time.monotonic() - started) * 1000, 2),
+            input_fingerprint=analysis_result.input_fingerprint, result_status=analysis_result.status.value,
+            verification_status="PASSED" if analysis_result.verification.passed else "LIMITED",
+            entity_coverage=analysis_result.coverage.entity_coverage_percent,
+            field_coverage=analysis_result.coverage.field_coverage_percent,
+            weight_coverage=analysis_result.coverage.weight_coverage_percent,
+            calculated_at=analysis_result.freshness.calculated_at.isoformat(),
+            effective_through=analysis_result.freshness.effective_through.isoformat() if analysis_result.freshness.effective_through else None,
+            oldest_required_input=analysis_result.freshness.oldest_required_input.isoformat() if analysis_result.freshness.oldest_required_input else None,
+            cache_state=next((dependency.cache_state for dependency in analysis_result.dependencies if dependency.cache_state != "not_tracked"), "not_tracked"),
+            read_model_version=analysis_result.calculation_version,
+            gemini_started=interpret_with_gemini, gemini_completed=not str(model).startswith("deterministic"),
+            gemini_latency_ms=round(narration_elapsed * 1000, 2) if interpret_with_gemini else 0.0,
+            persistence_status=persistence_status, error_class=error_class,
+            required_dependency_failures=",".join(failed_required) or "none",
+            optional_dependency_failures=",".join(failed_optional) or "none",
+            absolute_deadline=round(deadline.absolute_deadline_monotonic, 6),
+            initial_budget_ms=round((deadline.absolute_deadline_monotonic - deadline.started_monotonic) * 1000, 2),
+            queue_wait_ms=0.0,
+            auth_latency_ms=auth_latency_ms, execution_started_at=execution_started_at,
+            execution_completed_at=execution_completed_at, nodes_total=len(execution_outcomes),
+            nodes_started=sum(row.started_monotonic is not None for row in execution_outcomes),
+            nodes_completed=sum(row.completed_monotonic is not None for row in execution_outcomes),
+            nodes_timed_out=timed_out, nodes_skipped=skipped,
+            total_execution_ms=round(tools_elapsed * 1000, 2),
+            deterministic_render_ms=deterministic_render_ms,
+        )
+
+    persistence_started = time.monotonic()
+    final_state = {
+        AnalysisStatus.SUCCESS: "COMPLETED", AnalysisStatus.PARTIAL: "PARTIAL",
+        AnalysisStatus.UNAVAILABLE: "UNAVAILABLE", AnalysisStatus.FAILED: "FAILED",
+        AnalysisStatus.PENDING: "PARTIAL",
+    }[analysis_result.status]
+    try:
+        structured_content["analysis_context"]["persistence_status"] = "SUCCESS"
+        database.stage_ask_request_result(user.id, request_id, {
+            "answer": answer, "structured_content": structured_content, "model": model,
+            "sources": sources, "tool_results": tool_results, "artifacts": _chat_tool_artifacts(tool_results),
+            "final_state": final_state,
+        })
+        persisted_response = database.complete_ask_request(user.id, request_id, final_state=final_state)
+        message = persisted_response["message"]
+    except Exception as exc:
+        try:
+            database.fail_ask_request(user.id, request_id, type(exc).__name__, persistence=True)
+        except Exception:
+            pass
+        record_request_outcome("FAILED", type(exc).__name__)
+        raise
+    persistence_latency_ms = round((time.monotonic() - persistence_started) * 1000, 2)
     updated_history = [*history, {"role": "user", "content": payload.question}, message]
     summarized_count = int(conversation_meta.get("summary_message_count") or 0)
     if len(updated_history) >= 12 and len(updated_history) - summarized_count >= 8:
@@ -4135,6 +4931,9 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
             _conversation_summary(updated_history, conversation_meta.get("summary") or ""),
             len(updated_history),
         )
+    record_capability_request(request_id=request_id, capability=analysis_result.capability,
+                              persistence_status="SUCCESS", persistence_latency_ms=persistence_latency_ms)
+    record_request_outcome("SUCCESS")
     record_metric("ask.total.latency_ms",(time.monotonic()-started)*1000,tags={"intent":plan.intent,"status":"complete"})
     LOGGER.info(
         "ask_request request_id=%s intent=%s positions=%s context_version=%s tools=%s statuses=%s "
@@ -4148,7 +4947,7 @@ def chat_message(payload: ChatRequest, user: AuthenticatedUser = Depends(require
         model == "deterministic-timeout-fallback-v1", round(tools_elapsed * 1000),
         round(narration_elapsed * 1000), round((time.monotonic() - started) * 1000),
     )
-    return {"conversation_id": conversation_id, "message": message, "sources": sources, "tool_results": tool_results}
+    return persisted_response
 
 
 @app.post("/api/dashboard/drafts", status_code=202)

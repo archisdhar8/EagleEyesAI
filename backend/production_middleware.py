@@ -25,11 +25,14 @@ def _identity(request: Request) -> str:
 async def production_guard(request: Request, call_next):
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     started = time.perf_counter()
+    request.state.request_id = request_id
+    request.state.request_started_monotonic = started
+    request.state.request_started_at = time.time()
     max_body = int(os.getenv("MAX_REQUEST_BYTES", "1048576"))
     content_length = request.headers.get("content-length")
     if content_length and content_length.isdigit() and int(content_length) > max_body:
         return JSONResponse({"detail": "Request body is too large", "request_id": request_id}, status_code=413)
-    if request.method != "OPTIONS" and request.url.path not in {"/api/health"}:
+    if request.method != "OPTIONS" and request.url.path not in {"/api/health", "/api/health/readiness"}:
         limit = int(os.getenv("RATE_LIMIT_REQUESTS_PER_MINUTE", "240"))
         key = f"{_identity(request)}:{request.url.path.split('/', 3)[:3]}"
         now = time.monotonic()

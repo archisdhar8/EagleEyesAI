@@ -43,7 +43,7 @@ def test_exact_research_detail_reuses_shared_stored_evidence_without_user_contex
     assert second[0][0]["company"] == "Example"
 
 
-def test_analysis_reuses_same_market_session_and_restores_latest(monkeypatch) -> None:
+def test_analysis_reuses_same_durable_job_without_inline_optimizer(monkeypatch) -> None:
     calls: list[dict] = []
 
     def fake_run(holdings, profile):
@@ -68,16 +68,14 @@ def test_analysis_reuses_same_market_session_and_restores_latest(monkeypatch) ->
         second = client.post("/api/analyses", json=request)
         latest = client.get("/api/analyses/latest")
 
-    assert first.status_code == 200
-    assert first.json()["cache_status"] == "miss"
-    assert second.json()["cache_status"] == "hit"
-    assert second.json()["id"] == first.json()["id"]
-    assert second.json()["market_session"] == "2026-08-14"
-    assert latest.json()["analysis"]["id"] == first.json()["id"]
-    assert len(calls) == 1
+    assert first.status_code == 202
+    assert first.json()["status"] == "PENDING"
+    assert second.json()["job"]["id"] == first.json()["job"]["id"]
+    assert latest.json()["analysis"] is None
+    assert calls == []
 
 
-def test_objective_change_invalidates_analysis_cache(monkeypatch) -> None:
+def test_objective_change_creates_distinct_durable_optimizer_job(monkeypatch) -> None:
     calls: list[dict] = []
 
     def fake_run(holdings, profile):
@@ -102,7 +100,7 @@ def test_objective_change_invalidates_analysis_cache(monkeypatch) -> None:
             json={"portfolio": portfolio, "profile": {"objectives": {"expected_return": 0.75}}},
         )
 
-    assert first.json()["cache_status"] == "miss"
-    assert changed.json()["cache_status"] == "miss"
-    assert changed.json()["id"] != first.json()["id"]
-    assert len(calls) == 2
+    assert first.json()["status"] == "PENDING"
+    assert changed.json()["status"] == "PENDING"
+    assert changed.json()["job"]["id"] != first.json()["job"]["id"]
+    assert calls == []

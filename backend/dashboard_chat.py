@@ -40,6 +40,7 @@ class DashboardChatRequest(BaseModel):
     clarification: str | None = None
     dashboard_prompt: str | None = Field(default=None, min_length=3, max_length=3000)
     dashboard_name: str | None = Field(default=None, min_length=1, max_length=120)
+    requires_new_analysis: bool = False
 
 
 class DashboardChatExecution(BaseModel):
@@ -103,6 +104,8 @@ def _widget_kind(question: str) -> tuple[str | None, str | None, str | None]:
         return "sector_exposure", visualization or "bar_chart", "Sector Exposure"
     if any(term in lower for term in ("concentrated", "concentration")):
         return "sector_exposure", visualization or "bar_chart", "Sector Exposure"
+    if "risk contributor" in lower:
+        return "portfolio_risk", visualization or "bar_chart", "Largest Risk Contributors"
     if any(term in lower for term in ("performance", "return")) and any(term in lower for term in ("portfolio", "my ", "against", "benchmark")):
         return "portfolio_performance", visualization or "line_chart", "Portfolio Performance"
     if "allocation" in lower:
@@ -244,7 +247,17 @@ def interpret_dashboard_request(
     )
     if dashboard_build:
         prompt = re.sub(r"^/design\s*", "", question, flags=re.I).strip()
-        return DashboardChatRequest(intent=DashboardChatIntent.CREATE_DASHBOARD, dashboard_prompt=prompt or "Build a portfolio overview dashboard")
+        return DashboardChatRequest(intent=DashboardChatIntent.CREATE_DASHBOARD, dashboard_prompt=prompt or "Build a portfolio overview dashboard", requires_new_analysis=True)
+    if widgets and re.search(r"\brefresh\b.*\b(?:analysis|data|view|dashboard|verified)\b|\b(?:analysis|data|view|dashboard)\b.*\brefresh\b", lower):
+        return DashboardChatRequest(
+            intent=DashboardChatIntent.CREATE_WIDGET,
+            mixed_answer=True,
+            requires_new_analysis=True,
+        )
+    if "backtest" in lower and any(term in lower for term in ("add", "show", "chart", "dashboard")):
+        return DashboardChatRequest(intent=DashboardChatIntent.CREATE_WIDGET, mixed_answer=True, widget_type="portfolio_backtest", title="Portfolio Backtest", visualization="line_chart", requires_new_analysis=True)
+    if "market regime" in lower and any(term in lower for term in ("compare", "add", "show")):
+        return DashboardChatRequest(intent=DashboardChatIntent.CREATE_WIDGET, mixed_answer=True, widget_type="market_state", title="Current Market Regime", visualization="cards", requires_new_analysis=True)
     visual_word = any(term in lower for term in ("chart", "graph", "table", "heatmap", "heat map", "visually", "widget"))
     create_word = any(re.search(pattern, lower) for pattern in (r"\badd\b", r"\bshow\b", r"\bdisplay\b", r"\bvisualize\b", r"\bplot\b"))
     delete_word = any(term in lower for term in ("remove", "delete"))
@@ -285,13 +298,17 @@ def interpret_dashboard_request(
         prior = target or {}
         metric = str((prior.get("binding") or {}).get("metric") or prior.get("widget_type") or "")
         binding = _binding_for(question, metric, prior) if metric else None
-        return DashboardChatRequest(intent=DashboardChatIntent.UPDATE_WIDGET, widget_id=str(target.get("id")) if target else None, visualization=_visualization(question), binding=binding, clarification=clarification)
-    if create_word and (visual_word or "exposure" in lower or "performance" in lower):
+        requested_visual = _visualization(question)
+        requires_analysis = bool(_period(question) or "show only" in lower or re.search(r"(?:against|versus|vs\.?|benchmark)\s+[A-Z]", question, re.I))
+        return DashboardChatRequest(intent=DashboardChatIntent.UPDATE_WIDGET, widget_id=str(target.get("id")) if target else None, visualization=requested_visual, binding=binding, clarification=clarification, requires_new_analysis=requires_analysis)
+    if create_word and (visual_word or "exposure" in lower or "performance" in lower or "risk contributor" in lower):
         widget_type, visualization, title = _widget_kind(question)
         if not widget_type:
             return DashboardChatRequest(intent=DashboardChatIntent.CREATE_WIDGET, clarification="What should the new widget show?")
         mixed = any(term in lower for term in ("where ", "what ", "why ", "analyze", "explain")) and "show" in lower
-        return DashboardChatRequest(intent=DashboardChatIntent.CREATE_WIDGET, mixed_answer=mixed, widget_type=widget_type, title=title, visualization=visualization, binding=_binding_for(question, widget_type))
+        return DashboardChatRequest(intent=DashboardChatIntent.CREATE_WIDGET, mixed_answer=mixed, widget_type=widget_type, title=title, visualization=visualization, binding=_binding_for(question, widget_type), requires_new_analysis=True)
+    if create_word and any(term in lower for term in ("visualize", "visually", "plot")):
+        return DashboardChatRequest(intent=DashboardChatIntent.CREATE_WIDGET, mixed_answer=True, requires_new_analysis=True)
     return DashboardChatRequest(intent=DashboardChatIntent.NORMAL_ANSWER)
 
 

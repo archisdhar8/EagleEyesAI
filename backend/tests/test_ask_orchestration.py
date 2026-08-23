@@ -7,7 +7,7 @@ from backend.ask_orchestration import (
 def test_intent_routing_uses_smallest_approved_tool_set():
     plan = build_plan("What changed in MSFT since my last review?", "research")
     assert plan.intent == "CHANGE"
-    assert plan.tools == ("evidence_changes", "thesis_monitor")
+    assert plan.tools == ("historical_change",)
     assert plan.tickers == ("MSFT",)
     assert len(plan.tools) <= MAX_TOOL_CALLS
     assert plan.limits["max_retries"] == MAX_RETRIES == 0
@@ -32,7 +32,7 @@ def test_followup_continuity_preserves_comparison_entities():
 
 def test_specialized_intents_do_not_receive_unrelated_tools():
     earnings = build_plan("What changed in AAPL earnings?", "research")
-    assert earnings.tools == ("earnings_intelligence",)
+    assert earnings.tools == ("company_analysis",)
     assert "today_attention" not in earnings.tools
     assert "decision_journal" not in earnings.tools
 
@@ -73,7 +73,7 @@ def test_benchmark_outlook_and_portfolio_wide_thesis_questions_use_saved_context
     assert benchmark.tools == ("benchmark_outlook",)
     theses = build_plan("Which of my saved theses need review?", "research")
     assert theses.intent == "THESIS"
-    assert theses.tools == ("thesis_monitor", "evidence_changes")
+    assert theses.tools == ("thesis_monitor",)
     assert "stored_evidence" not in theses.tools
 
 
@@ -144,3 +144,27 @@ def test_high_impact_portfolio_question_contracts_and_entity_safety():
 def test_common_uppercase_words_are_not_tickers():
     plan = build_plan("I use AI and ETF research, and THE SEC heading is visible", "research")
     assert plan.tickers == ()
+
+
+def test_phase8_visual_followup_reuses_registered_analytical_capability() -> None:
+    previous = {
+        "intent": "PORTFOLIO_RISK",
+        "analytical_context": {"active_capabilities": ["portfolio_risk"], "recent_result_ids": ["result_123"]},
+    }
+    plan = build_plan("Visualize that.", "research", {"portfolio_id": "portfolio-61"}, previous)
+    assert plan.intent == "PORTFOLIO_RISK"
+    assert plan.tools == ("portfolio_risk",)
+    assert plan.requires_portfolio
+    refresh = build_plan("Refresh this analysis using the latest verified data.", "research", {"portfolio_id": "portfolio-61"}, previous)
+    assert refresh.intent == "PORTFOLIO_RISK"
+    assert refresh.tools == ("portfolio_risk",)
+
+
+def test_phase8_risk_market_and_backtest_followups_use_normal_capability_boundary() -> None:
+    risk = build_plan("Add my largest risk contributors.", "research", {"portfolio_id": "portfolio-61"})
+    assert risk.tools == ("portfolio_risk",)
+    market = build_plan("Compare against the current market regime.", "research", {"portfolio_id": "portfolio-61"})
+    assert market.tools == ("market_state",)
+    backtest = build_plan("Add a five-year backtest against SPY.", "research", {"portfolio_id": "portfolio-61"})
+    assert backtest.tools == ("portfolio_backtest",)
+    assert backtest.requires_portfolio

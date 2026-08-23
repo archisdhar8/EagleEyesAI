@@ -27,6 +27,11 @@ class AskPlan:
 
 
 _INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("MACRO_STATE", ("macro environment", "economic conditions", "recession risks", "rates and inflation", "macro risks", "macro factors")),
+    ("MARKET_STATE", ("kind of market", "market risk-on", "market risk off", "risk-on or risk-off", "sectors are leading", "sector leadership", "market environment", "current market regime", "market regime")),
+    ("PREDICTION_MARKETS", ("prediction markets matter", "probabilities changed", "market-implied risks", "prediction-market risks", "prediction market odds")),
+    ("HISTORICAL_CHANGE", ("changed for", "since i last looked", "changed in macro since", "company score change")),
+    ("DEEP_RESEARCH", ("deep research", "broad research", "research dossier", "full company research")),
     ("OPPORTUNITY_RANKING", ("strongest opportunities", "opportunities in my portfolio", "best opportunities in my portfolio")),
     ("THESIS_REPLACEMENT", ("weakest investment thesis", "weakest thesis", "replace it with", "replacement for")),
     ("PORTFOLIO_CHANGE", ("materially changed in my portfolio", "portfolio since my last review", "portfolio changed since")),
@@ -45,6 +50,7 @@ _INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("MULTIFACTOR_SCREEN", ("improving fundamentals", "reasonable valuation", "positive momentum")),
     ("RECOMMENDATION_COUNTERCASE", ("arguments against", "top recommendation", "bear case against")),
     ("CASH_ALLOCATION", ("invested new cash", "new cash today", "better than holding cash", "where should it go")),
+    ("BACKTEST", ("backtest", "historical test against", "five-year test against")),
     ("RETROSPECTIVE", ("why did i", "original decision", "decision journal", "retrospective", "mistakes repeat", "forecast calibration", "my decisions", "saved decisions", "decision history")),
     ("EARNINGS", ("earnings", "guidance", "estimate revision", "reported quarter", "beat estimates", "missed estimates")),
     ("CHANGE", ("what changed", "since last review", "different since", "new evidence", "material change")),
@@ -53,7 +59,7 @@ _INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("RESEARCH_RANKING", ("strongest and weakest research", "strongest research evidence", "weakest research evidence", "rank my holdings", "rank the holdings", "best and worst research evidence", "worst stock holding", "worst holding", "weakest stock holding", "weakest holding")),
     ("BENCHMARK_OUTLOOK", ("outperform spy", "underperform spy", "beat spy", "lag spy", "relative to spy", "versus spy", "vs spy")),
     ("PORTFOLIO_ANALYSIS", ("balanced alternative", "risk-controlled alternative", "goal-tilted alternative", "rebalance", "rebalancing", "optimizer", "target weight", "allocation change", "improve diversification", "without silently changing my constraints", "move out", "exit candidates", "stocks to remove", "holdings to remove")),
-    ("PORTFOLIO_RISK", ("biggest risks", "saved portfolio risk", "portfolio risks", "portfolio concentrated", "portfolio concentration", "hidden exposure", "same macro risk", "shared macro", "risk contribution", "fragile")),
+    ("PORTFOLIO_RISK", ("biggest risks", "saved portfolio risk", "portfolio risks", "portfolio concentrated", "portfolio concentration", "where am i most concentrated", "most concentrated", "hidden exposure", "same macro risk", "shared macro", "risk contribution", "risk contributors", "fragile")),
     ("COMPARISON", ("compare ", " versus ", " vs ", "stronger business", "which is better")),
     ("FORECAST", ("prediction market", "market pricing", "probability", "odds", "forecast", "fed cut", "export restriction")),
     ("TODAY", ("attention today", "what matters today", "review today", "requires my attention")),
@@ -103,47 +109,66 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
         "MULTIFACTOR_SCREEN": ("multifactor_screen",),
         "RECOMMENDATION_COUNTERCASE": ("recommendation_countercase",),
         "CASH_ALLOCATION": ("cash_allocation",),
+        "BACKTEST": ("portfolio_backtest",),
         "RETROSPECTIVE": ("decision_journal",),
         # Earnings intelligence already joins the latest saved thesis-monitor
         # result for the requested ticker. Running thesis_monitor again only
         # repeats owner-scoped database work and lengthens the answer path.
-        "EARNINGS": ("earnings_intelligence",),
-        "CHANGE": ("evidence_changes", "thesis_monitor"),
-        "THESIS": ("thesis_monitor", "evidence_changes"),
+        "EARNINGS": ("company_analysis",),
+        "CHANGE": ("historical_change",),
+        "THESIS": ("thesis_monitor",),
         "SCENARIO": ("portfolio_scenario",),
         "RESEARCH_RANKING": ("security_ranking",),
         "BENCHMARK_OUTLOOK": ("benchmark_outlook",),
         "PORTFOLIO_ANALYSIS": ("portfolio_analysis",),
         "PORTFOLIO_RISK": ("portfolio_risk",),
-        "COMPARISON": ("company_comparison", "portfolio_intelligence"),
-        "FORECAST": ("forecasting", "thesis_monitor"),
+        "COMPARISON": ("company_comparison",),
+        "FORECAST": ("prediction_markets",),
+        "MACRO_STATE": ("macro_state",),
+        "MARKET_STATE": ("market_state",),
+        "PREDICTION_MARKETS": ("prediction_markets",),
+        "HISTORICAL_CHANGE": ("historical_change",),
+        "DEEP_RESEARCH": ("company_research",),
         "TODAY": ("today_attention",),
-        "ADD_RESEARCH": ("company_research", "portfolio_intelligence", "thesis_monitor", "forecasting"),
-        "COMPANY_RESEARCH": ("company_research",),
+        "ADD_RESEARCH": ("company_research", "portfolio_intelligence", "thesis_monitor", "prediction_markets"),
+        "COMPANY_RESEARCH": ("company_analysis",),
         "GENERAL": ("stored_evidence",),
     }
     enabled = set((page_context or {}).get("enabled_context") or ("evidence", "thesis", "portfolio"))
     tools = list(mappings[intent])
+    previous_structured = (previous_analysis or {}).get("analytical_context") if isinstance((previous_analysis or {}).get("analytical_context"), dict) else (previous_analysis or {})
+    if intent == "GENERAL" and re.search(r"\b(?:visualize|visualise|plot|graph|chart)\b(?:\s+that|\s+this|\s+it)?|\brefresh\b.*\b(?:analysis|data|view|dashboard|verified)\b", question, re.I):
+        prior_capabilities = [str(value) for value in previous_structured.get("active_capabilities", [])]
+        registered = [value for value in prior_capabilities if value in {
+            "company_analysis", "company_comparison", "portfolio_risk", "portfolio_intelligence",
+            "macro_state", "market_state", "prediction_markets", "portfolio_scenario", "portfolio_backtest",
+        }]
+        if registered:
+            tools = registered[:MAX_TOOL_CALLS]
+            intent = str((previous_analysis or {}).get("intent") or "COMPOSED_ANALYSIS")
     if intent == "SCENARIO" and any(phrase in question.lower() for phrase in (
         "which holding", "holdings affected", "portfolio exposure", "risk contribution",
     )):
         tools.append("portfolio_intelligence")
-    if intent in {"CHANGE", "EARNINGS", "COMPARISON", "COMPANY_RESEARCH"} and not tickers:
+    if intent in {"CHANGE", "HISTORICAL_CHANGE", "EARNINGS", "COMPARISON", "COMPANY_RESEARCH", "DEEP_RESEARCH"} and not tickers:
         tools = ["stored_evidence"]
     portfolio_tools = {
         "portfolio_overview", "thesis_replacement", "portfolio_change", "valuation_ranking",
         "portfolio_intelligence", "portfolio_scenario", "watchlist_comparison", "portfolio_events",
         "data_quality", "score_attribution", "multifactor_screen", "recommendation_countercase",
-        "cash_allocation", "thesis_invalidation", "portfolio_analysis", "portfolio_risk", "security_ranking", "benchmark_outlook",
+        "cash_allocation", "thesis_invalidation", "portfolio_analysis", "portfolio_risk", "security_ranking", "benchmark_outlook", "portfolio_backtest",
     }
     if "portfolio" not in enabled:
         tools = [tool for tool in tools if tool not in portfolio_tools]
     if "thesis" not in enabled:
         tools = [tool for tool in tools if tool != "thesis_monitor"]
     if "evidence" not in enabled:
-        tools = [tool for tool in tools if tool not in {"stored_evidence", "evidence_changes", "company_research", "company_comparison", "earnings_intelligence", "forecasting"}]
+        tools = [tool for tool in tools if tool not in {"stored_evidence", "evidence_changes", "company_research", "company_analysis", "company_comparison", "earnings_intelligence", "forecasting", "macro_state", "market_state", "prediction_markets", "historical_change"}]
     tools = list(dict.fromkeys(tools))[:MAX_TOOL_CALLS]
-    requires_portfolio = bool(set(tools) & portfolio_tools)
+    requires_portfolio = bool(set(tools) & portfolio_tools) or (
+        intent in {"MACRO_STATE", "MARKET_STATE", "PREDICTION_MARKETS", "FORECAST", "COMPARISON"}
+        and any(phrase in question.lower() for phrase in ("my portfolio", "portfolio fit", "portfolio exposure", "portfolio risk"))
+    )
     confidence = 0.98 if intent != "GENERAL" else 0.35
     return AskPlan(
         intent=intent,

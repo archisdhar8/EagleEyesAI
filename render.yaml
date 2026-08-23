@@ -2,10 +2,11 @@ services:
   - type: web
     name: eagleeyes-api
     runtime: python
-    plan: free
+    plan: starter
     buildCommand: pip install -r backend/requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /api/health
+    healthCheckPath: /api/health/readiness
+    maxShutdownDelaySeconds: 60
     envVars:
       - key: DATABASE_URL
         sync: false
@@ -19,10 +20,38 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
-      - key: CHAT_ANALYSIS_CONCURRENCY
-        value: "1"
+      - key: ASK_DAG_CONCURRENCY
+        value: "3"
       - key: ASK_ROUTER_V2
         value: "1"
+      - key: ASK_CAPABILITY_PLANNER_GEMINI
+        value: "0"
+      - key: ASK_GEMINI_ENRICHMENT
+        value: "0"
+      - key: HEAVY_ANALYTICS_ENABLED
+        value: "1"
+      - key: SIMULATION_ENABLED
+        value: "1"
+      - key: OPTIMIZER_ENABLED
+        value: "1"
+      - key: BACKTESTING_ENABLED
+        value: "1"
+      - key: DEEP_COMPANY_RESEARCH_ENABLED
+        value: "1"
+      - key: PREDICTION_MARKET_ENRICHMENT_ENABLED
+        value: "1"
+      - key: CONVERSATIONAL_DASHBOARDS_ENABLED
+        value: "1"
+      - key: MAX_ACTIVE_ANALYTICAL_JOBS_PER_USER
+        value: "4"
+      - key: RATE_LIMIT_REQUESTS_PER_MINUTE
+        value: "60"
+      - key: MAX_REQUEST_BYTES
+        value: "1048576"
+      - key: APP_ENV
+        value: "production"
+      - key: SENTRY_DSN
+        sync: false
       - key: OPENBLAS_NUM_THREADS
         value: "1"
       - key: OMP_NUM_THREADS
@@ -37,3 +66,107 @@ services:
         sync: false
       - key: SEC_USER_AGENT
         sync: false
+
+  - type: worker
+    name: eagleeyes-analytics-worker
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python scripts/run_analytics_worker.py --concurrency 2 --poll-seconds 1
+    maxShutdownDelaySeconds: 150
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash
+      - key: ANALYTICS_WORKER_CONCURRENCY
+        value: "2"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
+      - key: APP_ENV
+        value: "production"
+      - key: SENTRY_DSN
+        sync: false
+
+  - type: cron
+    name: eagleeyes-job-recovery
+    runtime: python
+    plan: starter
+    schedule: "*/5 * * * *"
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python scripts/recover_analytics_jobs.py
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_ENV
+        value: "production"
+
+  - type: cron
+    name: eagleeyes-read-model-reconciliation
+    runtime: python
+    plan: starter
+    schedule: "*/15 * * * *"
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python scripts/reconcile_read_models.py
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_ENV
+        value: "production"
+
+  - type: cron
+    name: eagleeyes-market-ingestion
+    runtime: python
+    plan: starter
+    schedule: "*/30 * * * *"
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python scripts/run_provider_ingestion.py --scope market
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: TIINGO_API_KEY
+        sync: false
+      - key: POLYGON_API_KEY
+        sync: false
+      - key: FRED_API_KEY
+        sync: false
+      - key: APP_ENV
+        value: "production"
+
+  - type: cron
+    name: eagleeyes-fundamentals-ingestion
+    runtime: python
+    plan: starter
+    schedule: "15 6 * * *"
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python scripts/run_provider_ingestion.py --scope fundamentals
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SEC_USER_AGENT
+        sync: false
+      - key: POLYGON_API_KEY
+        sync: false
+      - key: APP_ENV
+        value: "production"
+
+  - type: cron
+    name: eagleeyes-prediction-ingestion
+    runtime: python
+    plan: starter
+    schedule: "10 * * * *"
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: python scripts/run_provider_ingestion.py --scope prediction
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: PREDICTION_MARKET_ENRICHMENT_ENABLED
+        value: "1"
+      - key: APP_ENV
+        value: "production"

@@ -17,8 +17,9 @@ test("canvas visibility is independent from dashboard persistence", () => {
 test("ordinary questions stay in chat while explicit visual requests open analysis", () => {
   assert.match(ask, /shouldOpenCanvasForQuestion/);
   assert.match(ask, /dashboard\|chart\|graph\|plot/);
-  assert.match(ask, /performance\|exposure\|allocation\|drawdown\|analysis/);
-  assert.match(ask, /if \(shouldOpenCanvasForQuestion\(request, hasAnalysis\)\) openCanvas\(\)/);
+  assert.match(ask, /performance\|return\|exposure\|allocation\|drawdown\|analysis/);
+  assert.match(ask, /const visualRequest = shouldOpenCanvasForQuestion\(request, hasAnalysis\)/);
+  assert.match(ask, /if \(visualRequest\) openCanvas\(\)/);
 });
 
 test("history and saved views are contextual controls instead of rails", () => {
@@ -29,13 +30,13 @@ test("history and saved views are contextual controls instead of rails", () => {
   assert.match(css, /#ask-history-drawer/);
 });
 
-test("analysis can close and reopen as a contextual full-screen surface", () => {
+test("analysis can close and reopen as a contextual split surface", () => {
   assert.match(ask, /onClose=\{closeCanvas\}/);
   assert.match(ask, /analysisLabel} ↗/);
   assert.match(shared, /Open analysis ↗/);
-  assert.match(ask, /!canvasOpen && <section className="ask-chat-pane"/);
-  assert.match(ask, /canvasOpen && <section className="ask-canvas-pane"/);
-  assert.match(css, /\.ask-content-shell>\.ask-chat-pane/);
+  assert.match(ask, /<section className={`ask-chat-pane/);
+  assert.match(ask, /canvasOpen && <section className={`ask-canvas-pane/);
+  assert.match(css, /\.canvas-open \.ask-content-shell\{grid-template-columns:minmax\(340px,38fr\) minmax\(560px,62fr\)\}/);
 });
 
 test("conversation changes close visible canvas context without deleting artifacts", () => {
@@ -46,6 +47,23 @@ test("conversation changes close visible canvas context without deleting artifac
 
 test("successful dashboard operations reveal their resulting analysis", () => {
   assert.match(ask, /operation\?\.action_result\?\.status !== "SUCCESS"/);
-  assert.match(ask, /pendingQuestionRef\.current = request/);
+  assert.match(ask, /pendingQuestionRef\.current = visualRequest \? request : null/);
   assert.match(ask, /window\.setTimeout\(openCanvas, 0\)/);
+});
+
+test("mobile preserves chat and analysis with explicit tabs", () => {
+  assert.match(ask, /ask-mobile-pane-tabs/);
+  assert.match(ask, /"chat" \| "analysis"/);
+  assert.match(ask, /aria-pressed=\{mobilePane === "chat"\}/);
+  assert.match(ask, /aria-pressed=\{mobilePane === "analysis"\}/);
+  assert.match(css, /\.ask-mobile-pane-tabs\{display:grid/);
+  assert.match(css, /\.mobile-active\{display:block\}/);
+});
+
+test("verified result lineage and independent widget states are visible", () => {
+  assert.match(shared, /source_result_id/);
+  assert.match(shared, /Market-implied/);
+  assert.match(shared, /Running historical analysis/);
+  assert.match(shared, /Updated data available/);
+  assert.match(shared, /Partial verified result/);
 });

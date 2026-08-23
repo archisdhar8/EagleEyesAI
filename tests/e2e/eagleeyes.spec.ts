@@ -36,7 +36,7 @@ test("Ask starts chat-first and opens analysis only for visual requests", async 
   await askInput.fill("Show my portfolio performance against SPY.");
   await page.getByRole("button", { name: "Ask EagleEyes →" }).click();
   await expect(page.locator(".ask-canvas-pane")).toBeVisible();
-  await expect(page.locator(".ask-chat-pane")).toHaveCount(0);
+  await expect(page.locator(".ask-chat-pane")).toBeVisible();
   const themeButton = page.getByRole("button", { name: /Light mode|Dark mode/ });
   const themeBefore = await themeButton.textContent();
   await themeButton.click();
@@ -324,7 +324,7 @@ test("separate browser users do not share saved boards", async ({ browser }) => 
   await firstPage.getByRole("button", { name: "Save dashboard" }).click();
   await signIn(secondPage);
   await secondPage.goto("/ask");
-  await expect(firstPage.getByRole("heading", { name: "Portfolio return and risks", exact: true })).toBeVisible();
-  await expect(secondPage.getByRole("heading", { name: "Portfolio return and risks", exact: true })).toHaveCount(0);
+  await expect(firstPage.locator(".canvas-view-switcher summary")).toHaveText(/Portfolio return and risks/);
+  await expect(secondPage.locator(".canvas-view-switcher summary")).toHaveCount(0);
   await first.close(); await second.close();
 });

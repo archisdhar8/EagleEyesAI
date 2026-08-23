@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from typing import Any
 
 import requests
@@ -18,6 +20,16 @@ load_dotenv(database.ENV_PATH, override=False)
 
 _EVIDENCE_CACHE = TTLCache(max_entries=128)
 _GEMINI_POLICY = RetryPolicy(attempts=max(1, min(2, int(os.getenv("GEMINI_MAX_RETRIES", "1")))))
+_GEMINI_DEADLINE = threading.local()
+
+
+def set_gemini_deadline(absolute_deadline_monotonic: float) -> None:
+    _GEMINI_DEADLINE.value = absolute_deadline_monotonic
+
+
+def clear_gemini_deadline() -> None:
+    if hasattr(_GEMINI_DEADLINE, "value"):
+        del _GEMINI_DEADLINE.value
 
 
 def _ticker_candidates(question: str, available: list[str]) -> list[str]:
@@ -80,16 +92,22 @@ def retrieve_evidence(user_id: str, question: str, portfolio_id: str | None = No
     return result
 
 
-def _gemini_request(api_key: str, model: str, contents: list[dict[str, Any]], max_tokens: int) -> dict[str, Any]:
+def _gemini_request(api_key: str, model: str, contents: list[dict[str, Any]], max_tokens: int,
+                    generation_config: dict[str, Any] | None = None) -> dict[str, Any]:
     def request_once() -> requests.Response:
+        configured = max(1.0, min(15.0, float(os.getenv("GEMINI_CHAT_TIMEOUT_SECONDS", "7"))))
+        absolute = getattr(_GEMINI_DEADLINE, "value", None)
+        remaining = max(0.05, absolute - time.monotonic()) if absolute else configured
+        timeout = min(configured, remaining)
+        if timeout <= 0.05:
+            raise requests.Timeout("Gemini narration budget exhausted")
         response = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json={
-                "contents": contents,
-                "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
-            },
-            timeout=(3, max(4, min(15, int(os.getenv("GEMINI_CHAT_TIMEOUT_SECONDS", "7"))))),
+            json={"contents": contents, "generationConfig": {
+                "temperature": 0.2, "maxOutputTokens": max_tokens, **(generation_config or {}),
+            }},
+            timeout=(min(1.5, timeout), timeout),
         )
         if response.status_code in {408, 429, 500, 502, 503, 504}:
             response.raise_for_status()
@@ -108,6 +126,47 @@ def _gemini_request(api_key: str, model: str, contents: list[dict[str, Any]], ma
         message = response.json().get("error", {}).get("message", "Gemini request failed")
         raise RuntimeError(message)
     return response.json()
+
+
+def plan_capabilities_gemini(planner_payload: dict[str, Any]) -> dict[str, Any]:
+    """One strict, lightweight planning pass; this never receives financial data."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    model = os.getenv("GEMINI_PLANNER_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.5-flash")).strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    prompt = (
+        "Select the smallest sufficient set of capabilities from the supplied registry. "
+        "Return only schema-valid JSON. Never invent an entity, capability, financial value, code, SQL, URL, "
+        "or verbose reasoning. Preserve required versus optional analytical dimensions.\n"
+        + json.dumps(planner_payload, default=str, separators=(",", ":"))
+    )
+    schema = {
+        "type": "OBJECT", "required": ["goal", "entities", "portfolio_context_required", "steps", "response_mode", "registry_version", "planner_model", "planner_prompt_version"],
+        "properties": {
+            "goal": {"type": "STRING"},
+            "entities": {"type": "ARRAY", "items": {"type": "OBJECT", "required": ["kind", "canonical_id"],
+                "properties": {"kind": {"type": "STRING"}, "canonical_id": {"type": "STRING"},
+                    "display_name": {"type": "STRING", "nullable": True}, "source_text": {"type": "STRING", "nullable": True},
+                    "resolution": {"type": "STRING"}}}},
+            "time_context": {"type": "OBJECT", "nullable": True, "properties": {"selection": {"type": "STRING"},
+                "start": {"type": "STRING", "nullable": True}, "end": {"type": "STRING", "nullable": True},
+                "baseline": {"type": "STRING", "nullable": True}}},
+            "portfolio_context_required": {"type": "BOOLEAN"},
+            "steps": {"type": "ARRAY", "items": {"type": "OBJECT", "required": ["step_id", "capability", "inputs", "required", "depends_on", "reason_code", "expected_output"],
+                "properties": {"step_id": {"type": "STRING"}, "capability": {"type": "STRING"},
+                    "inputs": {"type": "OBJECT"}, "required": {"type": "BOOLEAN"},
+                    "depends_on": {"type": "ARRAY", "items": {"type": "STRING"}},
+                    "reason_code": {"type": "STRING"}, "expected_output": {"type": "STRING"}}}},
+            "response_mode": {"type": "STRING"}, "registry_version": {"type": "STRING"},
+            "planner_model": {"type": "STRING"}, "planner_prompt_version": {"type": "STRING"},
+        },
+    }
+    payload = _gemini_request(api_key, model, [{"role": "user", "parts": [{"text": prompt}]}], 1400,
+                              {"temperature": 0, "responseMimeType": "application/json", "responseSchema": schema})
+    text, _ = _candidate(payload)
+    result = json.loads(text)
+    result["planner_model"] = model
+    return result
 
 
 def _candidate(payload: dict[str, Any]) -> tuple[str, str]:

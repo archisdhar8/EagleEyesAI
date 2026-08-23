@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -11,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import psycopg
+from psycopg_pool import ConnectionPool
 from dotenv import load_dotenv
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -21,6 +24,43 @@ DB_PATH = APP_DIR / "data" / "dashboard.db"
 ENV_PATH = APP_DIR / "backend" / ".env"
 load_dotenv(ENV_PATH, override=False)
 DATABASE_URL: str | None = os.getenv("DATABASE_URL") or None
+_QUERY_TIMEOUT = threading.local()
+_POOL_LOCK = threading.Lock()
+_POOL: ConnectionPool | None = None
+_POOL_URL: str | None = None
+
+
+def close_postgres_pool() -> None:
+    """Close background pool workers cleanly during tests and process shutdown."""
+    global _POOL, _POOL_URL
+    with _POOL_LOCK:
+        if _POOL is not None:
+            _POOL.close()
+        _POOL = None
+        _POOL_URL = None
+
+
+atexit.register(close_postgres_pool)
+
+
+def _analytical_scope(value: str | int) -> tuple[str, str | None]:
+    """Return the durable scope key and its optional real portfolio FK."""
+    raw = str(value)
+    candidate = raw.removeprefix("portfolio:")
+    try:
+        portfolio_id = str(uuid.UUID(candidate))
+    except ValueError:
+        return raw, None
+    return f"portfolio:{portfolio_id}", portfolio_id
+
+
+def set_thread_query_timeout_ms(value: float) -> None:
+    _QUERY_TIMEOUT.value = max(1, int(value))
+
+
+def clear_thread_query_timeout_ms() -> None:
+    if hasattr(_QUERY_TIMEOUT, "value"):
+        del _QUERY_TIMEOUT.value
 
 
 def utc_now() -> str:
@@ -74,15 +114,34 @@ def sqlite_connection() -> Iterator[sqlite3.Connection]:
 def postgres_connection() -> Iterator[psycopg.Connection]:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured")
-    connect_timeout = max(2, min(15, int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))))
-    statement_timeout = max(2_000, min(60_000, int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))))
-    with psycopg.connect(
-        DATABASE_URL,
-        connect_timeout=connect_timeout,
-        sslmode="require",
-        row_factory=dict_row,
-        options=f"-c statement_timeout={statement_timeout} -c lock_timeout=5000",
-    ) as conn:
+    node_timeout_ms = getattr(_QUERY_TIMEOUT, "value", None)
+    configured_connect = max(1, min(15, int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))))
+    configured_statement = max(100, min(60_000, int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))))
+    statement_timeout = min(configured_statement, node_timeout_ms) if node_timeout_ms else configured_statement
+    connect_timeout = min(configured_connect, max(1, (statement_timeout + 999) // 1000))
+    global _POOL, _POOL_URL
+    with _POOL_LOCK:
+        if _POOL is None or _POOL_URL != DATABASE_URL:
+            if _POOL is not None:
+                _POOL.close()
+            minimum = max(0, min(4, int(os.getenv("DB_POOL_MIN_SIZE", "1"))))
+            maximum = max(minimum or 1, min(20, int(os.getenv("DB_POOL_MAX_SIZE", "8"))))
+            _POOL = ConnectionPool(
+                conninfo=DATABASE_URL, min_size=minimum, max_size=maximum,
+                timeout=max(1, min(30, float(os.getenv("DB_POOL_TIMEOUT_SECONDS", "5")))),
+                kwargs={
+                    "connect_timeout": connect_timeout,
+                    "sslmode": os.getenv("DB_SSLMODE", "require"),
+                    "row_factory": dict_row,
+                    "options": "-c lock_timeout=5000",
+                },
+                open=True,
+            )
+            _POOL_URL = DATABASE_URL
+        pool = _POOL
+    assert pool is not None
+    with pool.connection() as conn:
+        conn.execute("SELECT set_config('statement_timeout', %s, true)", (str(statement_timeout),))
         yield conn
 
 
@@ -302,6 +361,45 @@ def initialize() -> None:
             methodology_version TEXT NOT NULL, effective_at TEXT NOT NULL, created_at TEXT NOT NULL,
             UNIQUE(user_id,portfolio_id,trigger,input_hash)
         )""",
+        """CREATE TABLE IF NOT EXISTS analytical_dataset_versions (
+            user_id TEXT NOT NULL, portfolio_id TEXT NOT NULL, dataset_type TEXT NOT NULL,
+            version TEXT NOT NULL, effective_through TEXT, updated_at TEXT NOT NULL,
+            PRIMARY KEY(user_id,portfolio_id,dataset_type)
+        )""",
+        """CREATE TABLE IF NOT EXISTS capability_read_models (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, portfolio_id TEXT NOT NULL,
+            read_model_type TEXT NOT NULL, schema_version TEXT NOT NULL,
+            calculation_version TEXT NOT NULL, input_fingerprint TEXT NOT NULL,
+            read_model_state TEXT NOT NULL, metadata_json TEXT NOT NULL, data_json TEXT NOT NULL,
+            failure_class TEXT, failure_at TEXT, stale_reason TEXT,
+            calculated_at TEXT NOT NULL, created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS ask_requests (
+            request_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, conversation_id TEXT,
+            question_hash TEXT NOT NULL, state TEXT NOT NULL, user_message_id TEXT,
+            assistant_message_id TEXT, staged_result_json TEXT, response_json TEXT,
+            error_class TEXT, received_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            completed_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS analytical_jobs (
+            id TEXT PRIMARY KEY, job_type TEXT NOT NULL, request_id TEXT, user_id TEXT NOT NULL,
+            portfolio_id TEXT, input_fingerprint TEXT NOT NULL, schema_version TEXT NOT NULL,
+            calculation_version TEXT NOT NULL, worker_version TEXT NOT NULL, status TEXT NOT NULL,
+            created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT,
+            progress_stage TEXT NOT NULL, progress_percent INTEGER,
+            input_payload TEXT NOT NULL, result_reference TEXT, result_payload TEXT,
+            error_class TEXT, safe_error_summary TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 2, deduplication_key TEXT NOT NULL,
+            expires_at TEXT, worker_id TEXT, lease_expires_at TEXT, heartbeat_at TEXT,
+            next_attempt_at TEXT, queue_wait_ms REAL, execution_ms REAL
+        )""",
+        """CREATE TABLE IF NOT EXISTS analytical_job_attempts (
+            id TEXT PRIMARY KEY, job_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
+            worker_id TEXT, started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL,
+            error_class TEXT, safe_error_summary TEXT, execution_ms REAL,
+            FOREIGN KEY(job_id) REFERENCES analytical_jobs(id) ON DELETE CASCADE,
+            UNIQUE(job_id,attempt_number)
+        )""",
         """CREATE TABLE IF NOT EXISTS portfolio_action_items (
             id TEXT PRIMARY KEY, user_id TEXT NOT NULL, portfolio_id TEXT NOT NULL,
             source_key TEXT NOT NULL, source TEXT NOT NULL, action_type TEXT NOT NULL,
@@ -386,6 +484,10 @@ def initialize() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS learning_quiz_user_lesson_idx ON learning_quiz_attempts(user_id, lesson_id, attempted_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS learning_threads_user_idx ON learning_tutor_threads(user_id, updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS learning_messages_thread_idx ON learning_tutor_messages(thread_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS capability_read_models_lookup_idx ON capability_read_models(user_id,portfolio_id,read_model_type,calculated_at)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS analytical_jobs_active_dedupe_idx ON analytical_jobs(user_id,deduplication_key) WHERE status IN ('QUEUED','RUNNING','SUCCESS','PARTIAL')")
+        conn.execute("CREATE INDEX IF NOT EXISTS analytical_jobs_claim_idx ON analytical_jobs(status,next_attempt_at,created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS analytical_jobs_lease_idx ON analytical_jobs(status,lease_expires_at)")
 
 
 def save_portfolio(
@@ -2645,6 +2747,324 @@ def portfolio_health_history(user_id: str, portfolio_id: str | int, limit: int =
 def latest_portfolio_health(user_id: str, portfolio_id: str | int) -> dict[str, Any] | None:
     rows = portfolio_health_history(user_id, portfolio_id, 1)
     return rows[0] if rows else None
+
+
+def upsert_analytical_dataset_version(user_id: str, portfolio_id: str | int, dataset_type: str,
+                                      version: str, effective_through: str | None = None) -> dict[str, Any]:
+    """Persist the latest known version for one analytical dependency scope."""
+    now = utc_now()
+    if DATABASE_URL:
+        scope_key, portfolio_fk = _analytical_scope(portfolio_id)
+        with postgres_connection() as conn:
+            row = conn.execute(
+                """INSERT INTO public.analytical_dataset_versions(user_id,portfolio_id,scope_key,dataset_type,version,effective_through,updated_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(user_id,scope_key,dataset_type) DO UPDATE SET
+                portfolio_id=excluded.portfolio_id,version=excluded.version,
+                effective_through=excluded.effective_through,updated_at=excluded.updated_at
+                RETURNING user_id,portfolio_id,scope_key,dataset_type,version,effective_through,updated_at""",
+                (user_id, portfolio_fk, scope_key, dataset_type, version, effective_through, now),
+            ).fetchone()
+        return {**dict(row), "portfolio_id": str(row["portfolio_id"]) if row["portfolio_id"] else None,
+                "effective_through": _iso(row["effective_through"]), "updated_at": _iso(row["updated_at"])}
+    with sqlite_connection() as conn:
+        conn.execute(
+            """INSERT INTO analytical_dataset_versions(user_id,portfolio_id,dataset_type,version,effective_through,updated_at)
+            VALUES(?,?,?,?,?,?) ON CONFLICT(user_id,portfolio_id,dataset_type) DO UPDATE SET
+            version=excluded.version,effective_through=excluded.effective_through,updated_at=excluded.updated_at""",
+            (user_id, str(portfolio_id), dataset_type, version, effective_through, now),
+        )
+    return {"user_id": user_id, "portfolio_id": str(portfolio_id), "dataset_type": dataset_type,
+            "version": version, "effective_through": effective_through, "updated_at": now}
+
+
+def analytical_dataset_versions(user_id: str, portfolio_id: str | int,
+                                dataset_types: list[str] | None = None) -> dict[str, dict[str, Any]]:
+    prefix, placeholder = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    scope_key, _ = _analytical_scope(portfolio_id)
+    params: list[Any] = [user_id, scope_key if DATABASE_URL else str(portfolio_id)]
+    clause = ""
+    if dataset_types:
+        markers = ",".join([placeholder] * len(dataset_types))
+        clause = f" AND dataset_type IN ({markers})"
+        params.extend(dataset_types)
+    with connection() as conn:
+        rows = conn.execute(
+            f"SELECT user_id,portfolio_id,dataset_type,version,effective_through,updated_at FROM {prefix}analytical_dataset_versions WHERE user_id={placeholder} AND {'scope_key' if DATABASE_URL else 'portfolio_id'}={placeholder}{clause}",
+            tuple(params),
+        ).fetchall()
+    return {str(row["dataset_type"]): {"version": str(row["version"]),
+            "effective_through": _iso(row["effective_through"]), "updated_at": _iso(row["updated_at"])} for row in rows}
+
+
+def save_capability_read_model(user_id: str, portfolio_id: str | int, metadata: dict[str, Any],
+                               data: dict[str, Any]) -> dict[str, Any]:
+    model_id, now = str(uuid.uuid4()), utc_now()
+    calculated_at = str(metadata.get("calculated_at") or now)
+    values = (model_id, user_id, str(portfolio_id), metadata["read_model_type"], metadata["schema_version"],
+              metadata["calculation_version"], metadata["input_fingerprint"], metadata["read_model_state"],
+              metadata, data, metadata.get("failure_class"), metadata.get("failure_at"),
+              metadata.get("stale_reason"), calculated_at, now)
+    if DATABASE_URL:
+        scope_key, portfolio_fk = _analytical_scope(portfolio_id)
+        with postgres_connection() as conn:
+            conn.execute(
+                """INSERT INTO public.capability_read_models(id,user_id,portfolio_id,scope_key,read_model_type,schema_version,
+                calculation_version,input_fingerprint,read_model_state,metadata,data,failure_class,failure_at,
+                stale_reason,calculated_at,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (model_id, user_id, portfolio_fk, scope_key, *values[3:8], _jsonb(metadata), _jsonb(data), *values[10:]),
+            )
+    else:
+        with sqlite_connection() as conn:
+            conn.execute(
+                """INSERT INTO capability_read_models(id,user_id,portfolio_id,read_model_type,schema_version,
+                calculation_version,input_fingerprint,read_model_state,metadata_json,data_json,failure_class,failure_at,
+                stale_reason,calculated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (*values[:8], json.dumps(metadata, default=str), json.dumps(data, default=str), *values[10:]),
+            )
+    return {"id": model_id, "user_id": user_id, "portfolio_id": str(portfolio_id),
+            "metadata": metadata, "data": data, "created_at": now}
+
+
+def capability_read_model_history(user_id: str, portfolio_id: str | int, read_model_type: str,
+                                  limit: int = 20) -> list[dict[str, Any]]:
+    prefix, placeholder = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    scope_key, _ = _analytical_scope(portfolio_id)
+    with connection() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM {prefix}capability_read_models WHERE user_id={placeholder} AND {'scope_key' if DATABASE_URL else 'portfolio_id'}={placeholder} AND read_model_type={placeholder} ORDER BY calculated_at DESC,created_at DESC LIMIT {placeholder}",
+            (user_id, scope_key if DATABASE_URL else str(portfolio_id), read_model_type, max(1, min(limit, 100))),
+        ).fetchall()
+    result = []
+    for source in rows:
+        row = dict(source)
+        metadata = row.get("metadata") if DATABASE_URL else json.loads(row["metadata_json"])
+        data = row.get("data") if DATABASE_URL else json.loads(row["data_json"])
+        result.append({"id": str(row["id"]), "user_id": str(row["user_id"]),
+                       "portfolio_id": str(row["portfolio_id"]) if row.get("portfolio_id") is not None else None,
+                       "scope_key": str(row.get("scope_key") or portfolio_id), "metadata": metadata, "data": data,
+                       "created_at": _iso(row["created_at"])})
+    return result
+
+
+def update_capability_read_model_state(model_id: str, state: str, stale_reason: str | None = None,
+                                       failure_class: str | None = None) -> None:
+    prefix, placeholder = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    with connection() as conn:
+        rows = conn.execute(f"SELECT metadata{'' if DATABASE_URL else '_json'} AS metadata_value FROM {prefix}capability_read_models WHERE id={placeholder}", (model_id,)).fetchone()
+        if not rows:
+            return
+        raw = rows["metadata_value"]
+        metadata = dict(raw) if isinstance(raw, dict) else json.loads(raw)
+        metadata.update({"read_model_state": state, "stale_reason": stale_reason,
+                         "failure_class": failure_class, "failure_at": utc_now() if failure_class else metadata.get("failure_at")})
+        encoded = _jsonb(metadata) if DATABASE_URL else json.dumps(metadata, default=str)
+        failure_at = metadata.get("failure_at")
+        conn.execute(
+            f"UPDATE {prefix}capability_read_models SET read_model_state={placeholder},stale_reason={placeholder},failure_class={placeholder},failure_at={placeholder},metadata{'' if DATABASE_URL else '_json'}={placeholder} WHERE id={placeholder}",
+            (state, stale_reason, failure_class, failure_at, encoded, model_id),
+        )
+
+
+def analytical_read_model_scopes() -> list[dict[str, str]]:
+    """Return durable reconciliation scopes without depending on page traffic."""
+    prefix = "public." if DATABASE_URL else ""
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    with connection() as conn:
+        rows = conn.execute(
+            f"SELECT DISTINCT user_id,portfolio_id FROM {prefix}capability_read_models "
+            f"WHERE portfolio_id IS NOT NULL ORDER BY user_id,portfolio_id"
+        ).fetchall()
+    scopes: dict[tuple[str, str], dict[str, str]] = {}
+    for row in rows:
+        _, portfolio_fk = _analytical_scope(row["portfolio_id"])
+        if portfolio_fk:
+            scopes[(str(row["user_id"]), portfolio_fk)] = {
+                "user_id": str(row["user_id"]), "portfolio_id": portfolio_fk,
+            }
+    return list(scopes.values())
+
+
+def _ask_request_row(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    if not DATABASE_URL:
+        item["staged_result"] = json.loads(item.pop("staged_result_json")) if item.get("staged_result_json") else None
+        item["response"] = json.loads(item.pop("response_json")) if item.get("response_json") else None
+    for key in ("request_id", "user_id", "conversation_id", "user_message_id", "assistant_message_id"):
+        if item.get(key) is not None:
+            item[key] = str(item[key])
+    for key in ("received_at", "updated_at", "completed_at"):
+        item[key] = _iso(item.get(key))
+    return item
+
+
+def get_ask_request(user_id: str, request_id: str) -> dict[str, Any] | None:
+    prefix, placeholder = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    with connection() as conn:
+        row = conn.execute(
+            f"SELECT * FROM {prefix}ask_requests WHERE request_id={placeholder} AND user_id={placeholder}",
+            (request_id, user_id),
+        ).fetchone()
+    return _ask_request_row(row) if row else None
+
+
+def reserve_ask_request(user_id: str, request_id: str, question_hash: str) -> dict[str, Any]:
+    """Idempotently reserve one logical Ask request before conversation creation."""
+    now = utc_now()
+    if DATABASE_URL:
+        with postgres_connection() as conn:
+            conn.execute(
+                """INSERT INTO public.ask_requests(request_id,user_id,question_hash,state,received_at,updated_at)
+                VALUES(%s,%s,%s,'RECEIVED',%s,%s) ON CONFLICT(request_id) DO NOTHING""",
+                (request_id, user_id, question_hash, now, now),
+            )
+            row = conn.execute("SELECT * FROM public.ask_requests WHERE request_id=%s AND user_id=%s",
+                               (request_id, user_id)).fetchone()
+    else:
+        with sqlite_connection() as conn:
+            conn.execute(
+                """INSERT INTO ask_requests(request_id,user_id,question_hash,state,received_at,updated_at)
+                VALUES(?,?,?,'RECEIVED',?,?) ON CONFLICT(request_id) DO NOTHING""",
+                (request_id, user_id, question_hash, now, now),
+            )
+            row = conn.execute("SELECT * FROM ask_requests WHERE request_id=? AND user_id=?",
+                               (request_id, user_id)).fetchone()
+    if not row or str(row["question_hash"]) != question_hash:
+        raise ValueError("The request ID is already bound to a different user or question.")
+    return _ask_request_row(row)
+
+
+def bind_ask_request_turn(user_id: str, request_id: str, conversation_id: str,
+                          question: str, structured: dict[str, Any]) -> dict[str, Any]:
+    """Atomically bind the request and insert its deterministic user turn once."""
+    if not DATABASE_URL:
+        now = utc_now()
+        message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"eagleeyes:{request_id}:user"))
+        with sqlite_connection() as conn:
+            conn.execute(
+                """UPDATE ask_requests SET conversation_id=?,user_message_id=?,state='EXECUTING',
+                error_class=NULL,updated_at=? WHERE request_id=? AND user_id=? AND state NOT IN ('COMPLETED','PARTIAL','UNAVAILABLE')""",
+                (conversation_id, message_id, now, request_id, user_id),
+            )
+            row = conn.execute("SELECT * FROM ask_requests WHERE request_id=? AND user_id=?", (request_id, user_id)).fetchone()
+        return _ask_request_row(row)
+    user_message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"eagleeyes:{request_id}:user"))
+    with postgres_connection() as conn:
+        owned = conn.execute("SELECT 1 FROM public.chat_conversations WHERE id=%s AND user_id=%s",
+                             (conversation_id, user_id)).fetchone()
+        if not owned:
+            raise KeyError(conversation_id)
+        request_row = conn.execute("SELECT * FROM public.ask_requests WHERE request_id=%s AND user_id=%s FOR UPDATE",
+                                   (request_id, user_id)).fetchone()
+        if not request_row:
+            raise KeyError(request_id)
+        if request_row.get("conversation_id") and str(request_row["conversation_id"]) != str(conversation_id):
+            raise ValueError("The request ID is already bound to a different conversation.")
+        conn.execute(
+            """INSERT INTO public.chat_messages(id,conversation_id,role,content,structured_content,model)
+            VALUES(%s,%s,'user',%s,%s,NULL) ON CONFLICT(id) DO NOTHING""",
+            (user_message_id, conversation_id, question, _jsonb(structured)),
+        )
+        if str(request_row["state"]) not in {"COMPLETED", "PARTIAL", "UNAVAILABLE"}:
+            conn.execute(
+                """UPDATE public.ask_requests SET conversation_id=%s,user_message_id=%s,state='EXECUTING',
+                error_class=NULL,updated_at=now() WHERE request_id=%s AND user_id=%s""",
+                (conversation_id, user_message_id, request_id, user_id),
+            )
+        row = conn.execute("SELECT * FROM public.ask_requests WHERE request_id=%s AND user_id=%s",
+                           (request_id, user_id)).fetchone()
+    return _ask_request_row(row)
+
+
+def stage_ask_request_result(user_id: str, request_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    prefix, placeholder = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    column = "staged_result" if DATABASE_URL else "staged_result_json"
+    encoded = _jsonb(result) if DATABASE_URL else json.dumps(result, default=str)
+    with connection() as conn:
+        row = conn.execute(
+            f"UPDATE {prefix}ask_requests SET {column}={placeholder},state='EXECUTED',updated_at={('now()' if DATABASE_URL else placeholder)} WHERE request_id={placeholder} AND user_id={placeholder} RETURNING *",
+            ((encoded, request_id, user_id) if DATABASE_URL else (encoded, utc_now(), request_id, user_id)),
+        ).fetchone()
+    if not row:
+        raise KeyError(request_id)
+    return _ask_request_row(row)
+
+
+def complete_ask_request(user_id: str, request_id: str, *, final_state: str,
+                         artifacts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Atomically materialize the staged assistant turn, artifact links, and final replay response."""
+    if not DATABASE_URL:
+        row = get_ask_request(user_id, request_id)
+        if not row or not row.get("staged_result"):
+            raise KeyError(request_id)
+        staged = row["staged_result"]
+        message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"eagleeyes:{request_id}:assistant"))
+        message = {"id": message_id, "role": "assistant", "content": staged["answer"],
+                   "structured_content": staged["structured_content"], "model": staged["model"]}
+        response = {"conversation_id": row["conversation_id"], "message": message,
+                    "sources": staged.get("sources") or [], "tool_results": staged.get("tool_results") or []}
+        with sqlite_connection() as conn:
+            conn.execute(
+                """UPDATE ask_requests SET assistant_message_id=?,response_json=?,state=?,updated_at=?,completed_at=?
+                WHERE request_id=? AND user_id=?""",
+                (message_id, json.dumps(response, default=str), final_state, utc_now(), utc_now(), request_id, user_id),
+            )
+        return response
+    assistant_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"eagleeyes:{request_id}:assistant"))
+    with postgres_connection() as conn:
+        request_row = conn.execute("SELECT * FROM public.ask_requests WHERE request_id=%s AND user_id=%s FOR UPDATE",
+                                   (request_id, user_id)).fetchone()
+        if not request_row:
+            raise KeyError(request_id)
+        if request_row.get("response"):
+            return dict(request_row["response"])
+        staged = request_row.get("staged_result") or {}
+        if not staged:
+            raise RuntimeError("No staged Ask result is available for final persistence.")
+        message = conn.execute(
+            """INSERT INTO public.chat_messages(id,conversation_id,role,content,structured_content,model)
+            VALUES(%s,%s,'assistant',%s,%s,%s) ON CONFLICT(id) DO UPDATE SET
+            content=excluded.content,structured_content=excluded.structured_content,model=excluded.model
+            RETURNING id,role,content,structured_content,model,created_at""",
+            (assistant_id, request_row["conversation_id"], staged["answer"],
+             _jsonb(staged["structured_content"]), staged["model"]),
+        ).fetchone()
+        for artifact in artifacts or staged.get("artifacts") or []:
+            conn.execute(
+                """INSERT INTO public.chat_artifact_links(user_id,conversation_id,message_id,artifact_type,artifact_id,label,metadata)
+                VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(conversation_id,artifact_type,artifact_id) DO UPDATE SET
+                message_id=excluded.message_id,label=excluded.label,metadata=excluded.metadata""",
+                (user_id, request_row["conversation_id"], assistant_id, artifact["artifact_type"], artifact["artifact_id"],
+                 artifact["label"], _jsonb(artifact.get("metadata") or {})),
+            )
+        message_payload = {**dict(message), "id": str(message["id"]), "created_at": _iso(message["created_at"])}
+        response = {"conversation_id": str(request_row["conversation_id"]), "message": message_payload,
+                    "sources": staged.get("sources") or [], "tool_results": staged.get("tool_results") or []}
+        conn.execute(
+            """UPDATE public.ask_requests SET assistant_message_id=%s,response=%s,state=%s,error_class=NULL,
+            updated_at=now(),completed_at=now() WHERE request_id=%s AND user_id=%s""",
+            (assistant_id, _jsonb(response), final_state, request_id, user_id),
+        )
+        conn.execute("UPDATE public.chat_conversations SET updated_at=now() WHERE id=%s", (request_row["conversation_id"],))
+    return response
+
+
+def fail_ask_request(user_id: str, request_id: str, error_class: str, *, persistence: bool = False) -> None:
+    prefix, placeholder = ("public.", "%s") if DATABASE_URL else ("", "?")
+    connection = postgres_connection if DATABASE_URL else sqlite_connection
+    now_expression = "now()" if DATABASE_URL else placeholder
+    params = (error_class, request_id, user_id) if DATABASE_URL else (error_class, utc_now(), request_id, user_id)
+    state = "PERSISTENCE_FAILED" if persistence else "FAILED"
+    with connection() as conn:
+        conn.execute(
+            f"UPDATE {prefix}ask_requests SET state={placeholder},error_class={placeholder},updated_at={now_expression} WHERE request_id={placeholder} AND user_id={placeholder}",
+            ((state, *params)),
+        )
 
 
 def sync_portfolio_actions(user_id: str, portfolio_id: str | int, actions: list[dict[str, Any]]) -> None:

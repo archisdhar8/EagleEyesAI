@@ -128,9 +128,18 @@ def backtest(request: ModelPortfolioBacktestRequest) -> dict[str, Any]:
     symbols = sorted({ticker for values in normalized.values() for ticker in values} | {benchmark, "SPY", "VTI", "VXUS", "BND"})
     rows = database.price_history(symbols, 10000)
     if not rows:
-        return {"version": BACKTEST_VERSION, "status": "unavailable", "results": [], "warnings": ["No adjusted price history is stored for the requested basket."]}
+        return {"version": BACKTEST_VERSION, "status": "unavailable", "results": [], "warnings": ["No adjusted price history is stored for the requested basket."],
+                "coverage": {"requested_symbols": symbols, "symbols_with_sufficient_history": [],
+                             "missing_symbols": symbols, "common_history_start": None,
+                             "common_history_end": None, "portfolio_weight_coverage": 0}}
     frame = pd.DataFrame(rows)
     frame["date"] = pd.to_datetime(frame["date"], utc=True).dt.tz_localize(None)
+    if request.start_date:
+        frame = frame[frame["date"] >= pd.Timestamp(request.start_date)]
+    if request.end_date:
+        frame = frame[frame["date"] <= pd.Timestamp(request.end_date)]
+    available_symbols = sorted(set(frame["ticker"].astype(str))) if not frame.empty else []
+    missing_symbols = sorted(set(symbols) - set(available_symbols))
     prices = frame.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").resample("ME").last()
     returns = prices.pct_change(fill_method=None)
     series: dict[str, pd.Series] = {}
@@ -160,10 +169,16 @@ def backtest(request: ModelPortfolioBacktestRequest) -> dict[str, Any]:
     else:
         warnings.append("The 60% VTI / 25% VXUS / 15% BND three-fund baseline is unavailable because one or more histories are missing.")
     if not series:
-        return {"version": BACKTEST_VERSION, "status": "unavailable", "results": [], "warnings": warnings}
+        return {"version": BACKTEST_VERSION, "status": "unavailable", "results": [], "warnings": warnings,
+                "coverage": {"requested_symbols": symbols, "symbols_with_sufficient_history": [],
+                             "missing_symbols": missing_symbols, "common_history_start": None,
+                             "common_history_end": None, "portfolio_weight_coverage": 0}}
     common = pd.concat(series, axis=1, join="inner").dropna()
     if common.empty:
-        return {"version": BACKTEST_VERSION, "status": "unavailable", "results": [], "warnings": [*warnings, "The requested strategies do not share an overlapping history window."]}
+        return {"version": BACKTEST_VERSION, "status": "unavailable", "results": [], "warnings": [*warnings, "The requested strategies do not share an overlapping history window."],
+                "coverage": {"requested_symbols": symbols, "symbols_with_sufficient_history": available_symbols,
+                             "missing_symbols": missing_symbols, "common_history_start": None,
+                             "common_history_end": None, "portfolio_weight_coverage": None}}
     results = []
     for key in common:
         values = common[key]
@@ -177,7 +192,14 @@ def backtest(request: ModelPortfolioBacktestRequest) -> dict[str, Any]:
     return {
         "version": BACKTEST_VERSION, "status": "ready", "results": results,
         "period": {"start": common.index.min().date().isoformat(), "end": common.index.max().date().isoformat(), "monthly_observations": len(common)},
+        "coverage": {"requested_symbols": symbols, "symbols_with_sufficient_history": available_symbols,
+                     "missing_symbols": missing_symbols, "common_history_start": common.index.min().date().isoformat(),
+                     "common_history_end": common.index.max().date().isoformat(),
+                     "portfolio_weight_coverage": {key: round(sum(weight for ticker, weight in values.items() if ticker in available_symbols), 6) for key, values in normalized.items()}},
         "lineage": [{"provider": "+".join(providers), "dataset": "corporate-action-adjusted daily prices resampled monthly", "symbols": symbols}],
-        "assumptions": ["All strategies use the same overlapping monthly observations.", "SPY is always included when its stored history is available; a separately requested relevant benchmark is also included.", "The three-fund baseline is fixed at 60% VTI, 25% VXUS, and 15% BND.", "Historical performance is hypothetical and is not a forecast."],
+        "assumptions": ["All strategies use the same overlapping monthly observations.", f"Rebalance policy: {request.rebalance_policy}.",
+                        "Transaction costs are not deducted because turnover attribution is not supported by this backtest engine." if request.transaction_cost_bps is not None else "No transaction-cost assumption was supplied.",
+                        "SPY is always included when its stored history is available; a separately requested relevant benchmark is also included.", "The three-fund baseline is fixed at 60% VTI, 25% VXUS, and 15% BND.", "Historical performance is hypothetical and is not a forecast."],
+        "turnover": None, "attribution": None,
         "warnings": warnings,
     }

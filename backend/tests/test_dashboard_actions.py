@@ -129,11 +129,48 @@ def test_invalid_widget_action_layout_and_binding_return_typed_statuses() -> Non
     assert malformed.status == DashboardActionStatus.INVALID
     assert layout.status == DashboardActionStatus.INVALID
     assert binding.status == DashboardActionStatus.INVALID
-    assert future.status == DashboardActionStatus.UNSUPPORTED
+    assert future.status == DashboardActionStatus.INVALID
     assert chart_change.status == DashboardActionStatus.SUCCESS
     assert chart_change.dashboard["widgets"][0]["visualization"] == "bar"
     assert widget_type.status == DashboardActionStatus.INVALID
     assert state["widgets"][0]["grid"]["w"] == 4
+
+
+def test_phase8_visual_filter_and_date_actions_are_schema_validated() -> None:
+    state = {"name": "Board", "widgets": [{**widget("A", "task-a", "Alpha"), "binding": {
+        "metric": "portfolio_performance", "portfolio": "current", "benchmark": None,
+        "period": "1Y", "tickers": [], "filters": [],
+    }}]}
+    visual = apply_dashboard_action(
+        state, {"type": "CHANGE_VISUALIZATION", "widget_id": "A", "visualization": "area_chart"},
+        allowed_widget_types=ALLOWED,
+    )
+    assert visual.status == DashboardActionStatus.SUCCESS
+    assert visual.dashboard["widgets"][0]["visualization"] == "area_chart"
+    dated = apply_dashboard_action(
+        state, {"type": "UPDATE_DATE_RANGE", "widget_id": "A", "period": "5Y"},
+        allowed_widget_types=ALLOWED,
+    )
+    assert dated.status == DashboardActionStatus.SUCCESS
+    assert dated.dashboard["widgets"][0]["binding"]["period"] == "5Y"
+    filtered = apply_dashboard_action(
+        state, {"type": "UPDATE_FILTER", "widget_id": "A", "filters": [
+            {"field": "sector", "operator": "eq", "value": "Technology"},
+        ]}, allowed_widget_types=ALLOWED,
+    )
+    assert filtered.status == DashboardActionStatus.SUCCESS
+    assert filtered.dashboard["widgets"][0]["binding"]["filters"][0]["value"] == "Technology"
+
+
+def test_canonical_widget_cannot_be_created_without_result_reference() -> None:
+    invalid = apply_dashboard_action(
+        {"name": "Board", "widgets": []},
+        {"type": "CREATE_WIDGET", "widget": {**widget("verified", "verified", "Verified"),
+                                                 "widget_type": "canonical_result", "binding": None}},
+        allowed_widget_types={"canonical_result"}, available_task_ids={"verified"},
+    )
+    assert invalid.status == DashboardActionStatus.INVALID
+    assert "verified result reference" in (invalid.error or "")
 
 
 def test_saved_view_action_creates_one_revision_and_updates_spec_and_layout() -> None:

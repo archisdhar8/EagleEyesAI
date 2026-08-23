@@ -90,6 +90,11 @@ EXPECTED_TABLES = {
     "attention_item_states",
     "portfolio_health_snapshots",
     "portfolio_action_items",
+    "analytical_dataset_versions",
+    "capability_read_models",
+    "ask_requests",
+    "analytical_jobs",
+    "analytical_job_attempts",
     "alert_preferences",
     "alert_events",
     "decision_preferences",
@@ -115,7 +120,7 @@ def database_url() -> str:
 
 
 def connect() -> psycopg.Connection:
-    return psycopg.connect(database_url(), connect_timeout=15, sslmode="require")
+    return psycopg.connect(database_url(), connect_timeout=15, sslmode=os.getenv("DB_SSLMODE", "require"))
 
 
 def ensure_migration_table(conn: psycopg.Connection) -> None:
