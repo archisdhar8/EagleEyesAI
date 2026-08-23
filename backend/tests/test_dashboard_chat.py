@@ -349,6 +349,7 @@ def test_successful_create_uses_typed_executor_and_persists_stable_binding(monke
     assert result.widget_id is not None and result.widget_id.startswith("chat-portfolio_performance-")
     created = result.action_result.dashboard["specification"]["widgets"][0]
     assert created["id"] == result.widget_id
+    assert created["grid"]["w"] == 12
     assert created["binding"]["benchmark"] == "SPY"
     assert created["binding"]["period"] == "1Y"
     assert result.response == "Added Portfolio Performance."

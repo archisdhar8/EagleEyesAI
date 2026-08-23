@@ -425,10 +425,13 @@ def execute_dashboard_chat_request(
             prepared_result = dashboard_workspace.prepare_conversational_widget(user_id, portfolio_id, request.binding, task_id)
             dashboard_workspace.persist_prepared_widget_result(user_id, resource_type, resource_id, prepared_result)
             meta = dashboard_workspace.widget_meta(request.widget_type)
+            grid = dashboard_workspace.next_widget_grid(widgets, meta[2], meta[3])
+            if not widgets:
+                grid = {**grid, "x": 0, "w": 12}
             action = {"type": "CREATE_WIDGET", "widget": {
                 "id": task_id, "task_id": task_id, "widget_type": request.widget_type,
                 "title": request.title or meta[0], "visualization": request.visualization or meta[1],
-                "grid": dashboard_workspace.next_widget_grid(widgets, meta[2], meta[3]),
+                "grid": grid,
                 "binding": request.binding.model_dump(mode="json"),
             }}
         else:

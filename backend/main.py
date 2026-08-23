@@ -4532,8 +4532,14 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
         if feature_flags.conversational_dashboards_enabled()
         else dashboard_chat.DashboardChatRequest(intent=dashboard_chat.DashboardChatIntent.NORMAL_ANSWER)
     )
+    direct_typed_widget = (
+        dashboard_request.intent == dashboard_chat.DashboardChatIntent.CREATE_WIDGET
+        and not dashboard_request.mixed_answer
+        and dashboard_request.widget_type is not None
+        and dashboard_request.binding is not None
+    )
     if (dashboard_request.intent != dashboard_chat.DashboardChatIntent.NORMAL_ANSWER
-            and not dashboard_request.requires_new_analysis):
+            and (not dashboard_request.requires_new_analysis or direct_typed_widget)):
         dashboard_execution = dashboard_chat.execute_dashboard_chat_request(
             user.id, dashboard_request, dashboard_resource_type, dashboard_resource_id,
             portfolio_id=requested_portfolio_id, conversation_id=conversation_id,

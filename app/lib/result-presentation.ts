@@ -32,6 +32,7 @@ export function resultPresentation(level: PresentationLevel): ResultPresentation
 export function plainResultAnswer(widgetType: string, data: unknown): string {
   const value = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {};
   if (widgetType === "portfolio_performance") return "This shows how today’s holdings and weights behaved historically; it is not your actual account return.";
+  if (widgetType === "sector_exposure") return "This groups your current saved portfolio weights by the latest stored sector classification.";
   if (widgetType === "correlation_matrix") return "Higher relationships mean the positions have tended to move together and may provide less diversification.";
   if (widgetType === "scenario_probabilities") return "These are separate condition estimates. Economic, inflation, rate, and shock conditions may occur together.";
   if (widgetType === "holdings_sensitivity") return "This compares which holdings historically moved most when the selected macro factor changed.";
