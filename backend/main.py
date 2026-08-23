@@ -30,7 +30,8 @@ from .ask_runtime import (
     scenario_payload, verify_results,
 )
 from .analytical_contract import (
-    AnalysisResult, AnalysisStatus, DependencyResult, adapt_legacy_tool_result, apply_request_verification,
+    AnalysisResult, AnalysisStatus, Coverage, DependencyResult, VerificationResult,
+    adapt_legacy_tool_result, apply_request_verification, build_freshness,
     with_canonical_result, stable_fingerprint,
 )
 from .analytical_telemetry import DeadlineContext, record_dependency as record_capability_dependency
@@ -3150,12 +3151,17 @@ def _security_ranking_chat_tools(user_id: str, question: str, portfolio_id: str 
         return [{"tool_name": "security_ranking", "status": "unavailable", "title": "Holdings research ranking",
                  "summary": {"message": "A versioned portfolio context is required for fast ranking."}}], []
     loaded = read_models.load_compatible_read_model(user_id, context.portfolio_id, "portfolio_opportunity", context.version)
+    snapshot = None
     if not loaded.model:
-        return [{"tool_name": "security_ranking", "status": "unavailable", "title": "Holdings research ranking",
-                 "summary": {"message": loaded.reason},
-                 "read_model": {"type": "portfolio_opportunity", "state": loaded.state.value,
-                                "legacy_adapter_used": False}}], []
-    rows = list(loaded.model.data.get("ranked_holdings") or loaded.model.data.get("holdings") or [])
+        snapshot = database.latest_portfolio_health(user_id, context.portfolio_id)
+        rows = list(((snapshot or {}).get("result") or {}).get("holdings") or [])
+        if not rows:
+            return [{"tool_name": "security_ranking", "status": "unavailable", "title": "Holdings research ranking",
+                     "summary": {"message": loaded.reason},
+                     "read_model": {"type": "portfolio_opportunity", "state": loaded.state.value,
+                                    "legacy_adapter_used": False}}], []
+    else:
+        rows = list(loaded.model.data.get("ranked_holdings") or loaded.model.data.get("holdings") or [])
     holding_context = {str(item.get("ticker") or "").upper(): item for item in holdings}
     ranked = sorted([{
         "ticker": row.get("ticker"), "company": row.get("company"),
@@ -3164,7 +3170,9 @@ def _security_ranking_chat_tools(user_id: str, question: str, portfolio_id: str 
                             "mixed" if float(row.get("health_score") or 0) >= 50 else "weak"),
         "bucket_explanation": "Versioned portfolio analytical score and component coverage.",
         "research_confidence": row.get("data_confidence"),
-        "freshness": loaded.model.metadata.freshness.model_dump(mode="json"),
+        "freshness": (loaded.model.metadata.freshness.model_dump(mode="json") if loaded.model else {
+            "effective_through": (snapshot or {}).get("effective_at"), "source": "saved portfolio health snapshot",
+        }),
         "strengths": [{"label": name.replace("_score", "").replace("_", " ")}
                       for name in ("fundamental_score", "valuation_score", "momentum_score")
                       if float(row.get(name) or 0) >= 65],
@@ -3175,31 +3183,50 @@ def _security_ranking_chat_tools(user_id: str, question: str, portfolio_id: str 
         "portfolio_weight": holding_context.get(str(row.get("ticker") or "").upper(), {}).get("weight"),
         "portfolio_risk_contribution": holding_context.get(str(row.get("ticker") or "").upper(), {}).get("risk_contribution"),
         "health_score": row.get("health_score"),
-    } for index, row in enumerate(rows) if row.get("ticker")], key=lambda row: float(row.get("health_score") or 0), reverse=True)
+    } for index, row in enumerate(rows)
+      if row.get("ticker") and str(row.get("ticker") or "").upper() in set(tickers)],
+        key=lambda row: float(row.get("health_score") or 0), reverse=True)
     covered = {str(item.get("ticker", "")).upper() for item in ranked}
     missing = [ticker for ticker in tickers if ticker not in covered]
     status = "partial" if missing or not ranked else "complete"
     lowered = " ".join(question.lower().split())
     asks_strongest = any(term in lowered for term in ("strongest", "best"))
-    asks_weakest = any(term in lowered for term in ("weakest", "worst"))
+    asks_weakest = any(term in lowered for term in ("weakest", "worst", "lower ranking", "lower-ranked", "bottom"))
     focus = "both" if asks_strongest and asks_weakest else "weakest" if asks_weakest else "strongest" if asks_strongest else "both"
     summary = {
         "universe": {"type": "saved portfolio holdings", "count": len(tickers), "tickers": tickers},
         "ranked": ranked, "missing": missing,
         "focus": focus,
-        "method": "Versioned portfolio-opportunity read model; no security research build runs in Ask.",
+        "method": ("Versioned portfolio-opportunity read model; no security research build runs in Ask." if loaded.model else
+                   "Latest saved portfolio-health snapshot; no security research build runs in Ask."),
         "note": "The stored composite orders eligible evidence; qualitative buckets are the user-facing conclusion.",
     }
-    canonical = phase6_domains._canonical_from_loaded(
-        "security_ranking", loaded, "security-ranking-read-v1", context.version, tickers,
-    )
-    canonical.data = summary
+    if loaded.model:
+        canonical = phase6_domains._canonical_from_loaded(
+            "security_ranking", loaded, "security-ranking-read-v1", context.version, tickers,
+        )
+        canonical.data = summary
+    else:
+        canonical = AnalysisResult(
+            capability="security_ranking", calculation_version="security-ranking-snapshot-v1",
+            input_fingerprint=context.version, status=AnalysisStatus.PARTIAL if missing else AnalysisStatus.SUCCESS,
+            data=summary, coverage=Coverage(requested_entities=tickers, evaluated_entities=sorted(covered)),
+            freshness=build_freshness([("portfolio_health_snapshot", (snapshot or {}).get("effective_at"))]),
+            dependencies=[DependencyResult(
+                name="portfolio_health_snapshot", required=True, status=AnalysisStatus.SUCCESS,
+                cache_state="SAVED_SNAPSHOT",
+            )],
+            limitations=[],
+            verification=VerificationResult(passed=not missing, answer_allowed=True, recommendation_allowed=False),
+        )
     tool = with_canonical_result({"tool_name": "security_ranking", "status": status,
         "title": "Holdings research ranking", "summary": summary,
-        "read_model": {"id": loaded.model.id, "type": "portfolio_opportunity", "state": loaded.state.value,
-                       "schema_version": loaded.model.metadata.schema_version,
-                       "calculation_version": loaded.model.metadata.calculation_version,
-                       "builder_version": loaded.model.metadata.builder_version,
+        "read_model": {"id": loaded.model.id if loaded.model else (snapshot or {}).get("id"),
+                       "type": "portfolio_opportunity" if loaded.model else "portfolio_health_snapshot",
+                       "state": loaded.state.value if loaded.model else "SAVED_SNAPSHOT",
+                       "schema_version": loaded.model.metadata.schema_version if loaded.model else "snapshot-v1",
+                       "calculation_version": loaded.model.metadata.calculation_version if loaded.model else "security-ranking-snapshot-v1",
+                       "builder_version": loaded.model.metadata.builder_version if loaded.model else "portfolio-overview",
                        "input_fingerprint_match": loaded.input_fingerprint_match,
                        "upstream_version_match": loaded.upstream_version_match,
                        "legacy_adapter_used": False}}, canonical)
@@ -4695,7 +4722,11 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
             "I can analyze this question only through EagleEyes' registered capabilities, but I don't yet have a supported "
             "capability for the requested analytical requirement. No unrestricted AI financial reasoning was used."
         )
-    canonical_check_messages = [check.message for check in analysis_result.verification.checks if not check.passed]
+    hidden_check_markers = ("legacy analysisresult adapter", "versioned registry", "request-scoped verifier")
+    canonical_check_messages = [
+        check.message for check in analysis_result.verification.checks
+        if not check.passed and not any(marker in check.message.lower() for marker in hidden_check_markers)
+    ]
     if not analysis_result.verification.answer_allowed:
         requested_count = len(analysis_result.coverage.requested_entities)
         evaluated_count = len(analysis_result.coverage.evaluated_entities)

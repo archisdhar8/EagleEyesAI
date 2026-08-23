@@ -160,6 +160,27 @@ def test_partial_failure_preserves_successful_evidence() -> None:
     assert "prediction_markets: UNAVAILABLE" in rendered
 
 
+def test_composed_answer_hides_internal_adapter_and_registry_diagnostics() -> None:
+    rows = entities()
+    plan = planner.CapabilityPlan(
+        goal="question", entities=rows, portfolio_context_required=True,
+        steps=[planner._step("portfolio_risk", rows, planner.ReasonCode.PRIMARY_QUESTION)],
+    )
+    composed = planner.compose_results("question", plan, [
+        result("portfolio_risk", AnalysisStatus.PARTIAL, message="Useful saved risk evidence."),
+    ])
+    composed.limitations.extend([
+        "Converted through the legacy AnalysisResult adapter; unavailable metadata was not fabricated.",
+        "Every component was selected from the versioned registry.",
+    ])
+
+    rendered = planner.render_composed(composed)
+
+    assert "Useful saved risk evidence" in rendered
+    assert "legacy AnalysisResult adapter" not in rendered
+    assert "versioned registry" not in rendered
+
+
 def test_heavy_pending_keeps_available_portfolio_risk() -> None:
     rows = entities()
     plan = planner.deterministic_capability_plan(

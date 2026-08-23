@@ -4,7 +4,8 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from backend import ask_portfolio, database
+from backend import ask_portfolio, database, read_models
+from backend.ask_runtime import build_portfolio_context
 from backend.main import (
     _benchmark_outlook_chat_tools, _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
     _cors_allowed_origins, _cors_allow_origin_regex, _decision_workspace_inputs, _execute_chat_plan_tools, _portfolio_chat_tools, _portfolio_risk_chat_tools,
@@ -832,6 +833,33 @@ def test_worst_holding_answer_focuses_on_weakest_evidence_not_a_sell_call(monkey
     tools, _ = _security_ranking_chat_tools("user-1", "what is my worst stock holding")
     assert tools[0]["status"] == "unavailable"
     assert "versioned portfolio context" in tools[0]["summary"]["message"]
+
+
+def test_security_ranking_falls_back_to_saved_portfolio_snapshot(monkeypatch) -> None:
+    portfolio = {"id": "portfolio-1", "holdings": [
+        {"ticker": "AAPL", "weight": .5}, {"ticker": "MU", "weight": .4}, {"ticker": "CASH", "weight": .1},
+    ]}
+    context = build_portfolio_context(portfolio)
+    monkeypatch.setattr("backend.main.read_models.load_compatible_read_model", lambda *_args, **_kwargs:
+                        read_models.CompatibleReadModel(state=read_models.CompatibilityState.MISSING, reason="No capability read model exists."))
+    monkeypatch.setattr("backend.main.database.latest_portfolio_health", lambda *_args, **_kwargs: {
+        "id": "snapshot-1", "effective_at": "2026-08-22T20:00:00+00:00", "result": {"holdings": [
+            {"ticker": "AAPL", "health_score": 75, "fundamental_score": 80, "valuation_score": 65, "momentum_score": 70},
+            {"ticker": "MU", "health_score": 42, "fundamental_score": 40, "valuation_score": 50, "momentum_score": 35},
+            {"ticker": "CASH", "health_score": 0},
+        ]},
+    })
+
+    tools, _ = _security_ranking_chat_tools(
+        "user-1", "what is my best holding? and lower ranking holdings?",
+        portfolio_id="portfolio-1", context=context,
+    )
+
+    assert tools[0]["status"] == "complete"
+    assert tools[0]["summary"]["focus"] == "both"
+    assert [row["ticker"] for row in tools[0]["summary"]["ranked"]] == ["AAPL", "MU"]
+    assert tools[0]["read_model"]["type"] == "portfolio_health_snapshot"
+    assert "legacy" not in str(tools[0]["analysis_result"]).lower()
 
 
 def test_slow_narrator_fallback_preserves_company_tool_evidence() -> None:

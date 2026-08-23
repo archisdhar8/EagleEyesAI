@@ -1,3 +1,4 @@
+from backend import capability_planner
 from backend.ask_orchestration import (
     MAX_REPLANS, MAX_RETRIES, MAX_TOOL_CALLS, actions_for, build_plan,
     execution_state, previous_analysis_context,
@@ -51,6 +52,16 @@ def test_worst_stock_holding_uses_saved_holdings_research_ranking():
     assert plan.intent == "RESEARCH_RANKING"
     assert plan.tools == ("security_ranking",)
     assert "stored_evidence" not in plan.tools
+
+
+def test_best_and_lower_ranking_holdings_use_research_ranking_without_composition():
+    question = "what is my best holding? and lower ranking holdings?"
+    plan = build_plan(question, "research")
+    assert plan.intent == "RESEARCH_RANKING"
+    assert plan.tools == ("security_ranking",)
+    assert not capability_planner.should_use_compositional_planner(
+        question, plan.intent, plan.confidence,
+    )
 
 
 def test_plain_language_concentration_question_uses_full_cached_intelligence():

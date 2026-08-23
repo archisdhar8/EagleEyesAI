@@ -485,6 +485,7 @@ def should_use_compositional_planner(question: str, direct_intent: str, confiden
         "HIDDEN_RISK", "MULTI_SCENARIO", "WATCHLIST_COMPARISON", "PORTFOLIO_EVENTS",
         "DATA_QUALITY", "SCORE_ATTRIBUTION", "THESIS_INVALIDATION", "PORTFOLIO_ANALYSIS",
         "MULTIFACTOR_SCREEN", "RECOMMENDATION_COUNTERCASE", "CASH_ALLOCATION",
+        "RESEARCH_RANKING",
     }
     if direct_intent in established_compound_routes:
         return False
@@ -579,6 +580,12 @@ def compose_results(question: str, plan: CapabilityPlan, results: list[AnalysisR
 
 
 def render_composed(result: ComposedAnalysisResult) -> str:
+    def public_limitation(value: str) -> bool:
+        lowered = value.lower()
+        return not any(marker in lowered for marker in (
+            "legacy analysisresult adapter", "versioned registry", "request-scoped verifier",
+        ))
+
     usable = [row for row in result.supported_findings if row.status in {AnalysisStatus.SUCCESS, AnalysisStatus.PARTIAL}]
     unavailable = [row for row in result.supported_findings if row.status in {AnalysisStatus.UNAVAILABLE, AnalysisStatus.FAILED}]
     if result.overall_status == AnalysisStatus.PENDING and not usable:
@@ -593,7 +600,7 @@ def render_composed(result: ComposedAnalysisResult) -> str:
                         + ", ".join(conflict["supporting"]) + " are supportive, while "
                         + ", ".join(conflict["opposing"]) + " are opposing evidence.")
     missing = [f"{row.capability}: {row.status.value}" for row in unavailable]
-    missing.extend(result.limitations[:5])
+    missing.extend(value for value in result.limitations if public_limitation(value))
     if missing:
         sections.append("**Missing or unavailable evidence**\n\n" + "\n".join(f"- {item}" for item in dict.fromkeys(missing)))
     sections.append(f"**Confidence / coverage**\n\nOverall status: **{result.overall_status.value}**. "
