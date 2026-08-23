@@ -3295,8 +3295,11 @@ def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]]) 
         canonical = AnalysisResult.model_validate(phase6["analysis_result"])
         if canonical.capability == "company_analysis" and canonical.data:
             return phase6_domains.render_company(phase6_domains.CompanyAnalysisResult.model_validate(canonical.data))
-        if canonical.capability == "company_comparison" and canonical.data:
-            return phase6_domains.render_comparison(phase6_domains.CompanyComparisonResult.model_validate(canonical.data))
+        if canonical.capability == "company_comparison" and canonical.status in {AnalysisStatus.SUCCESS, AnalysisStatus.PARTIAL} and canonical.data:
+            try:
+                return phase6_domains.render_comparison(phase6_domains.CompanyComparisonResult.model_validate(canonical.data))
+            except ValueError:
+                return None
         if canonical.capability == "macro_state" and canonical.data:
             return phase6_domains.render_macro(phase6_domains.MacroStateResult.model_validate(canonical.data))
         if canonical.capability == "market_state" and canonical.data:
@@ -3825,6 +3828,13 @@ def _comparison_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, 
     portfolios = database.list_portfolios(user_id)
     holdings = list(portfolios[0].get("holdings", [])) if portfolios else None
     canonical = phase6_domains.company_comparison_result(user_id, tickers, holdings)
+    if canonical.status == AnalysisStatus.UNAVAILABLE:
+        # Build directly from stored Supabase evidence when a scheduled read
+        # model is absent. Avoiding writes keeps this bounded request inside the
+        # interactive Ask deadline.
+        stored = database.security_data(tickers, price_limit=260)
+        research_rows = security_research(tickers, price_limit=260, stored=stored)
+        canonical = phase6_domains.company_comparison_from_stored(tickers, stored, research_rows, holdings)
     status = "complete" if canonical.status == AnalysisStatus.SUCCESS else canonical.status.value.lower()
     payload = canonical.data if isinstance(canonical.data, dict) else {}
     return [with_canonical_result({"tool_name": "company_comparison", "status": status,
@@ -4673,9 +4683,12 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
         record_metric("ask.partial", tags={"intent":plan.intent})
     narration_started = time.monotonic()
     deterministic_started = narration_started
+    direct_canonical_answer = _deterministic_chat_answer(plan.intent, tool_results)
     deterministic_answer = (
-        capability_planner.render_composed(composed_result) if composed_result else
-        ask_portfolio.compose(plan.intent, tool_results) or _deterministic_chat_answer(plan.intent, tool_results)
+        ask_portfolio.compose(plan.intent, tool_results)
+        or (direct_canonical_answer if len(canonical_results) == 1 else None)
+        or (capability_planner.render_composed(composed_result) if composed_result else None)
+        or direct_canonical_answer
     )
     if plan.intent == "UNSUPPORTED":
         deterministic_answer = (
@@ -4688,12 +4701,18 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
         evaluated_count = len(analysis_result.coverage.evaluated_entities)
         percent = analysis_result.coverage.entity_coverage_percent
         coverage_text = f"{percent:.1f}%" if percent is not None else "not tracked"
+        portfolio_wide = plan.intent in {
+            "PORTFOLIO_ANALYSIS", "PORTFOLIO_RISK", "HIDDEN_RISK", "THESIS_REPLACEMENT",
+            "WATCHLIST_COMPARISON", "CASH_ALLOCATION", "PORTFOLIO_CHANGE",
+        }
+        subject = "the whole portfolio" if portfolio_wide else "the requested securities"
+        conclusion = "No portfolio-wide conclusion or recommendation was generated." if portfolio_wide else "No unsupported comparison was generated."
         deterministic_answer = (
             f"I evaluated **{evaluated_count} of {requested_count} requested entities** "
-            f"(**{coverage_text} coverage**), so I cannot reliably characterize the whole portfolio. "
-            "No portfolio-wide conclusion or recommendation was generated.\n\n"
+            f"(**{coverage_text} coverage**), so I cannot reliably characterize {subject}. "
+            f"{conclusion}\n\n"
             + "\n".join(f"- {message}" for message in canonical_check_messages)
-            + "\n\n**What to verify:** refresh missing holding evidence and rerun the analysis."
+            + "\n\n**What to verify:** refresh the missing stored evidence and rerun the analysis."
         )
     elif analysis_result.status != AnalysisStatus.UNAVAILABLE and not analysis_result.verification.recommendation_allowed and plan.intent in {
         "PORTFOLIO_ANALYSIS", "THESIS_REPLACEMENT", "WATCHLIST_COMPARISON"

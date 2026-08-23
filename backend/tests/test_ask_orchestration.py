@@ -103,7 +103,13 @@ def test_explicit_execution_states_and_deep_link_actions():
     plan = build_plan("What changed in MSFT?", "research")
     actions = actions_for(plan)
     assert actions[0]["href"] == "/research?view=stocks&ticker=MSFT"
-    assert any(action["href"].startswith("/decisions?ticker=MSFT") for action in actions)
+    assert not any(action["href"].startswith("/decisions") for action in actions)
+
+    comparison = actions_for(build_plan("Compare MSFT and AMZN, including portfolio fit.", "research"))
+    assert [action["href"] for action in comparison[:2]] == [
+        "/research?view=stocks&ticker=MSFT",
+        "/research?view=stocks&ticker=AMZN",
+    ]
 
 
 def test_previous_analysis_context_reads_latest_structured_message():

@@ -192,17 +192,17 @@ def execution_state(status: str) -> str:
 def actions_for(plan: AskPlan, page_context: dict[str, Any] | None = None) -> list[dict[str, str]]:
     ticker = plan.tickers[0] if plan.tickers else str((page_context or {}).get("ticker") or "").upper()
     actions: list[dict[str, str]] = []
-    if ticker:
-        actions.extend([
-            {"label": f"Open {ticker} research", "href": f"/research?view=stocks&ticker={ticker}", "kind": "research"},
-            {"label": "Review thesis or record decision", "href": f"/decisions?ticker={ticker}", "kind": "decision"},
-        ])
+    research_tickers = list(plan.tickers[:2]) or ([ticker] if ticker else [])
+    actions.extend(
+        {"label": f"Open {symbol} research", "href": f"/research?view=stocks&ticker={symbol}", "kind": "research"}
+        for symbol in research_tickers
+    )
     if plan.intent in {"SCENARIO", "PORTFOLIO_ANALYSIS", "PORTFOLIO_RISK", "BENCHMARK_OUTLOOK", "ADD_RESEARCH", "COMPARISON"}:
         actions.append({"label": "Open portfolio intelligence", "href": "/portfolio?view=analysis", "kind": "portfolio"})
     if plan.intent == "THESIS" and not ticker:
-        actions.append({"label": "Review saved theses", "href": "/decisions", "kind": "decision"})
+        actions.append({"label": "Open company research", "href": "/research?view=stocks", "kind": "research"})
     if plan.intent == "RETROSPECTIVE":
-        actions.append({"label": "Open decision journal", "href": "/decisions?view=journal", "kind": "journal"})
+        actions.append({"label": "Open research workspace", "href": "/research", "kind": "research"})
     return actions[:3]
 
 

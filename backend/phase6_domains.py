@@ -744,6 +744,53 @@ def company_analysis_result(user_id: str, ticker: str) -> AnalysisResult:
                                   input_fingerprint("company_analysis", ticker=normalized), [normalized])
 
 
+def company_comparison_from_stored(tickers: list[str], stored: dict[str, Any],
+                                   research_rows: list[dict[str, Any]],
+                                   holdings: list[dict[str, Any]] | None = None) -> AnalysisResult:
+    """Build a bounded comparison from already-stored evidence without read-model writes."""
+    normalized = list(dict.fromkeys(value.upper() for value in tickers))
+    research_by_ticker = {str(row.get("ticker") or "").upper(): row for row in research_rows}
+    models = [
+        build_company_analysis(ticker, stored, research_by_ticker[ticker])
+        for ticker in normalized if ticker in research_by_ticker
+    ]
+    evaluated = [model.ticker for model in models if model.evidence_quality.level != "INSUFFICIENT_DATA"]
+    data = build_company_comparison(models, holdings).model_dump(mode="json") if len(models) >= 2 else {}
+    status = (
+        AnalysisStatus.SUCCESS if len(evaluated) == len(normalized) and holdings is not None
+        else AnalysisStatus.PARTIAL if len(models) >= 2
+        else AnalysisStatus.UNAVAILABLE
+    )
+    effective_dates = [value for model in models for value in model.freshness.values() if value]
+    return AnalysisResult(
+        capability="company_comparison", calculation_version=COMPARISON_CALCULATION_VERSION,
+        input_fingerprint=stable_fingerprint({
+            "tickers": normalized,
+            "stored": read_models.dataset_descriptor(stored),
+            "portfolio_context": holdings or None,
+        }),
+        status=status, data=data,
+        coverage=Coverage(requested_entities=normalized, evaluated_entities=evaluated),
+        freshness=build_freshness([("stored_company_evidence", value) for value in effective_dates]),
+        dependencies=[DependencyResult(
+            name=f"stored_company_evidence:{ticker}", required=True,
+            status=AnalysisStatus.SUCCESS if ticker in evaluated else AnalysisStatus.UNAVAILABLE,
+            cache_state="STORED_EVIDENCE",
+        ) for ticker in normalized] + [DependencyResult(
+            name="portfolio_fit", required=False,
+            status=AnalysisStatus.SUCCESS if holdings is not None else AnalysisStatus.UNAVAILABLE,
+        )],
+        limitations=[] if status == AnalysisStatus.SUCCESS else [
+            "Some requested stored company evidence or portfolio context is unavailable."
+        ],
+        verification=VerificationResult(
+            passed=status != AnalysisStatus.UNAVAILABLE,
+            answer_allowed=status != AnalysisStatus.FAILED,
+            recommendation_allowed=False,
+        ),
+    )
+
+
 def company_comparison_result(user_id: str, tickers: list[str], holdings: list[dict[str, Any]] | None = None) -> AnalysisResult:
     normalized = list(dict.fromkeys(value.upper() for value in tickers))
     loaded = load_company_pair(user_id, normalized)
@@ -936,15 +983,76 @@ def render_company(data: CompanyAnalysisResult) -> str:
 
 
 def render_comparison(data: CompanyComparisonResult) -> str:
-    lines = [" vs ".join(row["ticker"] for row in data.companies), "", "Growth"]
-    lines.extend(f"{row['ticker']}: revenue {row.get('revenue', 'unavailable')}" for row in data.growth_comparison)
-    lines.extend(["", "Profitability"])
-    lines.extend(f"{row['ticker']}: net margin {row.get('net_margin', 'unavailable')}" for row in data.profitability_comparison)
-    lines.extend(["", "Valuation"])
-    lines.extend(f"{row['ticker']}: score {row.get('score', 'unavailable')}" for row in data.valuation_comparison)
-    lines.extend(["", "Portfolio fit", "Available" if data.portfolio_context_available else "Unavailable; company facts are unaffected."])
-    lines.extend(["", "Missing evidence"])
-    lines.extend(f"{ticker}: {', '.join(values) or 'none'}" for ticker, values in data.missing_fields.items())
+    def by_ticker(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        return {str(row.get("ticker") or "").upper(): row for row in rows}
+
+    def number(value: Any, *, percent: bool = False) -> str:
+        parsed = _number(value)
+        if parsed is None:
+            return "unavailable"
+        return f"{parsed:.1%}" if percent else f"{parsed:,.1f}"
+
+    def money(value: Any) -> str:
+        parsed = _number(value)
+        if parsed is None:
+            return "unavailable"
+        if abs(parsed) >= 1_000_000_000:
+            return f"${parsed / 1_000_000_000:.1f}B"
+        if abs(parsed) >= 1_000_000:
+            return f"${parsed / 1_000_000:.1f}M"
+        return f"${parsed:,.1f}"
+
+    growth = by_ticker(data.growth_comparison)
+    profitability = by_ticker(data.profitability_comparison)
+    valuation = by_ticker(data.valuation_comparison)
+    momentum = by_ticker(data.momentum_comparison)
+    fit = by_ticker(data.portfolio_fit)
+    tickers = [str(row["ticker"]) for row in data.companies]
+    lines = [f"**{' vs '.join(tickers)} — stored evidence comparison**", ""]
+    scored = [(ticker, _number(next((row.get("score") for row in data.companies if row["ticker"] == ticker), None))) for ticker in tickers]
+    scored = [(ticker, value) for ticker, value in scored if value is not None]
+    margins = [(ticker, _number(profitability.get(ticker, {}).get("net_margin"))) for ticker in tickers]
+    margins = [(ticker, value) for ticker, value in margins if value is not None]
+    valuations = [(ticker, _number(valuation.get(ticker, {}).get("score"))) for ticker in tickers]
+    valuations = [(ticker, value) for ticker, value in valuations if value is not None]
+    if scored:
+        overall = max(scored, key=lambda row: row[1])
+        summary = f"On the currently stored evidence, **{overall[0]} ranks ahead overall** with an EagleEyes score of **{overall[1]:.1f}**"
+        if valuations:
+            valuation_leader = max(valuations, key=lambda row: row[1])
+            summary += f" and **{valuation_leader[0]} has the stronger relative valuation score**"
+        if margins:
+            margin_leader = max(margins, key=lambda row: row[1])
+            summary += f", while **{margin_leader[0]} has the higher stored net margin**"
+        lines.extend(["**Bottom line**", summary + ". The portfolio-fit conclusion is limited to current position weights; sector and economic-dependency overlap still need a separate concentration check.", ""])
+    for ticker in tickers:
+        company = next((row for row in data.companies if row["ticker"] == ticker), {})
+        lines.extend([
+            f"**{ticker}**",
+            f"- EagleEyes score: **{number(company.get('score'))}**",
+            f"- Latest stored revenue: **{money(growth.get(ticker, {}).get('revenue'))}**; net margin: **{number(profitability.get(ticker, {}).get('net_margin'), percent=True)}**",
+            f"- Valuation score: **{number(valuation.get(ticker, {}).get('score'))}**; momentum score: **{number(momentum.get(ticker, {}).get('score'))}**",
+        ])
+        strengths = data.advantages.get(ticker) or []
+        risks = data.disadvantages.get(ticker) or []
+        if strengths:
+            lines.append(f"- Strongest stored evidence: {strengths[0]}.")
+        if risks:
+            lines.append(f"- Main caution: {risks[0]}.")
+        lines.append("")
+    lines.append("**Portfolio fit**")
+    if data.portfolio_context_available:
+        lines.extend(
+            f"- **{ticker}: {number(fit.get(ticker, {}).get('current_portfolio_weight'))}%** of the saved portfolio."
+            for ticker in tickers
+        )
+        lines.append("This fit measure is current holding weight only. It shows existing concentration, not incremental diversification or expected return.")
+    else:
+        lines.append("Saved portfolio context is unavailable; the company comparison remains usable, but portfolio fit cannot be claimed.")
+    missing = [f"{ticker}: {', '.join(values)}" for ticker, values in data.missing_fields.items() if values]
+    if missing:
+        lines.extend(["", "**Missing evidence**", *[f"- {row}" for row in missing]])
+    lines.extend(["", f"Evidence confidence: **{data.confidence.lower()}**. This is a comparison of stored evidence, not a buy recommendation."])
     return "\n".join(lines)
 
 

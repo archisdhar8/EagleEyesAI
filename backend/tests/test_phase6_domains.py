@@ -305,6 +305,32 @@ def test_company_comparison_ask_regression_uses_canonical_data(monkeypatch):
     assert evidence[0]["data"]["valuation_comparison"]
 
 
+def test_company_comparison_materializes_missing_read_models_from_stored_evidence(monkeypatch):
+    fixtures = [company_fixture(ticker) for ticker in ("MSFT", "AMZN")]
+    stored = {
+        key: [row for fixture, _ in fixtures for row in fixture.get(key, [])]
+        for key in ("securities", "fundamentals", "prices", "news", "company_markets")
+    }
+    research = [row for _, row in fixtures]
+    monkeypatch.setattr(main.database, "security_data", lambda *_args, **_kwargs: stored)
+    monkeypatch.setattr(main, "security_research", lambda *_args, **_kwargs: research)
+    monkeypatch.setattr(main.database, "list_portfolios", lambda *_args, **_kwargs: [{"holdings": [
+        {"ticker": "MSFT", "weight": .18}, {"ticker": "AMZN", "weight": .07},
+    ]}])
+
+    tools, _ = main._comparison_chat_tools("user-on-demand", "Compare MSFT and AMZN, including portfolio fit.")
+
+    result = tools[0]["analysis_result"]
+    assert result["status"] in {"SUCCESS", "PARTIAL"}
+    assert result["coverage"]["evaluated_entities"] == ["MSFT", "AMZN"]
+    rendered = phase6_domains.render_comparison(phase6_domains.CompanyComparisonResult.model_validate(result["data"]))
+    assert "MSFT vs AMZN" in rendered
+    assert "Bottom line" in rendered
+    assert "ranks ahead overall" in rendered
+    assert "MSFT: 18.0%" in rendered
+    assert "AMZN: 7.0%" in rendered
+
+
 def test_deep_job_running_does_not_hide_fast_company_model():
     stored, research = company_fixture()
     phase6_domains.materialize_company("user-a", "MSFT", stored=stored, research_row=research)
