@@ -66,4 +66,8 @@ test("verified result lineage and independent widget states are visible", () => 
   assert.match(shared, /Running historical analysis/);
   assert.match(shared, /Updated data available/);
   assert.match(shared, /Partial verified result/);
+  assert.match(shared, /canonical-portfolio-intelligence/);
+  assert.match(shared, /canonical-result-widget/);
+  assert.match(shared, /Sector concentration/);
+  assert.match(shared, /Modeled risk contributors/);
 });

@@ -33,6 +33,16 @@ export function plainResultAnswer(widgetType: string, data: unknown): string {
   const value = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {};
   if (widgetType === "portfolio_performance") return "This shows how today’s holdings and weights behaved historically; it is not your actual account return.";
   if (widgetType === "sector_exposure") return "This groups your current saved portfolio weights by the latest stored sector classification.";
+  if (widgetType === "canonical_result" && value.concentration && typeof value.concentration === "object") {
+    const concentration = value.concentration as Record<string, unknown>;
+    const positions = Array.isArray(concentration.positions) ? concentration.positions : [];
+    const largest = positions[0] && typeof positions[0] === "object" ? positions[0] as Record<string, unknown> : null;
+    const effective = typeof concentration.effective_holdings === "number" ? concentration.effective_holdings : null;
+    if (largest && typeof largest.ticker === "string" && typeof largest.weight === "number") {
+      return `${largest.ticker} is the largest visible position at ${(largest.weight * 100).toFixed(1)}%${effective == null ? "." : `, with ${effective.toFixed(1)} effective holdings.`}`;
+    }
+    return "This shows the available position, sector, modeled-risk, and shared-dependency evidence from the saved portfolio analysis.";
+  }
   if (widgetType === "correlation_matrix") return "Higher relationships mean the positions have tended to move together and may provide less diversification.";
   if (widgetType === "scenario_probabilities") return "These are separate condition estimates. Economic, inflation, rate, and shock conditions may occur together.";
   if (widgetType === "holdings_sensitivity") return "This compares which holdings historically moved most when the selected macro factor changed.";
