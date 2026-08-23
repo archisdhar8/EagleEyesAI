@@ -26,6 +26,7 @@ import {
 
 const API = (process.env.NEXT_PUBLIC_API_URL || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000/api" : "/api")).replace(/\/$/, "");
 const DASHBOARD_TERMINAL_STATES = new Set(["COMPLETE", "PARTIAL_SUCCESS", "FAILED", "CANCELLED", "EXPIRED"]);
+const NEW_CHAT_STORAGE_VALUE = "__new_chat__";
 type SavedPortfolio = { id: string | number; name: string; holdings: Holding[]; updated_at?: string | null };
 type CachedToday = { cachedAt:number; briefing:TodayBriefing; macro?:Macro; macroFactors?:MacroFactor[]; dataStatus?:DataStatus };
 export default function Dashboard({ accessToken, email, onSignOut }: { accessToken: string; email: string; onSignOut: () => void }) {
@@ -104,6 +105,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   useEffect(()=>{
     setResearchConversationId(null);setResearchChatMessages([]);setResearchChatArtifacts([]);setResearchConversations([]);
     setPortfolioConversationId(null);setPortfolioChatMessages([]);setPortfolioChatArtifacts([]);setPortfolioConversations([]);
+    setSelectedDashboardView(null);setDashboardJob(null);
   },[portfolioId]);
   const [terminalCatalogOpen, setTerminalCatalogOpen] = useState(false);
   const [terminalPerformance, setTerminalPerformance] = useState<TerminalPerformance>(null);
@@ -113,7 +115,6 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   const [draggedTerminalWidget, setDraggedTerminalWidget] = useState<string | null>(null);
   const [terminalLayouts, setTerminalLayouts] = useState<TerminalLayout[]>([]);
   const [selectedTerminalLayout, setSelectedTerminalLayout] = useState<string | null>(null);
-  const restoredChatWorkspaces=useRef(new Set<string>());
   const chatStorageKey=(workspace:"research"|"portfolio")=>`eagleeyes-${workspace}-conversation-${portfolioId??"general"}`;
 
   const apiFetch = useCallback(async (input: string, init: RequestInit = {}) => {
@@ -172,42 +173,47 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
 
   useEffect(()=>{
     const workspace=tab==="ask"?"research":tab==="portfolio"?"portfolio":null;
-    const restoreKey=workspace?`${workspace}:${portfolioId??"general"}`:"";
-    if(!workspace||restoredChatWorkspaces.current.has(restoreKey))return;
+    if(!workspace)return;
     const activeWorkspace: "research"|"portfolio"=workspace;
+    const storageKey=chatStorageKey(activeWorkspace);
     let active=true;
     async function restore(){
-      const response=await apiRequest(`/chat/conversations?workspace=${activeWorkspace}${portfolioId?`&portfolio_id=${encodeURIComponent(String(portfolioId))}`:""}`);
-      if(!response.ok)return;
-      const payload=await response.json();
-      const rows:ChatConversation[]=Array.isArray(payload)?payload:[];
-      if(!active)return;
-      restoredChatWorkspaces.current.add(restoreKey);
-      if(activeWorkspace==="research")setResearchConversations(rows);else setPortfolioConversations(rows);
-      const remembered=window.localStorage.getItem(chatStorageKey(activeWorkspace));
-      const selected=rows.find(item=>item.id===remembered)?.id||rows[0]?.id;
-      if(!selected)return;
-      const detailResponse=await apiRequest(`/chat/conversations/${selected}`);
-      if(!detailResponse.ok||!active)return;
-      const detail=await detailResponse.json();
-      conversationCache.current[activeWorkspace].set(selected,{messages:detail.messages||[],artifacts:detail.artifacts||[]});
-      if(activeWorkspace==="research"){
-        setResearchConversationId(selected);setResearchChatMessages(detail.messages||[]);setResearchChatArtifacts(detail.artifacts||[]);
-        const linkedDashboard=(detail.artifacts||[]).find((artifact:ChatArtifact)=>artifact.artifact_type==="dashboard_view");
-        if(linkedDashboard){
-          const viewResponse=await apiRequest(`/dashboard/views/${linkedDashboard.artifact_id}`);
-          if(viewResponse.ok&&active)loadDashboardViewState(await viewResponse.json());
-        }else{
-          const lastDashboardMessage=[...(detail.messages||[])].reverse().find((message:ChatMessage)=>message.structured_content?.dashboard_operation?.resource_type==="draft");
-          const draftId=lastDashboardMessage?.structured_content?.dashboard_operation?.resource_id;
-          if(draftId){
-            const draftResponse=await apiRequest(`/dashboard/drafts/${draftId}`);
-            if(draftResponse.ok&&active){setSelectedDashboardView(null);setDashboardJob(await draftResponse.json());}
+      try{
+        const response=await apiRequest(`/chat/conversations?workspace=${activeWorkspace}${portfolioId?`&portfolio_id=${encodeURIComponent(String(portfolioId))}`:""}`);
+        if(!response.ok){if(active)setNotice(await apiError(response,"Unable to reload conversations"));return;}
+        const payload=await response.json();
+        const rows:ChatConversation[]=Array.isArray(payload)?payload:[];
+        if(!active)return;
+        if(activeWorkspace==="research")setResearchConversations(rows);else setPortfolioConversations(rows);
+        const remembered=window.localStorage.getItem(storageKey);
+        if(remembered===NEW_CHAT_STORAGE_VALUE)return;
+        const selected=rows.find(item=>item.id===remembered)?.id||rows[0]?.id;
+        if(!selected){window.localStorage.setItem(storageKey,NEW_CHAT_STORAGE_VALUE);return;}
+        window.localStorage.setItem(storageKey,selected);
+        const detailResponse=await apiRequest(`/chat/conversations/${selected}`);
+        if(!detailResponse.ok||!active||window.localStorage.getItem(storageKey)!==selected)return;
+        const detail=await detailResponse.json();
+        if(!active||window.localStorage.getItem(storageKey)!==selected)return;
+        conversationCache.current[activeWorkspace].set(selected,{messages:detail.messages||[],artifacts:detail.artifacts||[]});
+        if(activeWorkspace==="research"){
+          setResearchConversationId(selected);setResearchChatMessages(detail.messages||[]);setResearchChatArtifacts(detail.artifacts||[]);
+          const linkedDashboard=(detail.artifacts||[]).find((artifact:ChatArtifact)=>artifact.artifact_type==="dashboard_view");
+          if(linkedDashboard){
+            const viewResponse=await apiRequest(`/dashboard/views/${linkedDashboard.artifact_id}`);
+            if(viewResponse.ok&&active&&window.localStorage.getItem(storageKey)===selected)loadDashboardViewState(await viewResponse.json());
+          }else{
+            const lastDashboardMessage=[...(detail.messages||[])].reverse().find((message:ChatMessage)=>message.structured_content?.dashboard_operation?.resource_type==="draft");
+            const draftId=lastDashboardMessage?.structured_content?.dashboard_operation?.resource_id;
+            if(draftId){
+              const draftResponse=await apiRequest(`/dashboard/drafts/${draftId}`);
+              if(draftResponse.ok&&active&&window.localStorage.getItem(storageKey)===selected){setSelectedDashboardView(null);setDashboardJob(await draftResponse.json());}
+            }
           }
         }
+        else{setPortfolioConversationId(selected);setPortfolioChatMessages(detail.messages||[]);setPortfolioChatArtifacts(detail.artifacts||[]);}
+      }catch(error){
+        if(active)setNotice(error instanceof Error?error.message:"Unable to reload conversations");
       }
-      else{setPortfolioConversationId(selected);setPortfolioChatMessages(detail.messages||[]);setPortfolioChatArtifacts(detail.artifacts||[]);}
-      window.localStorage.setItem(chatStorageKey(activeWorkspace),selected);
     }
     void restore();
     return()=>{active=false;};
@@ -841,7 +847,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   }
 
   function newChatConversation(workspace:"research"|"portfolio") {
-    window.localStorage.removeItem(chatStorageKey(workspace));
+    window.localStorage.setItem(chatStorageKey(workspace),NEW_CHAT_STORAGE_VALUE);
     if(workspace==="research"){
       setResearchConversationId(null);setResearchChatMessages([]);setResearchChatArtifacts([]);setResearchChatQuestion("");setSelectedDashboardView(null);setDashboardJob(null);
     }else{
@@ -866,7 +872,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     conversationCache.current[workspace].delete(conversationId);
     if(workspace==="research")setResearchConversations(rows);else setPortfolioConversations(rows);
     if(isCurrent){
-      window.localStorage.removeItem(chatStorageKey(workspace));
+      window.localStorage.setItem(chatStorageKey(workspace),NEW_CHAT_STORAGE_VALUE);
       if(workspace==="research"){setResearchConversationId(null);setResearchChatMessages([]);setResearchChatArtifacts([]);}
       else{setPortfolioConversationId(null);setPortfolioChatMessages([]);setPortfolioChatArtifacts([]);}
       if(rows[0])void openChatConversation(workspace,rows[0].id);

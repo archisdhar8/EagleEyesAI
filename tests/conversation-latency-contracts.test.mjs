@@ -9,6 +9,14 @@ test("new conversation is local-first and does not wait for persistence", () => 
   assert.doesNotMatch(body, /await apiRequest|refreshConversationList|openChatConversation/);
   assert.match(body, /setResearchConversationId\(null\)/);
   assert.match(body, /setResearchChatMessages\(\[\]\)/);
+  assert.match(body, /NEW_CHAT_STORAGE_VALUE/);
+});
+
+test("reload restoration is cancellation-safe and preserves an explicit new chat", () => {
+  assert.doesNotMatch(dashboard, /restoredChatWorkspaces/);
+  assert.match(dashboard, /remembered===NEW_CHAT_STORAGE_VALUE/);
+  assert.match(dashboard, /window\.localStorage\.getItem\(storageKey\)!==selected/);
+  assert.match(dashboard, /setResearchConversations\(rows\)/);
 });
 
 test("conversation deletion updates the sidebar before awaiting Supabase", () => {
