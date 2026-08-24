@@ -23,6 +23,7 @@ export const PRIMARY_NAV_ITEMS: ReadonlyArray<readonly [Tab, string, string]> = 
 
 export const SECONDARY_NAV_ITEMS: ReadonlyArray<readonly [Tab, string, string]> = [
   ["plan", "◌", "Plan & profile"],
+  ["decisions", "◇", "Theses & decisions"],
   ["learn", "◇", "Learn"],
   ["advanced", "▦", "Advanced"],
 ];
@@ -37,8 +38,8 @@ const ROUTES: Record<string, Omit<RouteState, "canonicalPath"> & { canonicalPath
   "/plan": { tab: "plan" },
   "/portfolio": { tab: "portfolio" },
   "/optimize": { tab: "portfolio", portfolioView: "analysis", canonicalPath: "/portfolio?view=analysis" },
-  "/decisions": { tab: "explore", exploreView: "stocks", canonicalPath: "/research" },
-  "/decision-lab": { tab: "explore", exploreView: "stocks", canonicalPath: "/research" },
+  "/decisions": { tab: "decisions" },
+  "/decision-lab": { tab: "decisions", canonicalPath: "/decisions" },
   "/explore": { tab: "explore", canonicalPath: "/research" },
   "/research": { tab: "explore", exploreView: "stocks" },
   "/market-climate": { tab: "climate" },
@@ -67,15 +68,6 @@ export function resolveAppRoute(pathname: string, search = ""): RouteState | nul
   }
   const definition = ROUTES[pathname];
   if (!definition) return null;
-  if (pathname === "/decisions" || pathname === "/decision-lab") {
-    const query = new URLSearchParams(search);
-    const ticker = query.get("ticker")?.trim().toUpperCase();
-    return {
-      tab: "explore",
-      exploreView: "stocks",
-      canonicalPath: ticker ? `/research?ticker=${encodeURIComponent(ticker)}` : "/research",
-    };
-  }
   const requestedView = new URLSearchParams(search).get("view");
   if (pathname === "/portfolio" && requestedView === "lab") {
     return { tab: "explore", exploreView: "stocks", canonicalPath: "/research" };

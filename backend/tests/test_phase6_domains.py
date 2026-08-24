@@ -305,6 +305,20 @@ def test_company_comparison_ask_regression_uses_canonical_data(monkeypatch):
     assert evidence[0]["data"]["valuation_comparison"]
 
 
+def test_company_comparison_scenario_answer_synthesizes_tradeoffs():
+    left = phase6_domains.build_company_analysis("MSFT", *company_fixture("MSFT"))
+    right = phase6_domains.build_company_analysis("AMZN", *company_fixture("AMZN"))
+    comparison = phase6_domains.build_company_comparison(
+        [left, right], [{"ticker": "MSFT", "weight": .18}, {"ticker": "AMZN", "weight": .07}],
+    )
+    answer = main._scenario_comparison_answer(comparison, "which stock would be best when AI bubble pops")
+    assert answer is not None
+    assert "Provisional resilience read" in answer
+    assert "Operating cushion" in answer
+    assert "Valuation cushion" in answer
+    assert "cannot establish a definitive winner" in answer
+
+
 def test_company_comparison_materializes_missing_read_models_from_stored_evidence(monkeypatch):
     fixtures = [company_fixture(ticker) for ticker in ("MSFT", "AMZN")]
     stored = {

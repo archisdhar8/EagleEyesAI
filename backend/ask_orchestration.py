@@ -100,6 +100,21 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
                previous_analysis: dict[str, Any] | None = None) -> AskPlan:
     intent = _intent(question)
     tickers = _tickers(question, page_context, previous_analysis)
+    previous_intent = str((previous_analysis or {}).get("intent") or "").upper()
+    comparison_followup = bool(
+        len(tickers) >= 2
+        and previous_intent == "COMPARISON"
+        and re.search(
+            r"\b(?:which\s+(?:stock|company|one|holding)|what\s+about\s+them)\b.*"
+            r"\b(?:best|better|stronger|safer|resilien\w*|hold\s+up|survive)\b",
+            question,
+            re.I,
+        )
+    )
+    if comparison_followup:
+        # Pronoun/scenario follow-ups must keep the prior comparison set. A
+        # generic company route would otherwise collapse to the first ticker.
+        intent = "COMPARISON"
     mappings = {
         "OPPORTUNITY_RANKING": ("portfolio_overview",),
         "THESIS_REPLACEMENT": ("thesis_replacement",),

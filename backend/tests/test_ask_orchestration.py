@@ -31,6 +31,14 @@ def test_followup_continuity_preserves_comparison_entities():
     assert plan.tickers == ("MSFT", "AMZN")
 
 
+def test_scenario_comparison_followup_does_not_collapse_to_first_ticker():
+    plan = build_plan("which stock would be best when AI bubble pops", "research", {},
+                      {"intent": "COMPARISON", "tickers": ["MSFT", "AMZN"]})
+    assert plan.intent == "COMPARISON"
+    assert plan.tools == ("company_comparison",)
+    assert plan.tickers == ("MSFT", "AMZN")
+
+
 def test_specialized_intents_do_not_receive_unrelated_tools():
     earnings = build_plan("What changed in AAPL earnings?", "research")
     assert earnings.tools == ("company_analysis",)

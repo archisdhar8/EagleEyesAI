@@ -33,11 +33,11 @@ test("normal detail is the default and the only global presentation override is 
   assert.match(presentation, /value === "expert" \? "expert" : "detailed"/);
 });
 
-test("legacy Decision Lab links redirect into unified Research and preserve tickers", async () => {
+test("thesis and legacy Decision Lab links resolve to the guided decision workspace", async () => {
   const routes = await read("app/lib/routes.ts");
-  assert.match(routes, /"\/decision-lab"[^\n]+canonicalPath: "\/research"/);
-  assert.match(routes, /pathname === "\/decisions" \|\| pathname === "\/decision-lab"/);
-  assert.match(routes, /`\/research\?ticker=\$\{encodeURIComponent\(ticker\)\}`/);
+  assert.match(routes, /"\/decisions": \{ tab: "decisions" \}/);
+  assert.match(routes, /"\/decision-lab"[^\n]+canonicalPath: "\/decisions"/);
+  assert.match(routes, /"decisions", "◇", "Theses & decisions"/);
   assert.match(routes, /pathname === "\/portfolio" && requestedView === "lab"/);
   assert.match(routes, /tab: "explore", exploreView: "stocks", canonicalPath: "\/research"/);
 });

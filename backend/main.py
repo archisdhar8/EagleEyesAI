@@ -3349,7 +3349,81 @@ def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None,
     return [tool], [evidence]
 
 
-def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]]) -> str | None:
+def _scenario_comparison_answer(data: phase6_domains.CompanyComparisonResult, question: str) -> str | None:
+    """Synthesize a bounded downside comparison without pretending to forecast it."""
+    lowered = question.lower()
+    if not any(term in lowered for term in (
+        "bubble", "pops", "crash", "downturn", "selloff", "recession", "ai spending", "capex slowdown",
+    )):
+        return None
+
+    tickers = [str(item.get("ticker") or "") for item in data.companies]
+    if len(tickers) < 2:
+        return None
+
+    def indexed(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        return {str(row.get("ticker") or ""): row for row in rows}
+
+    def numeric(value: Any) -> float | None:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    profitability = indexed(data.profitability_comparison)
+    valuation = indexed(data.valuation_comparison)
+    fit = indexed(data.portfolio_fit)
+    margins = [(ticker, numeric(profitability.get(ticker, {}).get("net_margin"))) for ticker in tickers]
+    margins = [(ticker, value) for ticker, value in margins if value is not None]
+    valuations = [(ticker, numeric(valuation.get(ticker, {}).get("score"))) for ticker in tickers]
+    valuations = [(ticker, value) for ticker, value in valuations if value is not None]
+    margin_leader = max(margins, key=lambda item: item[1]) if margins else None
+    valuation_leader = max(valuations, key=lambda item: item[1]) if valuations else None
+    provisional = margin_leader[0] if margin_leader else (valuation_leader[0] if valuation_leader else None)
+    if not provisional:
+        return None
+
+    scenario = "an AI-led valuation reset" if "ai" in lowered or "bubble" in lowered else "the downside scenario you described"
+    lines = [
+        f"**Provisional resilience read: {provisional} — but the stored evidence cannot establish a definitive winner.**",
+        "",
+        f"For {scenario}, I would separate **business resilience** from **share-price resilience**:",
+    ]
+    if margin_leader:
+        lines.append(
+            f"- **Operating cushion:** {margin_leader[0]} has the higher stored net margin "
+            f"({margin_leader[1]:.1%}), which is the clearest available evidence of room to absorb pressure."
+        )
+    if valuation_leader:
+        lines.append(
+            f"- **Valuation cushion:** {valuation_leader[0]} has the stronger stored valuation score "
+            f"({valuation_leader[1]:.1f}); that can matter if expensive AI expectations are repriced."
+        )
+    if data.portfolio_context_available:
+        weights = [
+            (ticker, numeric(fit.get(ticker, {}).get("current_portfolio_weight")))
+            for ticker in tickers
+        ]
+        weights = [(ticker, value) for ticker, value in weights if value is not None]
+        if weights:
+            exposure = max(weights, key=lambda item: item[1])
+            lines.append(
+                f"- **Your portfolio impact:** {exposure[0]} is the larger saved position at "
+                f"{exposure[1]:.1f}%, so a shock there matters more to your current portfolio."
+            )
+    lines.extend([
+        "",
+        "**Why this is not a final prediction**",
+        "The stored comparison does not yet decompose AI revenue, AI capital spending, customer concentration, or valuation sensitivity for each company. "
+        "Without those exposures, choosing a certain winner would be fabricated precision.",
+        "",
+        "**What to verify next:** compare cloud/AI revenue dependence, capex commitments, free-cash-flow sensitivity, and valuation multiples under the same downside assumptions. "
+        f"Evidence confidence is **{data.confidence.lower()}**; this is scenario decision support, not a buy recommendation.",
+    ])
+    return "\n".join(lines)
+
+
+def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]], question: str = "") -> str | None:
     """Answer exact quantitative requests without paying an LLM latency or truncation penalty."""
     phase6 = next((item for item in tool_results if item.get("tool_name") in {
         "company_analysis", "company_comparison", "macro_state", "market_state", "prediction_markets", "historical_change"
@@ -3360,7 +3434,8 @@ def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]]) 
             return phase6_domains.render_company(phase6_domains.CompanyAnalysisResult.model_validate(canonical.data))
         if canonical.capability == "company_comparison" and canonical.status in {AnalysisStatus.SUCCESS, AnalysisStatus.PARTIAL} and canonical.data:
             try:
-                return phase6_domains.render_comparison(phase6_domains.CompanyComparisonResult.model_validate(canonical.data))
+                comparison = phase6_domains.CompanyComparisonResult.model_validate(canonical.data)
+                return _scenario_comparison_answer(comparison, question) or phase6_domains.render_comparison(comparison)
             except ValueError:
                 return None
         if canonical.capability == "macro_state" and canonical.data:
@@ -4811,7 +4886,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
         record_metric("ask.partial", tags={"intent":plan.intent})
     narration_started = time.monotonic()
     deterministic_started = narration_started
-    direct_canonical_answer = _deterministic_chat_answer(plan.intent, tool_results)
+    direct_canonical_answer = _deterministic_chat_answer(plan.intent, tool_results, payload.question)
     deterministic_answer = (
         ask_portfolio.compose(plan.intent, tool_results)
         or (direct_canonical_answer if len(canonical_results) == 1 else None)
