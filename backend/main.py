@@ -24,10 +24,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import analytics_jobs, database, ask_execution, ask_orchestration, ask_portfolio, attention, capability_planner, dashboard_chat, dashboard_presentation, decision_journal, earnings_intelligence, evidence, feature_flags, forecasting, model_portfolios, phase6_domains, portfolio_intelligence, portfolio_overview, product_preferences, read_models, thesis_monitor, theses
+from . import analytics_jobs, database, data_health, ask_execution, ask_orchestration, ask_portfolio, ask_resolution, attention, capability_planner, dashboard_chat, dashboard_presentation, decision_journal, earnings_intelligence, evidence, feature_flags, forecasting, model_portfolios, phase6_domains, portfolio_intelligence, portfolio_overview, product_preferences, read_models, thesis_monitor, theses
 from .ask_runtime import (
-    PortfolioContext, attach_coverage as attach_ask_coverage, build_portfolio_context, parse_scenario_factors,
-    scenario_payload, verify_results,
+    PortfolioContext, attach_coverage as attach_ask_coverage, build_portfolio_context,
+    enforce_output_symbol_boundary, parse_scenario_factors, scenario_payload, verify_results,
 )
 from .analytical_contract import (
     AnalysisResult, AnalysisStatus, Coverage, DependencyResult, VerificationResult,
@@ -849,15 +849,34 @@ def _calculate_portfolio_overview(user_id: str, portfolio_id: str | int,
     thesis_workspace = theses.workspace(user_id, holdings, [])
     active_theses = thesis_workspace.get("active_theses", [])
     monitors = thesis_monitor.latest_results(user_id, [str(row["id"]) for row in active_theses])
-    diagnostics = build_portfolio_diagnostics(holdings, security_bundle, {"funds": [], "holdings": []}) if holdings else {
+    # Fund identity and constituent coverage are build-time inputs.  Keeping
+    # them out of the interactive Ask path is fast, while omitting them here
+    # incorrectly relabels every fund as an unknown issuer holding.
+    fund_bundle = database.fund_reference_data(tickers) if tickers else {"funds": [], "holdings": []}
+    diagnostics = build_portfolio_diagnostics(holdings, security_bundle, fund_bundle) if holdings else {
         "sector_exposure": [], "industry_exposure": [], "marginal_risk": {"status": "unavailable", "positions": []},
         "performance_label": "Unavailable without saved holdings", "warnings": [],
     }
+    upcoming_events = database.upcoming_market_events(tickers, 45) if tickers else []
     diagnostics["intelligence"] = portfolio_intelligence.build_portfolio_intelligence(
         holdings=holdings, security_data=security_bundle, diagnostics=diagnostics, theses=active_theses,
-        monitor_results=monitors, forecasting={"markets": []}, events=[], scenario_outcomes=[],
+        monitor_results=monitors, forecasting={"markets": []}, events=upcoming_events, scenario_outcomes=[],
     )
     profile = database.load_profile(user_id) or InvestorProfile().model_dump(mode="json")
+    # The 3-month Treasury constant-maturity yield is the default sourced cash
+    # hurdle when a user has not supplied a personal cash yield.  Stale macro
+    # observations are not promoted into an invest-versus-cash claim.
+    if profile.get("cash_hurdle_yield") is None and profile.get("cash_yield") is None:
+        cash_rows = database.macro_observation_history(["DGS3MO"], 1)
+        latest_cash = cash_rows[0] if cash_rows else None
+        if latest_cash and latest_cash.get("date") and latest_cash.get("value") is not None:
+            cash_date = datetime.fromisoformat(str(latest_cash["date"]).replace("Z", "+00:00"))
+            if cash_date.tzinfo is None:
+                cash_date = cash_date.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - cash_date).days <= 8:
+                profile = {**profile, "cash_hurdle_yield": float(latest_cash["value"]) / 100.0,
+                           "cash_hurdle_source": latest_cash.get("source_url") or "FRED:DGS3MO",
+                           "cash_hurdle_as_of": latest_cash.get("date")}
     policy = database.load_investment_policy(user_id) or InvestmentPolicy().model_dump(mode="json")
     goals = database.list_goals(user_id)
     guidance = build_guidance(
@@ -867,8 +886,12 @@ def _calculate_portfolio_overview(user_id: str, portfolio_id: str | int,
     portfolios = database.list_portfolios(user_id)
     latest_briefing = database.latest_briefing_snapshot(user_id) if portfolios and str(portfolios[0].get("id")) == str(portfolio_id) else None
     attention_items = (latest_briefing or {}).get("attention", [])
-    previous_nightly_rows = database.portfolio_health_history(user_id, portfolio_id, 1, "NIGHTLY")
-    previous_nightly = (previous_nightly_rows[0].get("result") if previous_nightly_rows else None)
+    # Any compatible durable analytical snapshot is a valid baseline.  Its
+    # trigger is retained so the UI never relabels an import/refresh as a user
+    # "last review".  Nightly-only selection caused otherwise real history to
+    # be ignored by Ask.
+    previous_snapshot_rows = database.portfolio_health_history(user_id, portfolio_id, 1)
+    previous_snapshot = (previous_snapshot_rows[0].get("result") if previous_snapshot_rows else None)
     input_payload = {
         "portfolio": portfolio, "research": research, "diagnostics": diagnostics,
         "theses": active_theses, "monitors": monitors, "guidance": guidance,
@@ -878,7 +901,7 @@ def _calculate_portfolio_overview(user_id: str, portfolio_id: str | int,
     result = portfolio_overview.build_portfolio_overview(
         portfolio=portfolio, diagnostics=diagnostics, research=research, theses=active_theses,
         monitors=monitors, decisions=thesis_workspace.get("recent_decisions", []), attention_items=attention_items,
-        guidance=guidance, previous_nightly=previous_nightly, trigger=trigger,
+        guidance=guidance, previous_nightly=previous_snapshot, trigger=trigger,
     )
     watchlist = list(dict.fromkeys(str(value).upper() for value in profile.get("watchlist", []) if value))[:40]
     watchlist_bundle = database.security_data(watchlist, price_limit=260) if watchlist else {"securities": [], "fundamentals": [], "prices": [], "news": [], "company_markets": []}
@@ -890,10 +913,17 @@ def _calculate_portfolio_overview(user_id: str, portfolio_id: str | int,
         "watchlist_research": watchlist_research,
         "latest_simulation": latest_simulation,
         "latest_optimizer": latest_optimizer,
-        "events": list((latest_briefing or {}).get("upcoming_events") or [])[:30],
+        "events": [],
         "scenarios": list((latest_briefing or {}).get("scenarios") or [])[:12],
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+    # Preserve every available category.  Briefing completeness is independent
+    # from the normalized market-event store, so one incomplete feed must not
+    # erase events from another.
+    result["ask_cache"]["events"] = [
+        *upcoming_events,
+        *list((latest_briefing or {}).get("upcoming_events") or []),
+    ][:60]
     snapshot_hash = portfolio_overview.input_hash(input_payload)
     # Phase 2 compatibility migration: the legacy snapshot remains the source
     # for the Today UI, while Ask reads independently versioned projections.
@@ -904,12 +934,13 @@ def _calculate_portfolio_overview(user_id: str, portfolio_id: str | int,
             input_fingerprint=build_portfolio_context(portfolio).version,
             profile=profile, thesis_rows=active_theses, security_bundle=security_bundle,
             watchlist_bundle=watchlist_bundle, briefing=latest_briefing,
-            baseline_available=previous_nightly is not None,
+            baseline_available=previous_snapshot is not None,
             snapshot_identity={"input_hash": snapshot_hash, "effective_at": result.get("as_of")},
-            baseline_identity=({"id": previous_nightly_rows[0].get("id"),
-                                "input_hash": previous_nightly_rows[0].get("input_hash"),
-                                "effective_at": previous_nightly_rows[0].get("effective_at")}
-                               if previous_nightly_rows else None),
+            baseline_identity=({"id": previous_snapshot_rows[0].get("id"),
+                                "input_hash": previous_snapshot_rows[0].get("input_hash"),
+                                "effective_at": previous_snapshot_rows[0].get("effective_at"),
+                                "trigger": previous_snapshot_rows[0].get("trigger")}
+                               if previous_snapshot_rows else None),
         )
     except Exception as exc:
         record_metric("ask.read_model.build_batch.failure", tags={"error_class": type(exc).__name__}, persist=True)
@@ -935,10 +966,15 @@ def _queue_portfolio_overview_rebuild(user_id: str, portfolio_id: str | int,
     tickers = sorted({str(row.get("ticker") or "").upper() for row in portfolio.get("holdings") or []
                       if row.get("ticker") and str(row.get("ticker")).upper() != "CASH"})
     versions = database.analytical_dataset_versions(
-        user_id, str(portfolio_id), ["portfolio_holdings", "prices", "fundamentals", "theses", "thesis_monitor"],
+        user_id, str(portfolio_id), ["portfolio_holdings", "prices", "fundamentals", "theses", "thesis_monitor",
+                                     "scenario_model", "optimizer_config", "events"],
     )
+    # Snapshot trigger is a constrained audit enum. Dependency-specific causes
+    # remain in rebuild_reason while the durable snapshot uses an allowed
+    # system trigger.
+    snapshot_trigger = trigger if trigger in {"MANUAL", "NIGHTLY", "PORTFOLIO_CHANGE", "MATERIAL_EVENT"} else "MATERIAL_EVENT"
     payload = {"operation": "portfolio_overview_rebuild", "portfolio_id": str(portfolio_id),
-               "tickers": tickers, "trigger": trigger}
+               "tickers": tickers, "trigger": snapshot_trigger, "rebuild_reason": trigger}
     fingerprint = stable_fingerprint({"portfolio": build_portfolio_context(portfolio).version,
                                       "dataset_versions": versions, "tickers": tickers})
     return analytics_jobs.submit_job(job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD,
@@ -4025,8 +4061,10 @@ def _execute_ask_tool(tool: str, user_id: str, question: str,
                         job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.OPTIMIZATION, user_id=user_id,
                             portfolio_id=str(portfolio.get("id")) if portfolio.get("id") else None,
                             payload=payload, input_fingerprint=stable_fingerprint(payload))
-                    tools.append({"tool_name": f"{tool}_job", "status": "pending", "title": "Updated analysis queued",
-                                  "job_id": job.job_id, "summary": {"message": "The heavy calculation is running separately; available deterministic evidence is preserved."}})
+                    job_status, job_message = _analytics_job_chat_status(job)
+                    tools.append({"tool_name": f"{tool}_job", "status": job_status, "title": "Updated analysis status",
+                                  "job_id": job.job_id, "job_kind": job.job_type.value,
+                                  "summary": {"message": job_message}})
             except Exception as exc:
                 # The generated migration is intentionally not applied by this
                 # phase. A missing job table must not turn the existing safe
@@ -4098,6 +4136,20 @@ def _execute_ask_tool(tool: str, user_id: str, question: str,
     if tool == "benchmark_outlook":
         return _benchmark_outlook_chat_tools(user_id, portfolio_id, context)
     return [{"tool_name": tool, "status": "unavailable", "title": tool.replace("_", " ").title()}], []
+
+
+def _analytics_job_chat_status(job: analytics_jobs.AnalyticsJob) -> tuple[str, str]:
+    label = "simulation" if job.job_type == analytics_jobs.JobType.SIMULATION else "optimizer" if job.job_type == analytics_jobs.JobType.OPTIMIZATION else job.job_type.value.lower()
+    if job.status in {analytics_jobs.JobStatus.SUCCESS, analytics_jobs.JobStatus.PARTIAL}:
+        return "complete", f"The {label} completed and its verified result is available."
+    if job.status == analytics_jobs.JobStatus.FAILED:
+        return "failed", f"The {label} failed safely; the immediate deterministic evidence remains available."
+    if job.status in {analytics_jobs.JobStatus.EXPIRED, analytics_jobs.JobStatus.CANCELLED}:
+        return "unavailable", f"The {label} is unavailable because its durable job {job.status.value.lower()}."
+    health = analytics_jobs.operational_health()
+    if job.status == analytics_jobs.JobStatus.QUEUED and health.get("status") != "healthy":
+        return "partial", "The analytics worker is temporarily unavailable; the queued job and immediate deterministic evidence are preserved."
+    return "pending", "The heavy calculation is running separately; available deterministic evidence is preserved."
 
 
 def _instrumented_ask_tool(tool: str, user_id: str, question: str,
@@ -4235,7 +4287,12 @@ def _execute_chat_plan_tools(
             configured_timeout_ms=float(os.getenv("ASK_TOOL_NODE_TIMEOUT_MS", "5000")), executor=tool_executor(tool),
         ))
 
-    optional_read_models = tuple(spec.optional if spec else ())
+    # Background reconciliation owns optional-model freshness. Synchronous
+    # probes are disabled unless explicitly requested because these nodes do
+    # not produce claims or evidence for the visible answer.
+    optional_read_models = tuple(spec.optional if spec and os.getenv(
+        "ASK_EAGER_OPTIONAL_READ_MODELS", "0"
+    ).strip().lower() in {"1", "true", "on", "yes"} else ())
 
     def read_model_executor(model_type: str):
         def execute(_: ask_execution.NodeExecutionContext, __: dict[str, ask_execution.NodeOutcome]) -> ask_execution.NodeExecutionValue:
@@ -4357,6 +4414,28 @@ def _chat_tool_artifacts(tool_results: list[dict[str, Any]]) -> list[dict[str, A
     return artifacts
 
 
+def _compact_chat_tool_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep replay/follow-up identity without duplicating the canonical read model payload."""
+    canonical = result.get("analysis_result") or {}
+    read_model = result.get("read_model") or {}
+    compact = {key: deepcopy(result[key]) for key in (
+        "tool_name", "status", "execution_state", "title", "job_id", "job_kind", "run_id", "ticker",
+        "portfolio_context_version", "coverage",
+    ) if result.get(key) is not None}
+    message = (result.get("summary") or {}).get("message") if isinstance(result.get("summary"), dict) else None
+    if message:
+        compact["message"] = str(message)[:500]
+    compact["result_reference"] = {
+        "capability": canonical.get("capability") or result.get("tool_name"),
+        "input_fingerprint": canonical.get("input_fingerprint"),
+        "calculation_version": canonical.get("calculation_version"),
+        "read_model_id": read_model.get("id"),
+        "read_model_type": read_model.get("type"),
+        "read_model_state": read_model.get("state"),
+    }
+    return compact
+
+
 @app.post("/api/chat/messages")
 def chat_message(payload: ChatRequest, http_request: Request = None,
                  user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
@@ -4365,16 +4444,21 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
     request_started_at = telemetry_utc_now()
     deadline = DeadlineContext.from_budget(request_started_monotonic, ask_orchestration.OVERALL_BUDGET_SECONDS)
     auth_latency_ms = getattr(getattr(http_request, "state", None), "auth_latency_ms", None)
+    auth_cache_hit = getattr(getattr(http_request, "state", None), "auth_cache_hit", False)
+    phase_timings: dict[str, float] = {}
     if not database.DATABASE_URL:
         raise HTTPException(503, "Chat history requires Supabase storage")
+    database.begin_query_trace(request_id)
     question_hash = hashlib.sha256(json.dumps({
         "question": payload.question, "workspace": payload.workspace,
         "page_context": payload.page_context.model_dump(mode="json", exclude_none=True) if payload.page_context else {},
     }, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    phase_started = time.monotonic()
     try:
         request_record = database.reserve_ask_request(user.id, request_id, question_hash)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+    phase_timings["request_reservation_ms"] = round((time.monotonic() - phase_started) * 1000, 2)
 
     def mark_terminal_failure(error_class: str) -> None:
         try:
@@ -4384,6 +4468,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
     if request_record.get("response"):
         replay = deepcopy(request_record["response"])
         replay["duplicate_replay"] = True
+        replay["query_stats"] = {key: value for key, value in database.finish_query_trace(request_id).items() if key != "queries"}
         record_capability_request(request_id=request_id, capability="REPLAY", duplicate_replay=True,
                                   persistence_status="REPLAY", auth_latency_ms=auth_latency_ms)
         return replay
@@ -4394,6 +4479,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
                 user.id, request_id, final_state=str(staged.get("final_state") or "COMPLETED"),
             )
             replay["duplicate_replay"] = True
+            replay["query_stats"] = {key: value for key, value in database.finish_query_trace(request_id).items() if key != "queries"}
             return replay
         except Exception as exc:
             database.fail_ask_request(user.id, request_id, type(exc).__name__, persistence=True)
@@ -4403,6 +4489,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
     requested_portfolio_id = str(page_context.get("portfolio_id") or "").strip() or None
     conversation_meta: dict[str, Any] | None = None
     history: list[dict[str, Any]] = []
+    phase_started = time.monotonic()
     if conversation_id is not None:
         try:
             conversation_meta = database.get_conversation(user.id, conversation_id)
@@ -4418,6 +4505,8 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
             raise HTTPException(409, "This conversation belongs to a different portfolio. Start or restore that portfolio's conversation.")
         requested_portfolio_id = requested_portfolio_id or bound_portfolio_id
         history = database.conversation_messages(user.id, conversation_id)
+    phase_timings["conversation_context_ms"] = round((time.monotonic() - phase_started) * 1000, 2)
+    phase_started = time.monotonic()
     previous_context = ask_orchestration.previous_analysis_context(history)
     plan = ask_orchestration.build_plan(payload.question, payload.workspace, page_context, previous_context)
     if not plan.tickers and plan.intent in {"GENERAL", "COMPANY_RESEARCH", "CHANGE", "EARNINGS", "COMPARISON", "SCORE_ATTRIBUTION"}:
@@ -4505,16 +4594,19 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
         "RECOMMENDATION_COUNTERCASE", "CASH_ALLOCATION",
     }:
         plan = ask_orchestration.build_plan("general portfolio evidence", payload.workspace, page_context, previous_context)
+    phase_timings["router_planner_ms"] = round((time.monotonic() - phase_started) * 1000, 2)
     if plan.requires_portfolio and not requested_portfolio_id:
         mark_terminal_failure("PortfolioRequired")
         raise HTTPException(422, "Select a portfolio before asking a portfolio-specific question.")
     portfolio_context: PortfolioContext | None = None
+    phase_started = time.monotonic()
     if requested_portfolio_id:
         try:
             portfolio_context = build_portfolio_context(database.get_portfolio(requested_portfolio_id, user.id))
         except KeyError as exc:
             mark_terminal_failure("PortfolioNotFound")
             raise HTTPException(404, "Selected portfolio not found") from exc
+    phase_timings["portfolio_context_ms"] = round((time.monotonic() - phase_started) * 1000, 2)
     if compositional_plan:
         validation_started = time.monotonic()
         try:
@@ -4530,6 +4622,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
             **{**planner_telemetry.__dict__,
                "validation_latency_ms": round((time.monotonic() - validation_started) * 1000, 2)},
         )
+    phase_started = time.monotonic()
     if conversation_id is None:
         workspace = payload.workspace if payload.workspace in {"research", "portfolio"} else "research"
         conversation_meta = database.create_conversation(
@@ -4539,6 +4632,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
     assert conversation_meta is not None
     if not history and str(conversation_meta.get("title", "")).lower().startswith("new conversation"):
         conversation_meta = database.rename_conversation(user.id, conversation_id, payload.question[:72])
+    phase_timings["conversation_prepare_ms"] = round((time.monotonic() - phase_started) * 1000, 2)
     page_context["portfolio_id"] = requested_portfolio_id
     record_metric("ask.intent", tags={"intent": plan.intent, "tool_count": len(plan.tools),
                                        "confidence": plan.confidence, "portfolio_id": requested_portfolio_id or "none",
@@ -4546,11 +4640,18 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
                                        "portfolio_position_count": portfolio_context.total_positions if portfolio_context else 0,
                                        "portfolio_context_version": portfolio_context.version if portfolio_context else "none"})
     routed_question = payload.question
+    if (re.search(r"\b(?:is it done|is that done|show (?:me )?(?:the )?(?:simulation|optimizer|optimization) now|did (?:the )?(?:simulation|optimizer) finish)\b",
+                  payload.question, re.I)
+            and plan.intent in {"SCENARIO", "MULTI_SCENARIO"}
+            and previous_context.get("scenario_question")):
+        routed_question = str(previous_context["scenario_question"])
+    phase_started = time.monotonic()
     database.bind_ask_request_turn(
         user.id, request_id, conversation_id, payload.question,
         {"page_context": page_context, "planned_intent": plan.intent,
          "route_confidence": plan.confidence, "request_id": request_id, "request_state": "EXECUTING"},
     )
+    phase_timings["user_turn_persistence_ms"] = round((time.monotonic() - phase_started) * 1000, 2)
     started = request_started_monotonic
     dashboard_execution: dashboard_chat.DashboardChatExecution | None = None
     dashboard_resource_type = page_context.get("dashboard_resource_type")
@@ -4627,15 +4728,21 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
                 "status": dashboard_execution.action_result.status.value if dashboard_execution.action_result else "CLARIFICATION",
             })
             return persisted
+    health_pool: ThreadPoolExecutor | None = None
+    health_future = None
+    if portfolio_context:
+        health_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ask-health")
+        health_future = health_pool.submit(data_health.derive, user.id, portfolio_context.portfolio_id)
     tool_started = time.monotonic()
     execution_started_at = telemetry_utc_now()
     tool_results, evidence_rows, execution_steps, execution_outcomes = _execute_chat_plan_tools(
         plan.tools, user.id, routed_question, started, requested_portfolio_id, plan.tickers, portfolio_context,
         request_id, plan.intent, deadline, compositional_plan,
     )
+    tool_results = enforce_output_symbol_boundary(tool_results, portfolio_context)
     tools_elapsed = time.monotonic() - tool_started
     execution_completed_at = telemetry_utc_now()
-    scenario_factors = parse_scenario_factors(payload.question)
+    scenario_factors = parse_scenario_factors(routed_question)
     verification = verify_results(plan.intent, portfolio_context, scenario_factors, tool_results)
     canonical_results: list[AnalysisResult] = []
     execution_dependencies = [DependencyResult(
@@ -4687,12 +4794,6 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
         "label": "Canonical unavailable analysis", "as_of": None, "url": None,
         "data": analysis_result.model_dump(mode="json", exclude_none=True), "claim_type": "MODEL_OUTPUT",
     }]
-    try:
-        preference_context = product_preferences.ask_context(user.id)
-    except Exception as exc:
-        # Optional personalization must not block an otherwise grounded answer.
-        record_metric("ask.personalization.failure", tags={"error_type":type(exc).__name__})
-        preference_context = None
     # Canonical results are the single analytical truth source for both
     # renderers. Preference context remains available to read-model builders,
     # but is not injected as an alternative narration-only evidence channel.
@@ -4717,6 +4818,24 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
         or (capability_planner.render_composed(composed_result) if composed_result else None)
         or direct_canonical_answer
     )
+    health_started = time.monotonic()
+    try:
+        health_states = health_future.result(timeout=max(.05, deadline.remaining_ms() / 1000)) if health_future else []
+    except Exception as exc:
+        record_metric("ask.data_health.failure", tags={"error_type": type(exc).__name__})
+        health_states = []
+    finally:
+        if health_pool:
+            health_pool.shutdown(wait=False, cancel_futures=True)
+    phase_timings["data_health_ms"] = round((time.monotonic() - health_started) * 1000, 2)
+    requirement_resolution, supported_answer = ask_resolution.compose_supported_answer(
+        intent=plan.intent, question=payload.question, context=portfolio_context,
+        tool_results=tool_results, deterministic_answer=deterministic_answer,
+        data_health=health_states,
+        conversation_context=previous_analytical_context,
+    )
+    deterministic_answer = supported_answer.direct_answer
+    has_claim_level_answer = bool(supported_answer.supported_claims or supported_answer.partial_claims)
     if plan.intent == "UNSUPPORTED":
         deterministic_answer = (
             "I can analyze this question only through EagleEyes' registered capabilities, but I don't yet have a supported "
@@ -4727,7 +4846,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
         check.message for check in analysis_result.verification.checks
         if not check.passed and not any(marker in check.message.lower() for marker in hidden_check_markers)
     ]
-    if not analysis_result.verification.answer_allowed:
+    if not analysis_result.verification.answer_allowed and not has_claim_level_answer:
         requested_count = len(analysis_result.coverage.requested_entities)
         evaluated_count = len(analysis_result.coverage.evaluated_entities)
         percent = analysis_result.coverage.entity_coverage_percent
@@ -4745,7 +4864,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
             + "\n".join(f"- {message}" for message in canonical_check_messages)
             + "\n\n**What to verify:** refresh the missing stored evidence and rerun the analysis."
         )
-    elif analysis_result.status != AnalysisStatus.UNAVAILABLE and not analysis_result.verification.recommendation_allowed and plan.intent in {
+    elif analysis_result.status != AnalysisStatus.UNAVAILABLE and not analysis_result.verification.recommendation_allowed and not has_claim_level_answer and plan.intent in {
         "PORTFOLIO_ANALYSIS", "THESIS_REPLACEMENT", "WATCHLIST_COMPARISON"
     }:
         deterministic_answer = (
@@ -4754,7 +4873,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
             + "\n".join(f"- {message}" for message in canonical_check_messages)
             + "\n\n**What to verify:** resolve the listed coverage, constraint, or portfolio-state issue before using a rebalance."
         )
-    elif analysis_result.status == AnalysisStatus.PARTIAL and deterministic_answer:
+    elif analysis_result.status == AnalysisStatus.PARTIAL and deterministic_answer and not has_claim_level_answer:
         if analysis_result.coverage.entity_coverage_percent is not None and analysis_result.coverage.entity_coverage_percent < 90.0:
             disclosure = (
                 f"> **Partial analytical coverage:** {len(analysis_result.coverage.evaluated_entities)} of "
@@ -4804,8 +4923,12 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
         answer = answer.rstrip() + f"\n\n**Canvas:** {dashboard_execution.response}"
     narration_elapsed = time.monotonic() - narration_started
     sources = [{"id": f"S{index + 1}", "label": item["label"], "url": item.get("url"), "as_of": item.get("as_of")} for index, item in enumerate(evidence)]
+    compact_tool_results = [_compact_chat_tool_result(result) for result in tool_results]
     structured_content = {
-        "sources": sources, "tool_results": tool_results,
+        "sources": sources, "tool_results": compact_tool_results,
+        "requirement_resolution": requirement_resolution.model_dump(mode="json", exclude_none=True),
+        "supported_answer": supported_answer.model_dump(mode="json", exclude_none=True),
+        "data_health": [state.model_dump(mode="json", exclude_none=True) for state in health_states],
         "execution_plan": {**plan.payload(), "steps": execution_steps,
                            "capability_plan": compositional_plan.model_dump(mode="json") if compositional_plan else None,
                            "registry_version": capability_planner.CAPABILITY_REGISTRY_VERSION,
@@ -4840,8 +4963,6 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
                              "persistence_status": "STAGED",
                              "answer_complete": "answer is incomplete" not in answer.lower(),
                              "router_version": "v2" if ASK_ROUTER_V2_ENABLED else "v1"},
-        "analysis_result": analysis_result.model_dump(mode="json", exclude_none=True),
-        "canonical_results": [result.model_dump(mode="json", exclude_none=True) for result in canonical_results],
         "actions": ask_orchestration.actions_for(plan, page_context),
         "grounding": {"categories": ["VERIFIED_FACT", "MODEL_OUTPUT", "MARKET_IMPLIED", "USER_BELIEF", "AI_INTERPRETATION"],
                       "tool_claim_types": {item.get("tool_name"): claim_types.get(str(item.get("tool_name")), "VERIFIED_FACT") for item in tool_results}},
@@ -4851,6 +4972,10 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
     structured_content["analysis_context"].update({
         "result_ids": result_ids,
         "composed_result_id": composed_result.result_id if composed_result else None,
+        "pending_jobs": [{"job_id": row.get("job_id"), "kind": row.get("job_kind") or row.get("tool_name"),
+                          "capability": row.get("tool_name"), "status": row.get("status")}
+                         for row in tool_results if row.get("job_id")],
+        "scenario_question": (routed_question if plan.intent in {"SCENARIO", "MULTI_SCENARIO"} else previous_context.get("scenario_question")),
         "analytical_context": capability_planner.ConversationAnalyticalContext(
             active_entities=(compositional_plan.entities if compositional_plan else [
                 capability_planner.ResolvedEntity(kind=capability_planner.EntityKind.SECURITY, canonical_id=ticker)
@@ -4966,7 +5091,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
         structured_content["analysis_context"]["persistence_status"] = "SUCCESS"
         database.stage_ask_request_result(user.id, request_id, {
             "answer": answer, "structured_content": structured_content, "model": model,
-            "sources": sources, "tool_results": tool_results, "artifacts": _chat_tool_artifacts(tool_results),
+            "sources": sources, "tool_results": compact_tool_results, "artifacts": _chat_tool_artifacts(tool_results),
             "final_state": final_state,
         })
         persisted_response = database.complete_ask_request(user.id, request_id, final_state=final_state)
@@ -4979,6 +5104,39 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
         record_request_outcome("FAILED", type(exc).__name__)
         raise
     persistence_latency_ms = round((time.monotonic() - persistence_started) * 1000, 2)
+    phase_timings.update({
+        "authentication_ms": auth_latency_ms or 0.0,
+        "capability_execution_ms": round(tools_elapsed * 1000, 2),
+        "deterministic_composition_ms": deterministic_render_ms,
+        "persistence_ms": persistence_latency_ms,
+        "backend_total_ms": round((time.monotonic() - started) * 1000, 2),
+    })
+    persisted_response["request_timing"] = {
+        "request_id": request_id, "auth_cache_hit": auth_cache_hit, **phase_timings,
+        "response_payload_bytes": len(json.dumps(persisted_response, default=str, separators=(",", ":")).encode()),
+    }
+    query_stats = database.finish_query_trace(request_id)
+    persisted_response["query_stats"] = {key: value for key, value in query_stats.items() if key != "queries"}
+    if http_request is not None:
+        http_request.state.component_timing = {
+            "auth": auth_latency_ms or 0.0,
+            "context": sum(phase_timings.get(key, 0.0) for key in (
+                "request_reservation_ms", "conversation_context_ms", "portfolio_context_ms",
+                "conversation_prepare_ms", "user_turn_persistence_ms",
+            )),
+            "planner": phase_timings.get("router_planner_ms", 0.0),
+            "execution": phase_timings.get("capability_execution_ms", 0.0),
+            "resolver": phase_timings.get("deterministic_composition_ms", 0.0),
+            "persistence": persistence_latency_ms,
+            "db": query_stats["total_db_latency_ms"],
+        }
+    record_metric("ask.database.query_count", query_stats["db_queries"], tags={
+        "request_id": request_id, "intent": plan.intent,
+        "duplicates": len(query_stats["duplicate_query_signatures"]),
+        "rows_fetched": query_stats["rows_fetched"],
+        "total_db_latency_ms": query_stats["total_db_latency_ms"],
+        "response_payload_bytes": persisted_response["request_timing"]["response_payload_bytes"],
+    }, persist=True)
     updated_history = [*history, {"role": "user", "content": payload.question}, message]
     summarized_count = int(conversation_meta.get("summary_message_count") or 0)
     if len(updated_history) >= 12 and len(updated_history) - summarized_count >= 8:

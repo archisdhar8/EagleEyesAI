@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -25,6 +26,9 @@ ENV_PATH = APP_DIR / "backend" / ".env"
 load_dotenv(ENV_PATH, override=False)
 DATABASE_URL: str | None = os.getenv("DATABASE_URL") or None
 _QUERY_TIMEOUT = threading.local()
+_QUERY_TRACE = threading.local()
+_QUERY_TRACE_LOCK = threading.Lock()
+_QUERY_TRACES: dict[str, dict[str, Any]] = {}
 _POOL_LOCK = threading.Lock()
 _POOL: ConnectionPool | None = None
 _POOL_URL: str | None = None
@@ -63,6 +67,129 @@ def clear_thread_query_timeout_ms() -> None:
         del _QUERY_TIMEOUT.value
 
 
+def begin_query_trace(request_id: str) -> None:
+    _QUERY_TRACE.request_id = request_id
+    with _QUERY_TRACE_LOCK:
+        _QUERY_TRACES[request_id] = {"queries": [], "started": time.monotonic()}
+
+
+def attach_query_trace(request_id: str) -> None:
+    _QUERY_TRACE.request_id = request_id
+
+
+def clear_query_trace_thread() -> None:
+    if hasattr(_QUERY_TRACE, "request_id"):
+        del _QUERY_TRACE.request_id
+
+
+def _query_signature(sql: Any) -> str:
+    return " ".join(str(sql).split())[:500]
+
+
+def _record_query(sql: Any, latency_ms: float) -> tuple[str, int] | None:
+    request_id = getattr(_QUERY_TRACE, "request_id", None)
+    if not request_id:
+        return None
+    with _QUERY_TRACE_LOCK:
+        trace = _QUERY_TRACES.get(request_id)
+        if trace is None:
+            return None
+        trace["queries"].append({"signature": _query_signature(sql), "latency_ms": round(latency_ms, 2), "rows": 0})
+        return request_id, len(trace["queries"]) - 1
+
+
+def _record_fetched(token: tuple[str, int] | None, count: int) -> None:
+    if token is None or count <= 0:
+        return
+    with _QUERY_TRACE_LOCK:
+        trace = _QUERY_TRACES.get(token[0])
+        if trace and token[1] < len(trace["queries"]):
+            trace["queries"][token[1]]["rows"] += count
+
+
+class _TracedCursor:
+    def __init__(self, cursor: Any, token: tuple[str, int] | None = None):
+        self._cursor = cursor
+        self._token = token
+
+    def execute(self, sql: Any, params: Any = None, **kwargs: Any) -> "_TracedCursor":
+        started = time.monotonic()
+        result = self._cursor.execute(sql, params, **kwargs)
+        self._token = _record_query(sql, (time.monotonic() - started) * 1000)
+        return self if result is self._cursor else result
+
+    def executemany(self, sql: Any, params_seq: Any, **kwargs: Any) -> Any:
+        started = time.monotonic()
+        result = self._cursor.executemany(sql, params_seq, **kwargs)
+        self._token = _record_query(sql, (time.monotonic() - started) * 1000)
+        return result
+
+    def fetchone(self) -> Any:
+        row = self._cursor.fetchone()
+        _record_fetched(self._token, 1 if row is not None else 0)
+        return row
+
+    def fetchall(self) -> list[Any]:
+        rows = self._cursor.fetchall()
+        _record_fetched(self._token, len(rows))
+        return rows
+
+    def __iter__(self):
+        for row in self._cursor:
+            _record_fetched(self._token, 1)
+            yield row
+
+    def __enter__(self) -> "_TracedCursor":
+        self._cursor.__enter__()
+        return self
+
+    def __exit__(self, *args: Any) -> Any:
+        return self._cursor.__exit__(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+
+class _TracedConnection:
+    def __init__(self, connection: Any):
+        self._connection = connection
+
+    def execute(self, sql: Any, params: Any = None, **kwargs: Any) -> _TracedCursor:
+        started = time.monotonic()
+        cursor = self._connection.execute(sql, params, **kwargs)
+        return _TracedCursor(cursor, _record_query(sql, (time.monotonic() - started) * 1000))
+
+    def executemany(self, sql: Any, params_seq: Any, **kwargs: Any) -> Any:
+        started = time.monotonic()
+        with self._connection.cursor() as cursor:
+            result = cursor.executemany(sql, params_seq, **kwargs)
+        _record_query(sql, (time.monotonic() - started) * 1000)
+        return result
+
+    def cursor(self, *args: Any, **kwargs: Any) -> _TracedCursor:
+        return _TracedCursor(self._connection.cursor(*args, **kwargs))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+def finish_query_trace(request_id: str) -> dict[str, Any]:
+    with _QUERY_TRACE_LOCK:
+        trace = _QUERY_TRACES.pop(request_id, {"queries": []})
+    clear_query_trace_thread()
+    queries = list(trace.get("queries") or [])
+    counts: dict[str, int] = {}
+    for row in queries:
+        counts[row["signature"]] = counts.get(row["signature"], 0) + 1
+    duplicates = [{"signature": signature, "count": count} for signature, count in counts.items() if count > 1]
+    return {
+        "db_queries": len(queries), "duplicate_query_signatures": duplicates,
+        "rows_fetched": sum(int(row.get("rows") or 0) for row in queries),
+        "total_db_latency_ms": round(sum(float(row.get("latency_ms") or 0) for row in queries), 2),
+        "queries": queries,
+    }
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -79,6 +206,19 @@ def save_operational_event(event: dict[str, Any]) -> None:
             """INSERT INTO public.operational_events(metric_name, metric_value, tags, observed_at)
             VALUES (%s,%s,%s,%s)""",
             (event["name"], event["value"], _jsonb(event.get("tags") or {}), event["observed_at"]),
+        )
+
+
+def save_operational_events(events: list[dict[str, Any]]) -> None:
+    """Persist a bounded telemetry batch in one database round trip."""
+    if not DATABASE_URL or not events:
+        return
+    with postgres_connection() as conn:
+        conn.executemany(
+            """INSERT INTO public.operational_events(metric_name, metric_value, tags, observed_at)
+            VALUES (%s,%s,%s,%s)""",
+            [(event["name"], event["value"], _jsonb(event.get("tags") or {}), event["observed_at"])
+             for event in events],
         )
 
 
@@ -142,7 +282,7 @@ def postgres_connection() -> Iterator[psycopg.Connection]:
     assert pool is not None
     with pool.connection() as conn:
         conn.execute("SELECT set_config('statement_timeout', %s, true)", (str(statement_timeout),))
-        yield conn
+        yield _TracedConnection(conn)
 
 
 def initialize() -> None:
@@ -365,6 +505,12 @@ def initialize() -> None:
             user_id TEXT NOT NULL, portfolio_id TEXT NOT NULL, dataset_type TEXT NOT NULL,
             version TEXT NOT NULL, effective_through TEXT, updated_at TEXT NOT NULL,
             PRIMARY KEY(user_id,portfolio_id,dataset_type)
+        )""",
+        """CREATE TABLE IF NOT EXISTS data_health_states (
+            user_id TEXT NOT NULL, portfolio_id TEXT NOT NULL, domain TEXT NOT NULL,
+            status TEXT NOT NULL, coverage REAL, freshness TEXT, last_successful_update TEXT,
+            failure_reason TEXT, repair_action TEXT, metadata_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL, PRIMARY KEY(user_id,portfolio_id,domain)
         )""",
         """CREATE TABLE IF NOT EXISTS capability_read_models (
             id TEXT PRIMARY KEY, user_id TEXT NOT NULL, portfolio_id TEXT NOT NULL,
@@ -1729,8 +1875,12 @@ def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
         return {"securities": [], "fundamentals": [], "prices": [], "news": [], "company_markets": []}
     with postgres_connection() as conn:
         securities = conn.execute(
-            """SELECT id, ticker, asset_type, company_name, sector, industry, updated_at
-            FROM public.securities WHERE ticker = ANY(%s) AND active=true""",
+            """SELECT DISTINCT ON (ticker) id, ticker, asset_type, company_name, sector, industry, updated_at
+            FROM public.securities WHERE ticker = ANY(%s) AND active=true
+            ORDER BY ticker,
+              CASE WHEN sector IS NOT NULL OR industry IS NOT NULL THEN 0
+                   WHEN asset_type='etf' THEN 1 ELSE 2 END,
+              updated_at DESC""",
             (normalized,),
         ).fetchall()
         fundamentals = conn.execute(
@@ -2798,6 +2948,59 @@ def analytical_dataset_versions(user_id: str, portfolio_id: str | int,
             "effective_through": _iso(row["effective_through"]), "updated_at": _iso(row["updated_at"])} for row in rows}
 
 
+def upsert_data_health_state(user_id: str, portfolio_id: str | int, domain: str, state: dict[str, Any]) -> dict[str, Any]:
+    """Persist the owner-scoped readiness state for one analytical domain."""
+    now = utc_now()
+    values = (user_id, str(portfolio_id), domain, state["status"], state.get("coverage"),
+              state.get("freshness"), state.get("last_successful_update"), state.get("failure_reason"),
+              state.get("repair_action"), state, now)
+    if DATABASE_URL:
+        scope_key, portfolio_fk = _analytical_scope(portfolio_id)
+        with postgres_connection() as conn:
+            row = conn.execute(
+                """INSERT INTO public.data_health_states
+                (user_id,portfolio_id,scope_key,domain,status,coverage,freshness,last_successful_update,
+                 failure_reason,repair_action,metadata,updated_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(user_id,scope_key,domain) DO UPDATE SET
+                status=excluded.status,coverage=excluded.coverage,freshness=excluded.freshness,
+                last_successful_update=excluded.last_successful_update,failure_reason=excluded.failure_reason,
+                repair_action=excluded.repair_action,metadata=excluded.metadata,updated_at=excluded.updated_at
+                RETURNING *""",
+                (user_id, portfolio_fk, scope_key, domain, *values[3:]),
+            ).fetchone()
+        return dict(row)
+    with sqlite_connection() as conn:
+        conn.execute(
+            """INSERT INTO data_health_states(user_id,portfolio_id,domain,status,coverage,freshness,
+            last_successful_update,failure_reason,repair_action,metadata_json,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,portfolio_id,domain) DO UPDATE SET
+            status=excluded.status,coverage=excluded.coverage,freshness=excluded.freshness,
+            last_successful_update=excluded.last_successful_update,failure_reason=excluded.failure_reason,
+            repair_action=excluded.repair_action,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at""",
+            (*values[:9], json.dumps(state, default=str), now),
+        )
+    return {**state, "user_id": user_id, "portfolio_id": str(portfolio_id), "domain": domain, "updated_at": now}
+
+
+def data_health_states(user_id: str, portfolio_id: str | int) -> list[dict[str, Any]]:
+    prefix, p = ("public.", "%s") if DATABASE_URL else ("", "?")
+    scope_key, _ = _analytical_scope(portfolio_id)
+    with (postgres_connection() if DATABASE_URL else sqlite_connection()) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM {prefix}data_health_states WHERE user_id={p} AND {'scope_key' if DATABASE_URL else 'portfolio_id'}={p} ORDER BY domain",
+            (user_id, scope_key if DATABASE_URL else str(portfolio_id)),
+        ).fetchall()
+    output = []
+    for row in rows:
+        item = dict(row)
+        metadata = item.get("metadata") if DATABASE_URL else json.loads(item.get("metadata_json") or "{}")
+        output.append({**metadata, **{key: item.get(key) for key in (
+            "domain", "status", "coverage", "freshness", "last_successful_update",
+            "failure_reason", "repair_action", "updated_at")}})
+    return output
+
+
 def save_capability_read_model(user_id: str, portfolio_id: str | int, metadata: dict[str, Any],
                                data: dict[str, Any]) -> dict[str, Any]:
     model_id, now = str(uuid.uuid4()), utc_now()
@@ -2917,13 +3120,19 @@ def reserve_ask_request(user_id: str, request_id: str, question_hash: str) -> di
     now = utc_now()
     if DATABASE_URL:
         with postgres_connection() as conn:
-            conn.execute(
-                """INSERT INTO public.ask_requests(request_id,user_id,question_hash,state,received_at,updated_at)
-                VALUES(%s,%s,%s,'RECEIVED',%s,%s) ON CONFLICT(request_id) DO NOTHING""",
-                (request_id, user_id, question_hash, now, now),
-            )
-            row = conn.execute("SELECT * FROM public.ask_requests WHERE request_id=%s AND user_id=%s",
-                               (request_id, user_id)).fetchone()
+            row = conn.execute(
+                """WITH inserted AS (
+                     INSERT INTO public.ask_requests(request_id,user_id,question_hash,state,received_at,updated_at)
+                     VALUES(%s,%s,%s,'RECEIVED',%s,%s) ON CONFLICT(request_id) DO NOTHING
+                     RETURNING *
+                   )
+                   SELECT * FROM inserted
+                   UNION ALL
+                   SELECT * FROM public.ask_requests
+                   WHERE request_id=%s AND user_id=%s AND NOT EXISTS (SELECT 1 FROM inserted)
+                   LIMIT 1""",
+                (request_id, user_id, question_hash, now, now, request_id, user_id),
+            ).fetchone()
     else:
         with sqlite_connection() as conn:
             conn.execute(
@@ -2954,29 +3163,32 @@ def bind_ask_request_turn(user_id: str, request_id: str, conversation_id: str,
         return _ask_request_row(row)
     user_message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"eagleeyes:{request_id}:user"))
     with postgres_connection() as conn:
-        owned = conn.execute("SELECT 1 FROM public.chat_conversations WHERE id=%s AND user_id=%s",
-                             (conversation_id, user_id)).fetchone()
-        if not owned:
-            raise KeyError(conversation_id)
-        request_row = conn.execute("SELECT * FROM public.ask_requests WHERE request_id=%s AND user_id=%s FOR UPDATE",
-                                   (request_id, user_id)).fetchone()
-        if not request_row:
+        row = conn.execute(
+            """WITH owned AS MATERIALIZED (
+                 SELECT id FROM public.chat_conversations WHERE id=%s AND user_id=%s
+               ), locked AS MATERIALIZED (
+                 SELECT * FROM public.ask_requests WHERE request_id=%s AND user_id=%s FOR UPDATE
+               ), inserted_message AS (
+                 INSERT INTO public.chat_messages(id,conversation_id,role,content,structured_content,model)
+                 SELECT %s,owned.id,'user',%s,%s,NULL FROM owned,locked
+                 WHERE locked.conversation_id IS NULL OR locked.conversation_id=owned.id
+                 ON CONFLICT(id) DO NOTHING RETURNING id
+               )
+               UPDATE public.ask_requests AS target SET
+                 conversation_id=owned.id,
+                 user_message_id=%s,
+                 state=CASE WHEN target.state IN ('COMPLETED','PARTIAL','UNAVAILABLE') THEN target.state ELSE 'EXECUTING' END,
+                 error_class=CASE WHEN target.state IN ('COMPLETED','PARTIAL','UNAVAILABLE') THEN target.error_class ELSE NULL END,
+                 updated_at=CASE WHEN target.state IN ('COMPLETED','PARTIAL','UNAVAILABLE') THEN target.updated_at ELSE now() END
+               FROM owned,locked
+               WHERE target.request_id=locked.request_id AND target.user_id=locked.user_id
+                 AND (locked.conversation_id IS NULL OR locked.conversation_id=owned.id)
+               RETURNING target.*""",
+            (conversation_id, user_id, request_id, user_id, user_message_id, question,
+             _jsonb(structured), user_message_id),
+        ).fetchone()
+        if not row:
             raise KeyError(request_id)
-        if request_row.get("conversation_id") and str(request_row["conversation_id"]) != str(conversation_id):
-            raise ValueError("The request ID is already bound to a different conversation.")
-        conn.execute(
-            """INSERT INTO public.chat_messages(id,conversation_id,role,content,structured_content,model)
-            VALUES(%s,%s,'user',%s,%s,NULL) ON CONFLICT(id) DO NOTHING""",
-            (user_message_id, conversation_id, question, _jsonb(structured)),
-        )
-        if str(request_row["state"]) not in {"COMPLETED", "PARTIAL", "UNAVAILABLE"}:
-            conn.execute(
-                """UPDATE public.ask_requests SET conversation_id=%s,user_message_id=%s,state='EXECUTING',
-                error_class=NULL,updated_at=now() WHERE request_id=%s AND user_id=%s""",
-                (conversation_id, user_message_id, request_id, user_id),
-            )
-        row = conn.execute("SELECT * FROM public.ask_requests WHERE request_id=%s AND user_id=%s",
-                           (request_id, user_id)).fetchone()
     return _ask_request_row(row)
 
 
@@ -3017,40 +3229,55 @@ def complete_ask_request(user_id: str, request_id: str, *, final_state: str,
         return response
     assistant_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"eagleeyes:{request_id}:assistant"))
     with postgres_connection() as conn:
-        request_row = conn.execute("SELECT * FROM public.ask_requests WHERE request_id=%s AND user_id=%s FOR UPDATE",
-                                   (request_id, user_id)).fetchone()
-        if not request_row:
-            raise KeyError(request_id)
-        if request_row.get("response"):
-            return dict(request_row["response"])
-        staged = request_row.get("staged_result") or {}
-        if not staged:
-            raise RuntimeError("No staged Ask result is available for final persistence.")
-        message = conn.execute(
-            """INSERT INTO public.chat_messages(id,conversation_id,role,content,structured_content,model)
-            VALUES(%s,%s,'assistant',%s,%s,%s) ON CONFLICT(id) DO UPDATE SET
-            content=excluded.content,structured_content=excluded.structured_content,model=excluded.model
-            RETURNING id,role,content,structured_content,model,created_at""",
-            (assistant_id, request_row["conversation_id"], staged["answer"],
-             _jsonb(staged["structured_content"]), staged["model"]),
+        row = conn.execute(
+            """WITH req AS MATERIALIZED (
+                 SELECT * FROM public.ask_requests WHERE request_id=%s AND user_id=%s FOR UPDATE
+               ), message AS (
+                 INSERT INTO public.chat_messages(id,conversation_id,role,content,structured_content,model)
+                 SELECT %s,req.conversation_id,'assistant',req.staged_result->>'answer',
+                        req.staged_result->'structured_content',req.staged_result->>'model'
+                 FROM req WHERE req.response IS NULL AND req.staged_result IS NOT NULL
+                 ON CONFLICT(id) DO UPDATE SET content=excluded.content,
+                   structured_content=excluded.structured_content,model=excluded.model
+                 RETURNING id,role,content,structured_content,model,created_at
+               ), response_payload AS (
+                 SELECT jsonb_build_object(
+                   'conversation_id',req.conversation_id::text,
+                   'message',to_jsonb(message) || jsonb_build_object('id',message.id::text),
+                   'sources',COALESCE(req.staged_result->'sources','[]'::jsonb),
+                   'tool_results',COALESCE(req.staged_result->'tool_results','[]'::jsonb)
+                 ) AS response
+                 FROM req,message
+               ), updated_request AS (
+                 UPDATE public.ask_requests AS target SET assistant_message_id=%s,
+                   response=response_payload.response,staged_result=NULL,state=%s,error_class=NULL,
+                   updated_at=now(),completed_at=now()
+                 FROM response_payload
+                 WHERE target.request_id=%s AND target.user_id=%s
+                 RETURNING target.response,target.conversation_id
+               ), updated_conversation AS (
+                 UPDATE public.chat_conversations AS conversation SET updated_at=now()
+                 FROM updated_request WHERE conversation.id=updated_request.conversation_id RETURNING conversation.id
+               )
+               SELECT updated_request.response,COALESCE(req.staged_result->'artifacts','[]'::jsonb) AS staged_artifacts
+               FROM updated_request,req
+               UNION ALL
+               SELECT response,'[]'::jsonb AS staged_artifacts FROM req WHERE response IS NOT NULL
+               LIMIT 1""",
+            (request_id, user_id, assistant_id, assistant_id, final_state, request_id, user_id),
         ).fetchone()
-        for artifact in artifacts or staged.get("artifacts") or []:
-            conn.execute(
+        if not row:
+            raise RuntimeError("No staged Ask result is available for final persistence.")
+        response = dict(row["response"])
+        staged_artifacts = artifacts or list(row.get("staged_artifacts") or [])
+        if staged_artifacts:
+            conn.executemany(
                 """INSERT INTO public.chat_artifact_links(user_id,conversation_id,message_id,artifact_type,artifact_id,label,metadata)
                 VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(conversation_id,artifact_type,artifact_id) DO UPDATE SET
                 message_id=excluded.message_id,label=excluded.label,metadata=excluded.metadata""",
-                (user_id, request_row["conversation_id"], assistant_id, artifact["artifact_type"], artifact["artifact_id"],
-                 artifact["label"], _jsonb(artifact.get("metadata") or {})),
+                [(user_id, response["conversation_id"], assistant_id, artifact["artifact_type"], artifact["artifact_id"],
+                  artifact["label"], _jsonb(artifact.get("metadata") or {})) for artifact in staged_artifacts],
             )
-        message_payload = {**dict(message), "id": str(message["id"]), "created_at": _iso(message["created_at"])}
-        response = {"conversation_id": str(request_row["conversation_id"]), "message": message_payload,
-                    "sources": staged.get("sources") or [], "tool_results": staged.get("tool_results") or []}
-        conn.execute(
-            """UPDATE public.ask_requests SET assistant_message_id=%s,response=%s,state=%s,error_class=NULL,
-            updated_at=now(),completed_at=now() WHERE request_id=%s AND user_id=%s""",
-            (assistant_id, _jsonb(response), final_state, request_id, user_id),
-        )
-        conn.execute("UPDATE public.chat_conversations SET updated_at=now() WHERE id=%s", (request_row["conversation_id"],))
     return response
 
 

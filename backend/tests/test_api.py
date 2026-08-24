@@ -312,7 +312,7 @@ def test_hidden_risk_cached_answer_synthesizes_all_concentration_dimensions() ->
     assert "Technology" in answer and "Software" in answer
     assert "MSFT, GOOGL" in answer and "0.79" in answer
     assert "AI Infrastructure Demand" in answer and "42.0%" in answer
-    assert "ETF holdings are shown at the fund level" in answer
+    assert "Fund-level classification is not issuer-sector look-through" in answer
 
 
 def test_research_coverage_returns_explicit_missing_history_in_sqlite_mode() -> None:
@@ -487,6 +487,21 @@ def test_csv_import_validation() -> None:
         response = client.post("/api/portfolios/import", json={"name": "Test", "csv_text": "ticker,weight,account_type\nSPY,0.6,taxable\nBND,0.4,traditional_ira\n"})
     assert response.status_code == 200
     assert response.json()["validated_rows"] == 2
+
+
+def test_portfolio_import_invalidates_inputs_and_queues_lightweight_read_models(monkeypatch) -> None:
+    invalidations = []
+    rebuilds = []
+    monkeypatch.setattr("backend.main._invalidate_read_models_safely", lambda *args, **kwargs: invalidations.append((args, kwargs)))
+    monkeypatch.setattr("backend.main._recalculate_portfolio_overview_safely", lambda *args, **kwargs: rebuilds.append((args, kwargs)))
+    with TestClient(app) as client:
+        response = client.post("/api/portfolios/import", json={
+            "name": "Initialization contract",
+            "csv_text": "ticker,weight\nSPY,0.7\nBND,0.3\n",
+        })
+    assert response.status_code == 200
+    assert invalidations and invalidations[0][0][1] == "portfolio_holdings"
+    assert rebuilds and rebuilds[0][0][2] == "PORTFOLIO_CHANGE"
 
 
 def test_users_can_keep_and_reopen_multiple_saved_portfolios() -> None:

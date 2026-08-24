@@ -85,6 +85,7 @@ export type ChatMessage = { id?: string; role: string; content: string; structur
   actions?: Array<{ label: string; href: string; kind: string }>;
   visual_suggestion?: { label: string; prompt: string };
   grounding?: { categories?: string[]; tool_claim_types?: Record<string,string> };
+  client_timing?: Record<string,unknown>;
 } };
 export type ChatConversation = { id:string;portfolio_id?:string|null;title:string;workspace:"research"|"portfolio";summary?:string;message_count:number;artifact_count:number;last_message_preview?:string|null;created_at:string;updated_at:string };
 export type ChatArtifact = {id:string;artifact_type:"simulation_run"|"analysis_run"|"dashboard_view"|"research_snapshot";artifact_id:string;label:string;metadata?:Record<string,unknown>;created_at:string};

@@ -146,10 +146,12 @@ def _run_node(node: ExecutionNode, context: NodeExecutionContext,
     try:
         from . import database
         database.set_thread_query_timeout_ms(context.effective_timeout_ms)
+        database.attach_query_trace(context.request_id)
         return node.executor(context, outcomes)
     finally:
         try:
             database.clear_thread_query_timeout_ms()
+            database.clear_query_trace_thread()
         except Exception:
             pass
 

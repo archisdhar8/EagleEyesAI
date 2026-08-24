@@ -143,6 +143,19 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
     enabled = set((page_context or {}).get("enabled_context") or ("evidence", "thesis", "portfolio"))
     tools = list(mappings[intent])
     previous_structured = (previous_analysis or {}).get("analytical_context") if isinstance((previous_analysis or {}).get("analytical_context"), dict) else (previous_analysis or {})
+    # A status follow-up resolves against the durable job reference retained in
+    # the conversation.  This selects an existing capability; it does not add
+    # a planner capability or require the user to paste a job id.
+    status_followup = bool(re.search(r"\b(?:is it done|is that done|show (?:me )?(?:the )?(?:simulation|optimizer|optimization) now|did (?:the )?(?:simulation|optimizer) finish)\b", question, re.I))
+    pending_jobs = list((previous_analysis or {}).get("pending_jobs") or [])
+    if status_followup:
+        latest = pending_jobs[-1] if pending_jobs else {}
+        prior_capabilities = list(previous_structured.get("active_capabilities") or (previous_analysis or {}).get("tool_names") or [])
+        kind = str(latest.get("kind") or latest.get("capability") or (prior_capabilities[-1] if prior_capabilities else "")).upper()
+        if "SIMULATION" in kind or "SCENARIO" in kind:
+            intent, tools = "MULTI_SCENARIO", ["portfolio_scenario"]
+        elif "OPTIM" in kind or "PORTFOLIO_ANALYSIS" in kind or "PORTFOLIO_ANALYSIS" in prior_capabilities:
+            intent, tools = "PORTFOLIO_ANALYSIS", ["portfolio_analysis"]
     if intent == "GENERAL" and re.search(r"\b(?:visualize|visualise|plot|graph|chart)\b(?:\s+that|\s+this|\s+it)?|\brefresh\b.*\b(?:analysis|data|view|dashboard|verified)\b", question, re.I):
         prior_capabilities = [str(value) for value in previous_structured.get("active_capabilities", [])]
         registered = [value for value in prior_capabilities if value in {

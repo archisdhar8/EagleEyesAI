@@ -576,7 +576,8 @@ def build_cash_allocation(dominance: list[dict[str, Any]], profile: dict[str, An
     hurdle = {
         "available": configured_yield is not None,
         "annual_yield": configured_yield,
-        "source": "user_profile" if configured_yield is not None else None,
+        "source": profile.get("cash_hurdle_source") or ("user_profile" if configured_yield is not None else None),
+        "as_of": profile.get("cash_hurdle_as_of"),
         "reason": None if configured_yield is not None else "No supported cash/risk-free yield is stored for this portfolio.",
     }
     candidates = [row for row in dominance if row.get("dominance_status") in {"DOMINATES", "ADD_TO_EXISTING_SUPPORTED"}]
@@ -758,16 +759,46 @@ def build_portfolio_events(events: list[dict[str, Any]], holdings: list[dict[str
                            "source": event.get("provider") or event.get("source_url"),
                            "freshness": event.get("verified_at"), "confidence": confidence})
         covered_categories.add(category)
+    requested = {ticker for ticker in weights if ticker != "CASH"}
+    earnings_entities = {
+        ticker for row in normalized if row["event_type"] == "EARNINGS"
+        for ticker in row.get("affected_entities") or [] if ticker in requested
+    }
+    earnings_weight = sum(weights.get(ticker, 0) for ticker in earnings_entities)
+    newest_by_category: dict[str, str | None] = {}
+    for category in covered_categories:
+        newest_by_category[category] = max(
+            (str(row.get("freshness") or "") for row in normalized if row["event_type"] == category),
+            default="",
+        ) or None
     completeness = {
-        "earnings": "AVAILABLE" if "EARNINGS" in covered_categories else "MISSING",
-        "macro_calendar": "AVAILABLE" if "MACRO" in covered_categories else "MISSING",
-        "company_catalysts": "AVAILABLE" if "COMPANY_CATALYST" in covered_categories else "PARTIAL",
-        "prediction_markets": "AVAILABLE" if "PREDICTION_MARKET_EVENT" in covered_categories else "MISSING",
+        "earnings": "CURRENT" if requested and earnings_entities == requested else "PARTIAL" if earnings_entities else "MISSING",
+        "macro_calendar": "CURRENT" if "MACRO" in covered_categories else "MISSING",
+        "company_catalysts": "CURRENT" if "COMPANY_CATALYST" in covered_categories else "MISSING",
+        "prediction_markets": "CURRENT" if "PREDICTION_MARKET_EVENT" in covered_categories else "MISSING",
+    }
+    health = {
+        "earnings": {"status": completeness["earnings"], "entity_coverage": len(earnings_entities) / len(requested) if requested else None,
+                     "portfolio_weight_coverage": earnings_weight, "freshness": newest_by_category.get("EARNINGS")},
+        "macro": {"status": completeness["macro_calendar"], "event_count": sum(row["event_type"] == "MACRO" for row in normalized),
+                  "freshness": newest_by_category.get("MACRO")},
+        "company_catalysts": {"status": completeness["company_catalysts"],
+                              "event_count": sum(row["event_type"] == "COMPANY_CATALYST" for row in normalized),
+                              "freshness": newest_by_category.get("COMPANY_CATALYST")},
+        "prediction_market_events": {"status": completeness["prediction_markets"],
+                                     "event_count": sum(row["event_type"] == "PREDICTION_MARKET_EVENT" for row in normalized),
+                                     "freshness": newest_by_category.get("PREDICTION_MARKET_EVENT")},
     }
     return {"events": sorted(normalized, key=lambda row: (row.get("date") or "", row["title"])),
             "category_completeness": completeness,
-            "complete": all(completeness[key] == "AVAILABLE" for key in ("earnings", "macro_calendar", "company_catalysts")),
-            "calculation_version": "portfolio-events-v2"}
+            "event_coverage_health": health,
+            "provider_limitations": {
+                "earnings": "No configured ingestion adapter currently supplies an earnings calendar." if completeness["earnings"] == "MISSING" else None,
+                "macro": "FRED observations do not supply a forward release calendar in the configured adapter." if completeness["macro_calendar"] == "MISSING" else None,
+                "company_catalysts": "Stored structured events only; arbitrary news is not promoted to a guaranteed catalyst." if completeness["company_catalysts"] != "CURRENT" else None,
+            },
+            "complete": all(completeness[key] == "CURRENT" for key in ("earnings", "macro_calendar", "company_catalysts")),
+            "calculation_version": "portfolio-events-v3"}
 
 
 def build_data_quality(holdings: list[dict[str, Any]], bundle: dict[str, Any]) -> list[dict[str, Any]]:
@@ -791,7 +822,7 @@ def build_data_quality(holdings: list[dict[str, Any]], bundle: dict[str, Any]) -
 def build_rebalance_contract(optimizer: dict[str, Any] | None, input_fingerprint: str,
                              holdings: list[dict[str, Any]]) -> dict[str, Any]:
     optimizer = optimizer or {}
-    run_fingerprint = optimizer.get("input_fingerprint") or optimizer.get("portfolio_context_version")
+    run_fingerprint = optimizer.get("portfolio_context_version") or optimizer.get("input_fingerprint")
     alternatives = optimizer.get("alternatives") or []
     selected = next((row for row in alternatives if row.get("name") == "Balanced"), None)
     diagnostics = optimizer.get("model_diagnostics") or {}

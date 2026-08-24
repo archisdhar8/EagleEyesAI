@@ -7,6 +7,15 @@ from fastapi import HTTPException
 from backend import auth
 
 
+@pytest.fixture(autouse=True)
+def clear_verified_token_cache():
+    with auth._AUTH_CACHE_LOCK:
+        auth._AUTH_CACHE.clear()
+    yield
+    with auth._AUTH_CACHE_LOCK:
+        auth._AUTH_CACHE.clear()
+
+
 def test_auth_uses_stdin_curl_fallback_without_token_in_process_args(monkeypatch) -> None:
     monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
     monkeypatch.setenv("SUPABASE_PUBLISHABLE_KEY", "publishable-key")

@@ -34,6 +34,39 @@ def _group_exposure(weights: dict[str, float], security_rows: list[dict[str, Any
     return [{field: key, "weight": value} for key, value in sorted(grouped.items(), key=lambda item: item[1], reverse=True)]
 
 
+def _classification_coverage(weights: dict[str, float], security_rows: list[dict[str, Any]],
+                             fund_holdings: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = {str(row.get("ticker") or "").upper(): row for row in security_rows}
+    matched = {ticker for ticker in weights if ticker in rows}
+    issuers = {ticker for ticker, row in rows.items() if ticker in weights and row.get("sector")}
+    funds = {ticker for ticker, row in rows.items() if ticker in weights and str(row.get("asset_type") or "").lower() == "etf"}
+    look_through_funds = {str(row.get("fund_ticker") or "").upper() for row in fund_holdings}
+    unknown = set(weights) - issuers - funds
+    issuer_weight = sum(weights[ticker] for ticker in issuers)
+    fund_weight = sum(weights[ticker] for ticker in funds)
+    look_through_weight = sum(weights[ticker] for ticker in funds & look_through_funds)
+    metadata_weight = sum(weights[ticker] for ticker in matched)
+    return {
+        "contract_version": "classification-coverage-v2",
+        "holding_universe": {"entities": len(weights), "portfolio_weight": sum(weights.values())},
+        "security_metadata": {"entities": len(matched), "entity_coverage": len(matched) / len(weights) if weights else None,
+                              "portfolio_weight_coverage": metadata_weight,
+                              "definition": "A canonical security record exists; this does not imply sector coverage."},
+        "rendered_sector": {"entities": len(issuers), "portfolio_weight_coverage": issuer_weight,
+                            "unclassified_weight": max(0.0, 1.0 - issuer_weight),
+                            "definition": "Portfolio weight assigned to a displayed issuer sector; funds remain unclassified without look-through."},
+        "direct_issuer": {"classified_entities": len(issuers), "portfolio_weight": issuer_weight,
+                          "definition": "Direct issuer holdings with observed sector and industry fields."},
+        "fund_level": {"entities": len(funds), "portfolio_weight": fund_weight,
+                       "classification": "fund-level identity only",
+                       "look_through_available_entities": len(funds & look_through_funds),
+                       "look_through_available_weight": look_through_weight,
+                       "look_through_unavailable_weight": max(0.0, fund_weight - look_through_weight)},
+        "unknown": {"entities": len(unknown), "portfolio_weight": sum(weights[ticker] for ticker in unknown),
+                    "tickers": sorted(unknown)},
+    }
+
+
 def _risk_contribution(weights: dict[str, float], prices: list[dict[str, Any]]) -> dict[str, Any]:
     tickers = [ticker for ticker in weights if ticker != "CASH"]
     if len(tickers) < 2:
@@ -73,6 +106,7 @@ def build_portfolio_diagnostics(
     security_rows = security_data.get("securities", [])
     fund_rows = fund_data.get("funds", [])
     fund_holdings = fund_data.get("holdings", [])
+    classification_coverage = _classification_coverage(weights, security_rows, fund_holdings)
     account_exposure: dict[str, float] = defaultdict(float)
     for row in holdings:
         account_exposure[str(row.get("account_type") or "unknown")] += weights.get(str(row.get("ticker") or "").upper(), 0)
@@ -115,6 +149,7 @@ def build_portfolio_diagnostics(
         "as_of": now,
         "sector_exposure": _group_exposure(weights, security_rows, "sector"),
         "industry_exposure": _group_exposure(weights, security_rows, "industry"),
+        "classification_coverage": classification_coverage,
         "account_allocation": [{"account_type": key, "weight": value} for key, value in sorted(account_exposure.items(), key=lambda item: item[1], reverse=True)],
         "marginal_risk": _risk_contribution(weights, security_data.get("prices", [])),
         "holdings_fund_overlap": {"status": "ready" if fund_holdings else "unavailable", "items": overlaps, "reason": None if fund_holdings else "No current ETF constituent dataset is stored."},

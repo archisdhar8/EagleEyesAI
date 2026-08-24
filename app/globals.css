@@ -673,6 +673,15 @@ body.ask-resizing{cursor:col-resize;user-select:none}
 .widget-state-note{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:8px 0;padding:8px 10px;border-radius:8px;background:var(--surface-2);font-size:9px;color:var(--muted)}
 .widget-state-note.stale{color:#b67b1d}.widget-state-note.pending{color:var(--accent)}
 
+/* Owner validation: keep the primary Ask surface wide and readable. */
+.canvas-closed .ask-chat-pane,.ask-content-shell>.ask-chat-pane{max-width:1400px}
+.ask-chat-workspace .chat-message{max-width:min(1200px,92%)}
+.ask-chat-workspace .chat-message>span{font-size:12px}
+.ask-chat-workspace .chat-message p,.ask-chat-workspace .chat-message .narrative-text p{font-size:17px}
+.ask-chat-workspace .chat-empty p{font-size:15px}
+.ask-chat-workspace .chat-empty button{font-size:14px}
+.ask-chat-workspace .chat-composer textarea{font-size:17px}
+
 @media(max-width:980px){
   .canvas-open .ask-content-shell{grid-template-columns:minmax(300px,40fr) minmax(480px,60fr)}
 }

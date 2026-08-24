@@ -185,3 +185,16 @@ def test_phase8_risk_market_and_backtest_followups_use_normal_capability_boundar
     backtest = build_plan("Add a five-year backtest against SPY.", "research", {"portfolio_id": "portfolio-61"})
     assert backtest.tools == ("portfolio_backtest",)
     assert backtest.requires_portfolio
+
+
+def test_job_status_followup_reuses_conversation_capability_without_job_id() -> None:
+    scenario = build_plan("is it done?", "research", {"portfolio_id": "portfolio-61"}, {
+        "pending_jobs": [{"job_id": "job-1", "kind": "SIMULATION", "status": "pending"}],
+        "analytical_context": {"active_capabilities": ["portfolio_scenario"]},
+    })
+    assert (scenario.intent, scenario.tools) == ("MULTI_SCENARIO", ("portfolio_scenario",))
+
+    completed_optimizer = build_plan("show the optimizer now", "research", {"portfolio_id": "portfolio-61"}, {
+        "analytical_context": {"active_capabilities": ["portfolio_analysis"]},
+    })
+    assert (completed_optimizer.intent, completed_optimizer.tools) == ("PORTFOLIO_ANALYSIS", ("portfolio_analysis",))

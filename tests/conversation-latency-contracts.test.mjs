@@ -17,6 +17,9 @@ test("reload restoration is cancellation-safe and preserves an explicit new chat
   assert.match(dashboard, /remembered===NEW_CHAT_STORAGE_VALUE/);
   assert.match(dashboard, /window\.localStorage\.getItem\(storageKey\)!==selected/);
   assert.match(dashboard, /setResearchConversations\(rows\)/);
+  assert.match(dashboard, /CachedConversation/);
+  assert.match(dashboard, /setResearchChatMessages\(cached\.messages\|\|\[\]\)/);
+  assert.match(dashboard, /storeConversationSnapshot\(activeWorkspace,selected/);
 });
 
 test("conversation deletion updates the sidebar before awaiting Supabase", () => {

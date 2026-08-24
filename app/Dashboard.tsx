@@ -29,6 +29,7 @@ const DASHBOARD_TERMINAL_STATES = new Set(["COMPLETE", "PARTIAL_SUCCESS", "FAILE
 const NEW_CHAT_STORAGE_VALUE = "__new_chat__";
 type SavedPortfolio = { id: string | number; name: string; holdings: Holding[]; updated_at?: string | null };
 type CachedToday = { cachedAt:number; briefing:TodayBriefing; macro?:Macro; macroFactors?:MacroFactor[]; dataStatus?:DataStatus };
+type CachedConversation = { conversationId:string; workspace:"research"|"portfolio"; portfolioId:string; messages:ChatMessage[]; artifacts:ChatArtifact[]; cachedAt:number };
 export default function Dashboard({ accessToken, email, onSignOut }: { accessToken: string; email: string; onSignOut: () => void }) {
   const [tab, setTab] = useState<Tab>("today");
   const [exploreView, setExploreView] = useState<ExploreView>("stocks");
@@ -115,7 +116,18 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   const [draggedTerminalWidget, setDraggedTerminalWidget] = useState<string | null>(null);
   const [terminalLayouts, setTerminalLayouts] = useState<TerminalLayout[]>([]);
   const [selectedTerminalLayout, setSelectedTerminalLayout] = useState<string | null>(null);
-  const chatStorageKey=(workspace:"research"|"portfolio")=>`eagleeyes-${workspace}-conversation-${portfolioId??"general"}`;
+  const resolvedChatPortfolioId=()=>String(
+    portfolioId ?? (typeof window!=="undefined"?window.localStorage.getItem(`eagleeyes-active-portfolio-${email}`):null) ?? "general"
+  );
+  const chatScope=()=>`${email}-${resolvedChatPortfolioId()}`;
+  const chatStorageKey=(workspace:"research"|"portfolio")=>`eagleeyes-${workspace}-conversation-${chatScope()}`;
+  const chatSnapshotKey=(workspace:"research"|"portfolio")=>`eagleeyes-${workspace}-conversation-snapshot-${chatScope()}`;
+  const storeConversationSnapshot=(workspace:"research"|"portfolio",conversationId:string,messages:ChatMessage[],artifacts:ChatArtifact[])=>{
+    try{
+      const snapshot:CachedConversation={conversationId,workspace,portfolioId:resolvedChatPortfolioId(),messages,artifacts,cachedAt:Date.now()};
+      window.localStorage.setItem(chatSnapshotKey(workspace),JSON.stringify(snapshot));
+    }catch{/* Durable server history remains authoritative when browser storage is unavailable. */}
+  };
 
   const apiFetch = useCallback(async (input: string, init: RequestInit = {}) => {
     const headers = new Headers(init.headers);
@@ -179,6 +191,20 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     let active=true;
     async function restore(){
       try{
+        const initiallyRemembered=window.localStorage.getItem(storageKey);
+        if(initiallyRemembered&&initiallyRemembered!==NEW_CHAT_STORAGE_VALUE){
+          try{
+            const cached=JSON.parse(window.localStorage.getItem(chatSnapshotKey(activeWorkspace))||"null") as CachedConversation|null;
+            if(cached?.conversationId===initiallyRemembered&&cached.workspace===activeWorkspace&&cached.portfolioId===resolvedChatPortfolioId()){
+              conversationCache.current[activeWorkspace].set(cached.conversationId,{messages:cached.messages||[],artifacts:cached.artifacts||[]});
+              if(activeWorkspace==="research"){
+                setResearchConversationId(cached.conversationId);setResearchChatMessages(cached.messages||[]);setResearchChatArtifacts(cached.artifacts||[]);
+              }else{
+                setPortfolioConversationId(cached.conversationId);setPortfolioChatMessages(cached.messages||[]);setPortfolioChatArtifacts(cached.artifacts||[]);
+              }
+            }
+          }catch{/* Ignore a malformed local snapshot and restore from Supabase. */}
+        }
         const response=await apiRequest(`/chat/conversations?workspace=${activeWorkspace}${portfolioId?`&portfolio_id=${encodeURIComponent(String(portfolioId))}`:""}`);
         if(!response.ok){if(active)setNotice(await apiError(response,"Unable to reload conversations"));return;}
         const payload=await response.json();
@@ -195,6 +221,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
         const detail=await detailResponse.json();
         if(!active||window.localStorage.getItem(storageKey)!==selected)return;
         conversationCache.current[activeWorkspace].set(selected,{messages:detail.messages||[],artifacts:detail.artifacts||[]});
+        storeConversationSnapshot(activeWorkspace,selected,detail.messages||[],detail.artifacts||[]);
         if(activeWorkspace==="research"){
           setResearchConversationId(selected);setResearchChatMessages(detail.messages||[]);setResearchChatArtifacts(detail.artifacts||[]);
           const linkedDashboard=(detail.artifacts||[]).find((artifact:ChatArtifact)=>artifact.artifact_type==="dashboard_view");
@@ -825,6 +852,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     const detail=await response.json();
     if(detail.workspace!==workspace){setNotice("That conversation belongs to a different workspace.");return;}
     conversationCache.current[workspace].set(conversationId,{messages:detail.messages||[],artifacts:detail.artifacts||[]});
+    storeConversationSnapshot(workspace,conversationId,detail.messages||[],detail.artifacts||[]);
     if(window.localStorage.getItem(chatStorageKey(workspace))!==conversationId)return;
     if(workspace==="research"){
       setResearchConversationId(conversationId);setResearchChatMessages(detail.messages||[]);setResearchChatArtifacts(detail.artifacts||[]);
@@ -848,6 +876,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
 
   function newChatConversation(workspace:"research"|"portfolio") {
     window.localStorage.setItem(chatStorageKey(workspace),NEW_CHAT_STORAGE_VALUE);
+    window.localStorage.removeItem(chatSnapshotKey(workspace));
     if(workspace==="research"){
       setResearchConversationId(null);setResearchChatMessages([]);setResearchChatArtifacts([]);setResearchChatQuestion("");setSelectedDashboardView(null);setDashboardJob(null);
     }else{
@@ -873,6 +902,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     if(workspace==="research")setResearchConversations(rows);else setPortfolioConversations(rows);
     if(isCurrent){
       window.localStorage.setItem(chatStorageKey(workspace),NEW_CHAT_STORAGE_VALUE);
+      window.localStorage.removeItem(chatSnapshotKey(workspace));
       if(workspace==="research"){setResearchConversationId(null);setResearchChatMessages([]);setResearchChatArtifacts([]);}
       else{setPortfolioConversationId(null);setPortfolioChatMessages([]);setPortfolioChatArtifacts([]);}
       if(rows[0])void openChatConversation(workspace,rows[0].id);
@@ -908,21 +938,44 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     setResearchChatMessages(items => [...items, userMessage]);
     setResearchChatQuestion("");
     setResearchChatBusy(true);
+    const requestId=crypto.randomUUID();
+    const dispatchStarted=performance.now();
     try {
       const currentUrl=new URL(window.location.href);
       const contextTicker=(currentUrl.searchParams.get("ticker")||"").toUpperCase()||undefined;
       const dashboardResourceType=selectedDashboardView?"view":dashboardJob?"draft":undefined;
       const dashboardResourceId=selectedDashboardView||dashboardJob?.id||undefined;
+      const fetchStarted=performance.now();
       const response = await apiRequest("/chat/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: cleanQuestion, conversation_id: researchConversationId, workspace: "research", page_context:{route:`${currentUrl.pathname}${currentUrl.search}`,workspace:tab==="ask"?"ask":"research",entity_type:contextTicker?"security":undefined,ticker:contextTicker,portfolio_id:portfolioId?String(portfolioId):undefined,dashboard_resource_type:dashboardResourceType,dashboard_resource_id:dashboardResourceId,enabled_context:askEnabledContext} }),
+        body: JSON.stringify({ request_id:requestId,question: cleanQuestion, conversation_id: researchConversationId, workspace: "research", page_context:{route:`${currentUrl.pathname}${currentUrl.search}`,workspace:tab==="ask"?"ask":"research",entity_type:contextTicker?"security":undefined,ticker:contextTicker,portfolio_id:portfolioId?String(portfolioId):undefined,dashboard_resource_type:dashboardResourceType,dashboard_resource_id:dashboardResourceId,enabled_context:askEnabledContext} }),
       });
+      const responseReceived=performance.now();
       if (!response.ok) throw new Error(await apiError(response, "Unable to answer the research question"));
       const data = await response.json();
+      const responseParsed=performance.now();
+      const clientTiming={request_id:requestId,question:cleanQuestion,
+        frontend_dispatch_ms:Number((fetchStarted-dispatchStarted).toFixed(2)),
+        network_and_backend_ms:Number((responseReceived-fetchStarted).toFixed(2)),
+        response_parse_ms:Number((responseParsed-responseReceived).toFixed(2)),
+        server_timing:response.headers.get("Server-Timing"),backend:data.request_timing||null,query_stats:data.query_stats||null};
+      data.message.structured_content={...(data.message.structured_content||{}),client_timing:clientTiming};
       setResearchConversationId(data.conversation_id || null);
       if(data.conversation_id)window.localStorage.setItem(chatStorageKey("research"),data.conversation_id);
-      setResearchChatMessages(items => [...items, data.message]);
+      setResearchChatMessages(items => {
+        const next=[...items,data.message];
+        if(data.conversation_id)storeConversationSnapshot("research",data.conversation_id,next,researchChatArtifacts);
+        return next;
+      });
+      window.requestAnimationFrame(()=>window.requestAnimationFrame(()=>{
+        const visibleAt=performance.now();
+        const completed={...clientTiming,frontend_render_ms:Number((visibleAt-responseParsed).toFixed(2)),
+          total_visible_ms:Number((visibleAt-dispatchStarted).toFixed(2))};
+        const measuredWindow=window as Window & {__eagleEyesAskTimings?:Array<Record<string,unknown>>};
+        measuredWindow.__eagleEyesAskTimings=[...(measuredWindow.__eagleEyesAskTimings||[]),completed];
+        window.dispatchEvent(new CustomEvent("eagleeyes:ask-rendered",{detail:completed}));
+      }));
       const operation=data.message?.structured_content?.dashboard_operation;
       if(operation?.action_result?.status==="SUCCESS"&&operation.action_result.dashboard){
         if(operation.resource_type==="view"){
@@ -964,7 +1017,11 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       const data = await response.json();
       setPortfolioConversationId(data.conversation_id || null);
       if(data.conversation_id)window.localStorage.setItem(chatStorageKey("portfolio"),data.conversation_id);
-      setPortfolioChatMessages(items => [...items, data.message]);
+      setPortfolioChatMessages(items => {
+        const next=[...items,data.message];
+        if(data.conversation_id)storeConversationSnapshot("portfolio",data.conversation_id,next,portfolioChatArtifacts);
+        return next;
+      });
       void refreshConversationList("portfolio");
       if(data.conversation_id)void refreshConversationArtifacts("portfolio",data.conversation_id);
     } catch (error) {

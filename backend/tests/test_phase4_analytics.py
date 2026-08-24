@@ -168,7 +168,9 @@ def test_event_result_tracks_materiality_and_category_completeness_separately():
     result = build_portfolio_events(events, holdings())
     assert result["events"][0]["affected_portfolio_weight"] == .65
     assert result["events"][0]["estimated_materiality"] == "HIGH"
-    assert result["category_completeness"]["earnings"] == "AVAILABLE"
+    assert result["category_completeness"]["earnings"] == "PARTIAL"
+    assert result["event_coverage_health"]["earnings"]["entity_coverage"] == .5
+    assert result["event_coverage_health"]["earnings"]["portfolio_weight_coverage"] == .65
     assert result["complete"] is False
 
 

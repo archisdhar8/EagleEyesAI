@@ -443,6 +443,10 @@ def _simulation(job: AnalyticsJob, payload: dict[str, Any], progress: Callable[[
     request = SimulationRunInput.model_validate(payload)
     progress("running_paths", 35)
     result = run_simulation(request)
+    # Persist the durable job fingerprint on the reusable simulation artifact,
+    # not only on the wrapping analytical-job result.
+    result["input_fingerprint"] = job.input_fingerprint
+    result["portfolio_context_version"] = job.input_fingerprint
     progress("aggregating", 85)
     database.save_simulation_run(job.user_id, result)
     symbols = [row.ticker for row in request.holdings]
@@ -502,7 +506,9 @@ def _optimization(job: AnalyticsJob, payload: dict[str, Any], progress: Callable
         result["alternatives"] = []
         result["attempted_weights_withheld"] = True
     result["input_fingerprint"] = job.input_fingerprint
-    database.save_analysis(result["id"], {"portfolio_id": job.portfolio_id, "input_fingerprint": job.input_fingerprint}, result, job.user_id)
+    result["portfolio_context_version"] = payload.get("portfolio_fingerprint")
+    database.save_analysis(result["id"], {"portfolio_id": job.portfolio_id, "input_fingerprint": job.input_fingerprint,
+                                          "portfolio_context_version": payload.get("portfolio_fingerprint")}, result, job.user_id)
     status = AnalysisStatus.UNAVAILABLE if infeasible else AnalysisStatus.PARTIAL if result.get("warnings") else AnalysisStatus.SUCCESS
     current_weights = {str(row.get("ticker")): float(row.get("weight") or 0) for row in holdings}
     typed = OptimizationResult.model_validate({**result, "feasible": not infeasible, "current_weights": current_weights,
@@ -636,6 +642,16 @@ def _invalidate(job: AnalyticsJob, result: AnalysisResult) -> None:
     for portfolio_id in portfolio_ids:
         read_models.invalidate_for_upstream_change(job.user_id, portfolio_id, dataset,
                                                    stable_fingerprint(result.data), result.freshness.effective_through.isoformat() if result.freshness.effective_through else None)
+        if job.job_type in {JobType.SIMULATION, JobType.OPTIMIZATION}:
+            # Completion advances a versioned dependency. Queue the existing
+            # portfolio projection builder so Ask can read the completed result
+            # without calculating it synchronously on the next question.
+            try:
+                from .main import _queue_portfolio_overview_rebuild
+                _queue_portfolio_overview_rebuild(job.user_id, portfolio_id, f"{job.job_type.value}_COMPLETED")
+            except Exception as exc:
+                record_metric("analytics.job.read_model_rebuild.failure",
+                              tags={"job_type": job.job_type.value, "error_class": type(exc).__name__})
 
 
 def run_one(*, worker_id: str | None = None, lease_seconds: int = DEFAULT_LEASE_SECONDS,

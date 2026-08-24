@@ -65,7 +65,12 @@ async def production_guard(request: Request, call_next):
     if response.status_code in {401, 403, 404}:
         record_metric("access.boundary_failure", tags={"status": response.status_code, "group": route_group})
     response.headers["X-Request-ID"] = request_id
-    response.headers["Server-Timing"] = f'app;dur={duration}'
+    components = getattr(request.state, "component_timing", {}) or {}
+    detailed = ",".join(
+        f"{name};dur={float(value):.2f}" for name, value in components.items()
+        if isinstance(value, (int, float))
+    )
+    response.headers["Server-Timing"] = f'app;dur={duration}' + (f",{detailed}" if detailed else "")
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"

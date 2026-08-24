@@ -7,6 +7,7 @@ import pytest
 
 from backend import analytics_jobs, database
 from backend.analytical_contract import AnalysisStatus
+from backend.main import _analytics_job_chat_status
 
 
 @pytest.fixture()
@@ -225,3 +226,24 @@ def test_migration_has_leases_dedupe_and_rls():
     sql = path.read_text()
     for token in ("analytical_jobs", "deduplication_key", "lease_expires_at", "retry_count", "ENABLE ROW LEVEL SECURITY"):
         assert token in sql
+
+
+def test_ask_job_failure_and_worker_unavailable_messages_are_specific(monkeypatch):
+    simulation = analytics_jobs.AnalyticsJob.model_construct(
+        job_type=analytics_jobs.JobType.SIMULATION, status=analytics_jobs.JobStatus.FAILED,
+    )
+    optimizer = analytics_jobs.AnalyticsJob.model_construct(
+        job_type=analytics_jobs.JobType.OPTIMIZATION, status=analytics_jobs.JobStatus.FAILED,
+    )
+    assert _analytics_job_chat_status(simulation) == (
+        "failed", "The simulation failed safely; the immediate deterministic evidence remains available.",
+    )
+    assert _analytics_job_chat_status(optimizer) == (
+        "failed", "The optimizer failed safely; the immediate deterministic evidence remains available.",
+    )
+    monkeypatch.setattr(analytics_jobs, "operational_health", lambda: {"status": "degraded"})
+    queued = analytics_jobs.AnalyticsJob.model_construct(
+        job_type=analytics_jobs.JobType.SIMULATION, status=analytics_jobs.JobStatus.QUEUED,
+    )
+    status, message = _analytics_job_chat_status(queued)
+    assert status == "partial" and "worker is temporarily unavailable" in message

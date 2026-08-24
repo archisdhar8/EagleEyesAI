@@ -164,7 +164,8 @@ test("Ask EagleEyes exposes durable conversation controls as the single chat sur
     assert.match(source, new RegExp(copy));
   }
   assert.match(source, /ask-history-drawer/);
-  assert.match(source, /`eagleeyes-\$\{workspace\}-conversation-\$\{portfolioId\?\?"general"\}`/);
+  assert.match(source, /`eagleeyes-\$\{workspace\}-conversation-\$\{chatScope\(\)\}`/);
+  assert.match(source, /conversation-snapshot-\$\{chatScope\(\)\}/);
   assert.match(source, /onKeyDown=\{event=>\{if\(event\.key!=="Enter"\|\|event\.shiftKey\|\|event\.nativeEvent\.isComposing\)return/);
 });
 

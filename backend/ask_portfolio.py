@@ -59,7 +59,7 @@ _CALCULATION_VERSIONS = {
     "portfolio_intelligence": "portfolio-intelligence-v1",
     "portfolio_scenario": "scenario-compatibility-v2",
     "watchlist_comparison": "watchlist-dominance-v2",
-    "portfolio_events": "portfolio-events-v2",
+    "portfolio_events": "portfolio-events-v3",
     "data_quality": "data-quality-v2",
     "score_attribution": "score-attribution-v2",
     "thesis_monitor": "thesis-invalidation-v2",
@@ -114,6 +114,10 @@ def _coverage_for(tool: str, summary: dict[str, Any], context: PortfolioContext 
         return Coverage(methodology=(
             "Per-holding event-calendar coverage is not tracked by the current read model; an empty list is not full coverage."
         ))
+    if tool == "portfolio_change":
+        return Coverage(methodology=(
+            "Portfolio change is evaluated against a compatible portfolio-level baseline; zero material changes is a valid result, not zero holding coverage."
+        ))
     if tool in {"portfolio_scenario", "portfolio_analysis"}:
         return Coverage(methodology=(
             "Per-holding analytical coverage is not tracked by the current cached simulation/optimizer read model."
@@ -122,8 +126,6 @@ def _coverage_for(tool: str, summary: dict[str, Any], context: PortfolioContext 
     rows = list(summary.get("all_holdings") or summary.get("positions") or [])
     if tool == "portfolio_overview":
         rows = list(summary.get("candidates") or []) + list(summary.get("ineligible_candidates") or [])
-    elif tool == "portfolio_change":
-        rows = list(summary.get("material_changes") or [])
     elif tool == "valuation_ranking":
         rows = list(summary.get("all_relative_valuation") or summary.get("positions") or [])
     elif tool in {"data_quality", "multifactor_screen"}:
@@ -191,12 +193,13 @@ def _canonical_result(
     if tool == "portfolio_analysis":
         exists = bool(summary.get("optimizer_run"))
         optimizer = summary.get("optimizer_run") or {}
-        optimizer_fingerprint = optimizer.get("input_fingerprint") or optimizer.get("portfolio_context_version")
+        optimizer_fingerprint = optimizer.get("portfolio_context_version") or optimizer.get("input_fingerprint")
         compatible = bool(context and optimizer_fingerprint and optimizer_fingerprint == context.version)
         diagnostics = optimizer.get("model_diagnostics") or {}
+        selected = next((row for row in optimizer.get("alternatives") or [] if row.get("name") == "Balanced"), None)
         constraint_status = str(
             (diagnostics.get("constraint_status") if isinstance(diagnostics, dict) else None)
-            or optimizer.get("constraint_status") or ""
+            or (selected or {}).get("constraint_status") or optimizer.get("constraint_status") or ""
         ).lower()
         feasible = constraint_status in {"feasible", "satisfied", "optimal", "success"}
         prerequisites.extend([
@@ -448,7 +451,8 @@ def _overview_from_read_model(read_model_type: str, data: dict[str, Any]) -> dic
         base["ask_cache"] = {"events": data.get("events") or [], "typed_events": data.get("typed_events") or {}}
     elif read_model_type == "portfolio_data_quality":
         base["warnings"] = data.get("warnings") or []
-        base["ask_cache"] = {"trust_classifications": data.get("trust_classifications") or []}
+        base["ask_cache"] = {"trust_classifications": data.get("trust_classifications") or [],
+                             "classification_coverage": data.get("classification_coverage") or {}}
     elif read_model_type == "score_attribution":
         base["ask_cache"] = {"score_attributions": data.get("attributions") or []}
     elif read_model_type == "thesis_status":
@@ -526,7 +530,6 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
     holding_tickers = {str(row.get("ticker") or "").upper() for row in holdings}
     as_of = overview.get("as_of") or portfolio.get("updated_at")
     health = overview.get("health") or {}
-    profile = database.load_profile(user_id) or {}
     ask_cache = overview.get("ask_cache") or {}
 
     if tool == "portfolio_overview":
@@ -570,14 +573,19 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
         ranked = list(ask_cache.get("trust_classifications") or [])
         summary = {"title": "Portfolio ranking trust and eligibility review", "positions": ranked,
                    "all_holdings": holdings,
+                   "classification_coverage": ask_cache.get("classification_coverage") or {},
                    "coverage": health.get("coverage"), "warnings": overview.get("warnings") or [],
                    "method": "Data-quality-v2 classifies HIGH, MEDIUM, LOW, or NOT_RANKABLE from raw required-field coverage, price/fundamental history, freshness, placeholder detection, and lineage—not symbol presence alone."}
         return _covered_evidence(tool, portfolio, summary, as_of, context, read_model_info)
 
     if tool == "multifactor_screen":
         ranked = list(ask_cache.get("improving_fundamental_screen") or [])
+        trends = ask_cache.get("fundamental_trends") or {}
+        near_matches = [{**row, "fundamental_trend": trends.get(str(row.get("ticker") or "").upper()) or {}}
+                        for row in holdings]
         summary = {"title": "Fundamentals, valuation, and momentum screen", "positions": ranked[:15],
                    "all_holdings": holdings,
+                   "near_matches": near_matches,
                    "method": "Fundamental-trend-screen-v2 requires an improving multi-period reported trend plus available valuation and positive momentum. A high current fundamental level alone is not improvement."}
         if not ranked:
             summary["warnings"] = ["No holding has sufficient stored multi-period evidence to prove improving fundamentals alongside valuation and momentum."]
@@ -617,7 +625,8 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
         typed = ask_cache.get("typed_events") or {}
         summary = {"title": "Upcoming material portfolio events", "events": list(typed.get("events") or [])[:20],
                    "event_completeness": typed,
-                   "method": "Portfolio-events-v2 normalizes event category, mapped portfolio weight, materiality, source freshness, and confidence; completeness is reported separately for earnings, macro, and company catalysts."}
+                   "provider_limitations": typed.get("provider_limitations") or {},
+                   "method": "Portfolio-events-v3 normalizes event category, mapped portfolio weight, materiality, source freshness, and confidence; completeness is reported independently for earnings, macro, company catalysts, and prediction markets."}
         return _covered_evidence(tool, portfolio, summary, ask_cache.get("generated_at") or as_of, context, read_model_info)
 
     if tool in {"watchlist_comparison", "thesis_replacement", "cash_allocation"}:
@@ -646,7 +655,9 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
         if tool == "thesis_replacement" and not active_theses:
             summary = {"status": "unavailable", "title": "No saved investment theses",
                        "message": "No saved thesis exists for this portfolio, so EagleEyes cannot identify a weakest thesis or claim that a replacement invalidates it.",
-                       "watchlist_candidates": watchlist_rows[:5], "weakest_evidence_holdings": weak}
+                       "watchlist_candidates": watchlist_rows[:5], "weakest_evidence_holdings": weak,
+                       "dominance_results": ask_cache.get("watchlist_dominance") or [],
+                       "thesis": {"exists": False, "count": 0}}
         else:
             summary = {"title": "Watchlist and portfolio comparison" if tool == "watchlist_comparison" else "New-cash research queue" if tool == "cash_allocation" else "Thesis and replacement review",
                        "watchlist_candidates": watchlist_rows[:10], "weakest_holdings": weak,
@@ -680,6 +691,7 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
                                if isinstance(simulation, dict) else simulation)
         summary = {"title": "Cached portfolio scenario matrix", "latest_simulation": scenario_simulation,
                    "market_scenarios": ask_cache.get("scenarios") or [],
+                   "all_holdings": holdings,
                    "requested_conditions": question,
                    "method": "Latest cached portfolio simulation and stored scenario probabilities; no simulation or provider refresh runs inside chat."}
         if not simulation:
@@ -709,6 +721,7 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
         summary = {
             "title": "Latest saved portfolio analysis",
             "optimizer_run": optimizer,
+            "all_holdings": holdings,
             "selected_alternative": next((
                 row for row in list((optimizer or {}).get("alternatives") or [])
                 if row.get("name") == "Balanced"
@@ -843,13 +856,31 @@ def _hidden_risk_answer(summary: dict[str, Any]) -> str:
     if risk_text:
         sections.append(f"## Largest modeled risk contributors\n\n{risk_text}")
 
-    classification_coverage = coverage.get("classification_weight")
-    coverage_note = (
-        f"Sector and dependency classifications cover **{_number(classification_coverage):.1%}** of portfolio weight. "
-        if classification_coverage is not None else
-        "The snapshot does not report classification coverage. "
+    classification_contract = coverage.get("classification") or {}
+    metadata_coverage = (classification_contract.get("security_metadata") or {}).get("portfolio_weight_coverage")
+    rendered_contract = classification_contract.get("rendered_sector") or {}
+    fund_contract = classification_contract.get("fund_level") or {}
+    unknown_contract = classification_contract.get("unknown") or {}
+    unclassified_weight = sum(
+        _number(row.get("weight")) for row in sectors
+        if str(row.get("sector") or "").strip().lower() in {"unclassified", "unknown", "unavailable"}
     )
-    coverage_note += "ETF holdings are shown at the fund level unless look-through constituent data is explicitly present, so direct holdings may overlap with an index fund more than these totals reveal."
+    sector_row_coverage = max(0.0, 1.0 - unclassified_weight) if sectors else None
+    if classification_contract:
+        rendered_weight = _number(rendered_contract.get("portfolio_weight_coverage"), sector_row_coverage or 0)
+        coverage_note = (
+            f"Rendered issuer-sector coverage is **{rendered_weight:.1%}** of portfolio weight; "
+            f"security-record metadata coverage is **{_number(metadata_coverage):.1%}** and is not a sector measure. "
+            f"Funds represent **{_number(fund_contract.get('portfolio_weight')):.1%}** at fund level; "
+            f"look-through is available for **{_number(fund_contract.get('look_through_available_weight')):.1%}** and unavailable for "
+            f"**{_number(fund_contract.get('look_through_unavailable_weight')):.1%}**. "
+            f"Unknown instrument/classification weight is **{_number(unknown_contract.get('portfolio_weight')):.1%}**. "
+        )
+    elif sector_row_coverage is not None:
+        coverage_note = f"Rendered issuer-sector coverage is **{sector_row_coverage:.1%}** of portfolio weight. "
+    else:
+        coverage_note = "The snapshot does not report classification coverage. "
+    coverage_note += "Fund-level classification is not issuer-sector look-through, so direct holdings may overlap with a fund more than the sector rows reveal."
     sections.append(f"## Coverage limits\n\n{coverage_note}")
     sections.append("**What to verify:** inspect ETF look-through, the covariance date and sample size, and whether the largest shared economic dependencies match how you understand the businesses.")
     return "\n\n".join(sections)
@@ -910,7 +941,9 @@ def compose(intent: str, tool_results: list[dict[str, Any]]) -> str | None:
     if intent == "PORTFOLIO_EVENTS":
         body = _rows(summary.get("events") or [], lambda row: f"**{row.get('title')}** — {row.get('date') or 'date unavailable'}; {str(row.get('event_type')).replace('_', ' ').title()}; affected weight {_number(row.get('affected_portfolio_weight')):.1%}; materiality {row.get('estimated_materiality')}; confidence {row.get('confidence')} [S1]", 12)
         completeness = (summary.get("event_completeness") or {}).get("category_completeness") or {}
-        return f"The stored event calendar contains these upcoming portfolio-relevant events:\n\n{body or 'No covered upcoming event is stored.'}\n\n**Category completeness:** earnings {completeness.get('earnings', 'MISSING')}; macro {completeness.get('macro_calendar', 'MISSING')}; company catalysts {completeness.get('company_catalysts', 'MISSING')}.\n\n**What to verify:** confirm event dates and missing categories before assuming silence means no catalyst exists."
+        limitations = summary.get("provider_limitations") or {}
+        limitation_text = " ".join(str(value) for value in limitations.values() if value)
+        return f"The stored event calendar contains these upcoming portfolio-relevant events:\n\n{body or 'No covered upcoming event is stored.'}\n\n**Category health:** earnings {completeness.get('earnings', 'MISSING')}; macro {completeness.get('macro_calendar', 'MISSING')}; company catalysts {completeness.get('company_catalysts', 'MISSING')}; prediction-market events {completeness.get('prediction_markets', 'MISSING')}.\n\n{limitation_text}\n\n**What to verify:** confirm event dates and missing categories before assuming silence means no catalyst exists."
     if intent == "HIDDEN_RISK":
         return _hidden_risk_answer(summary)
     if intent == "RECOMMENDATION_COUNTERCASE":
@@ -923,7 +956,19 @@ def compose(intent: str, tool_results: list[dict[str, Any]]) -> str | None:
             hurdle = cash.get("cash_hurdle") or {}
             rows = cash.get("candidates") or []
             body = _rows(rows, lambda row: f"**{row.get('candidate')}** — {row.get('dominance_status')}; decision score {_number(row.get('decision_score')):.1f}; concentration {((row.get('diversification_effect') or {}).get('concentration_effect') or '').lower()} [S1]", 5)
-            return f"**Decision: {str(cash.get('recommended_action') or 'NO_CLEAR_EDGE').replace('_', ' ')}.**\n\nCash hurdle: {f'{_number(hurdle.get("annual_yield")):.2%}' if hurdle.get('available') else 'unavailable — no supported stored cash/risk-free yield'} [S1].\n\n{body or 'No candidate has a verified edge over the available comparison set.'}\n\n{cash.get('sizing_guidance')}\n\nEagleEyes does not force deployment and does not invent expected returns, taxes, or trading costs."
+            hurdle_text = (
+                f"{_number(hurdle.get('annual_yield')):.2%} annualized"
+                + (f" from {hurdle.get('source')}" if hurdle.get("source") else "")
+                + (f" as of {hurdle.get('as_of')}" if hurdle.get("as_of") else "")
+                if hurdle.get("available") else
+                "unavailable — no supported stored cash/risk-free yield"
+            )
+            conclusion = str(cash.get('recommended_action') or 'NO_CLEAR_EDGE').replace('_', ' ')
+            qualification = (
+                "The candidates pass the stored multi-factor comparison, but that does **not** prove a risk-adjusted return above the cash hurdle because EagleEyes has no supported expected-return forecast. "
+                if rows and hurdle.get("available") else ""
+            )
+            return f"**Decision: {conclusion}.**\n\nCash hurdle: **{hurdle_text}** [S1].\n\n{body or 'No candidate has a verified edge over the available comparison set.'}\n\n{qualification}{cash.get('sizing_guidance')}\n\nEagleEyes does not force deployment and does not invent expected returns, taxes, or trading costs."
         if intent == "THESIS_REPLACEMENT":
             comparisons = summary.get("replacement_comparisons") or []
             supported = [row for row in comparisons if row.get("replacement_dominance") == "REPLACEMENT_SUPPORTED"]
@@ -966,8 +1011,14 @@ def compose(intent: str, tool_results: list[dict[str, Any]]) -> str | None:
         )
     if intent == "PORTFOLIO_ANALYSIS":
         decision = summary.get("rebalance_decision") or {}
+        targets = sorted(decision.get("target_weights") or [], key=lambda row: abs(_number(row.get("delta"))), reverse=True)
+        target_text = _rows(targets, lambda row: (
+            f"**{row.get('ticker')}** — target {_number(row.get('target_weight')):.1%}; "
+            f"change {_number(row.get('delta')):+.1%}; {row.get('reason') or 'constraint-aware model output'} [S1]"
+        ), 8)
         return (f"**Actionable rebalance: {decision.get('actionable', False)}.** Feasibility: **{decision.get('feasibility', 'NOT_TRACKED')}**; portfolio fingerprint match: **{decision.get('portfolio_fingerprint_match', False)}** [S1]. "
                 f"Expected turnover: **{decision.get('expected_turnover')}**; trading-cost model: **{decision.get('trading_cost_model', 'UNAVAILABLE')}**; tax data available: **{decision.get('tax_data_available', False)}**; tax-aware: **{decision.get('tax_aware', False)}**. "
-                "Target weights and trades are withheld unless feasibility and fingerprint checks pass. A non-tax-aware result is never described as tax optimized.\n\n"
+                + (f"\n\nLargest modeled changes:\n\n{target_text}\n\n" if target_text else "\n\nTarget weights and trades are withheld unless feasibility and fingerprint checks pass. ")
+                + "This result is not tax optimized and has no supported trading-cost estimate.\n\n"
                 "**What to verify:** refresh a compatible optimizer result and provide lot-level cost basis before requesting tax-aware trades.")
     return None

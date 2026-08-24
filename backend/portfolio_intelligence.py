@@ -125,6 +125,6 @@ def build_portfolio_intelligence(*, holdings: list[dict[str, Any]], security_dat
                               "holdings_without_thesis": sorted(set(current_weights) - thesis_tickers)},
             "prediction_market_exposure": prediction, "scenario_exposure": scenarios,
             "upcoming_events": sorted(upcoming, key=lambda row: row.get("portfolio_weight", 0), reverse=True),
-            "coverage": {"classification_weight": sum(w for t,w in current_weights.items() if any(str(r.get("ticker") or "").upper()==t for r in security_data.get("securities", []))),
+            "coverage": {"classification": diagnostics.get("classification_coverage") or {},
                          "fundamental_weight": health["coverage"]},
             "methodology": "portfolio-intelligence-v1: existing holdings, covariance, Phase 5 mappings, stored financial periods, thesis monitor, and verified events."}

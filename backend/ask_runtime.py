@@ -379,6 +379,80 @@ def _collect_tickers(value: Any) -> set[str]:
     return found
 
 
+_SYMBOL_KEYS = {"ticker", "symbol", "candidate", "incumbent", "entity"}
+_SYMBOL_LIST_KEYS = {"holdings", "affected_holdings", "affected_entities", "tickers", "symbols", "compared_incumbents"}
+
+
+def suppress_excluded_symbols(value: Any, excluded_symbols: set[str] | frozenset[str]) -> Any:
+    """Remove complete claims that refer to request-excluded portfolio symbols.
+
+    Request-scoped exclusions are a hard boundary.  A cached read model may be
+    useful after a portfolio change, but no row, cluster, dependency, event, or
+    free-form claim that still names an excluded asset may reach a renderer.
+    """
+    excluded = {str(symbol).upper() for symbol in excluded_symbols if symbol}
+    if not excluded:
+        return value
+
+    def contains_excluded_text(item: Any) -> bool:
+        if not isinstance(item, str):
+            return False
+        tokens = set(re.findall(r"\b[A-Z][A-Z0-9.\-]{0,9}\b", item.upper()))
+        # CASH is both an excluded pseudo-position and ordinary financial
+        # vocabulary.  Structural symbol fields enforce its exclusion; prose
+        # such as "cash hurdle" must remain valid contract metadata.
+        return bool(tokens & (excluded - {"CASH"}))
+
+    def scrub(item: Any, parent_key: str | None = None) -> Any:
+        if isinstance(item, dict):
+            identity = {
+                str(item.get(key) or "").upper()
+                for key in _SYMBOL_KEYS if item.get(key) is not None
+            }
+            if identity & excluded:
+                return None
+            cleaned: dict[str, Any] = {}
+            for key, child in item.items():
+                if key in _SYMBOL_LIST_KEYS and isinstance(child, list):
+                    kept = [entry for entry in child if str(entry).upper() not in excluded]
+                    cleaned[key] = [result for entry in kept if (result := scrub(entry, key)) is not None]
+                    continue
+                result = scrub(child, key)
+                if result is not None:
+                    cleaned[key] = result
+            return cleaned
+        if isinstance(item, list):
+            return [result for child in item if (result := scrub(child, parent_key)) is not None]
+        if isinstance(item, str) and contains_excluded_text(item):
+            # Suppress the entire textual claim.  Editing financial prose in
+            # place could change its meaning and is therefore not permitted.
+            return None
+        return item
+
+    return scrub(value)
+
+
+def enforce_output_symbol_boundary(tool_results: list[dict[str, Any]], context: PortfolioContext | None) -> list[dict[str, Any]]:
+    if not context or not context.excluded_symbols:
+        return tool_results
+    excluded = set(context.excluded_symbols)
+    cleaned = suppress_excluded_symbols(tool_results, excluded)
+    rows = cleaned if isinstance(cleaned, list) else []
+    leaked = _collect_tickers(rows) & excluded
+    if leaked:
+        # Fail closed if a newly introduced schema shape bypasses the scrubber.
+        return [{
+            "tool_name": "output_symbol_validation",
+            "status": "unavailable",
+            "title": "Portfolio result invalidated",
+            "summary": {
+                "message": "A cached result violated the request-scoped portfolio boundary and was suppressed. A compatible rebuild is required.",
+                "invalidated": True,
+            },
+        }]
+    return rows
+
+
 def _collect_candidates(value: Any) -> list[tuple[str, CandidateType]]:
     found: list[tuple[str, CandidateType]] = []
     if isinstance(value, dict):
