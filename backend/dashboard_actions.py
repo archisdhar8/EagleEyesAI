@@ -72,6 +72,7 @@ class DashboardDataBinding(BaseModel):
     metric: str = Field(min_length=2, max_length=80)
     portfolio: str | None = Field(default="current", max_length=120)
     benchmark: str | None = Field(default=None, max_length=10, pattern=r"^[A-Za-z][A-Za-z0-9.-]{0,9}$")
+    benchmarks: list[str] = Field(default_factory=list, max_length=5)
     period: str = Field(default="1Y", pattern=r"^(?:1M|3M|6M|1Y|3Y|5Y|7Y|10Y|20Y)$")
     tickers: list[str] = Field(default_factory=list, max_length=50)
     filters: list[DashboardFilter] = Field(default_factory=list, max_length=12)

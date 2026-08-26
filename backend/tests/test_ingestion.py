@@ -1,6 +1,6 @@
 from backend.ingestion import (
     article_id, normalize_sec_payload, normalize_tiingo_prices, parse_providers,
-    refresh_security_evidence,
+    refresh_news, refresh_security_evidence,
 )
 
 
@@ -80,3 +80,29 @@ def test_security_evidence_isolates_provider_failures(monkeypatch) -> None:
     result = refresh_security_evidence(["MSFT"])
     assert result["providers"] == {"tiingo": 500, "sec": 12}
     assert any("polygon_news refresh failed" in warning for warning in result["warnings"])
+
+
+def test_polygon_news_preserves_provider_insight_instead_of_unknown_zero(monkeypatch) -> None:
+    class Response:
+        ok = True
+        status_code = 200
+        reason = "OK"
+        def json(self):
+            return {"results": [{
+                "published_utc": "2026-08-26T12:00:00Z", "title": "Product update",
+                "description": "A sourced article", "article_url": "https://example.com/news",
+                "publisher": {"name": "Example"},
+                "insights": [{"ticker": "AAPL", "sentiment": "positive", "sentiment_reasoning": "Demand increased."}],
+            }]}
+    class Session:
+        def get(self, *args, **kwargs): return Response()
+    captured = {}
+    monkeypatch.setenv("POLYGON_API_KEY", "configured")
+    monkeypatch.setattr("backend.ingestion.requests.Session", Session)
+    monkeypatch.setattr("backend.ingestion.upsert_news_frame", lambda frame, provider: captured.update(frame=frame, provider=provider) or len(frame))
+    assert refresh_news(["AAPL"]) == 1
+    row = captured["frame"].iloc[0]
+    assert row["sentiment_label"] == "positive"
+    assert row["sentiment_score"] is None
+    assert row["sentiment_reasoning"] == "Demand increased."
+    assert row["provider_insights"][0]["ticker"] == "AAPL"

@@ -944,13 +944,15 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     try {
       const currentUrl=new URL(window.location.href);
       const contextTicker=(currentUrl.searchParams.get("ticker")||"").toUpperCase()||undefined;
+      const researchSection=currentUrl.searchParams.get("research_section")||undefined;
+      const researchCapabilities=(currentUrl.searchParams.get("capabilities")||"").split(",").map(item=>item.trim()).filter(Boolean).slice(0,12);
       const dashboardResourceType=selectedDashboardView?"view":dashboardJob?"draft":undefined;
       const dashboardResourceId=selectedDashboardView||dashboardJob?.id||undefined;
       const fetchStarted=performance.now();
       const response = await apiRequest("/chat/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ request_id:requestId,question: cleanQuestion, conversation_id: researchConversationId, workspace: "research", page_context:{route:`${currentUrl.pathname}${currentUrl.search}`,workspace:tab==="ask"?"ask":"research",entity_type:contextTicker?"security":undefined,ticker:contextTicker,portfolio_id:portfolioId?String(portfolioId):undefined,dashboard_resource_type:dashboardResourceType,dashboard_resource_id:dashboardResourceId,enabled_context:askEnabledContext} }),
+        body: JSON.stringify({ request_id:requestId,question: cleanQuestion, conversation_id: researchConversationId, workspace: "research", page_context:{route:`${currentUrl.pathname}${currentUrl.search}`,workspace:tab==="ask"?"ask":"research",entity_type:contextTicker?"security":undefined,ticker:contextTicker,portfolio_id:portfolioId?String(portfolioId):undefined,research_section:researchSection,research_capabilities:researchCapabilities,dashboard_resource_type:dashboardResourceType,dashboard_resource_id:dashboardResourceId,enabled_context:askEnabledContext} }),
       });
       const responseReceived=performance.now();
       if (!response.ok) throw new Error(await apiError(response, "Unable to answer the research question"));
@@ -1145,7 +1147,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   function navigateExplore(view:ExploreView){setNotice("");setExploreView(view);setTab("explore");window.history.pushState({},"",`/research?view=${view}`);}
   function navigateAdvanced(view:AdvancedView){setNotice("");setAdvancedView(view);setTab("advanced");window.history.pushState({},"",`/advanced?view=${view}`);}
   function navigateLearn(module?:string,lesson?:string){setNotice("");setLearningModule(module);setLearningLesson(lesson);setTab("learn");window.history.pushState({},"",module&&lesson?`/learn/${module}/${lesson}`:"/learn");}
-  function navigateDeepLink(path:string){const url=new URL(path,window.location.origin);const route=resolveAppRoute(url.pathname,url.search);if(!route)return;setNotice("");setTab(route.tab);if(route.exploreView)setExploreView(route.exploreView);if(route.portfolioView)setPortfolioView(route.portfolioView);if(route.advancedView)setAdvancedView(route.advancedView);setLearningModule(route.learningModule);setLearningLesson(route.learningLesson);window.history.pushState({},"",`${url.pathname}${url.search}`);}
+  function navigateDeepLink(path:string){const url=new URL(path,window.location.origin);const route=resolveAppRoute(url.pathname,url.search);if(!route)return;setNotice("");setTab(route.tab);if(route.exploreView)setExploreView(route.exploreView);if(route.portfolioView)setPortfolioView(route.portfolioView);if(route.advancedView)setAdvancedView(route.advancedView);if(route.tab==="ask"){const suggested=url.searchParams.get("prompt");if(suggested)setResearchChatQuestion(suggested);}setLearningModule(route.learningModule);setLearningLesson(route.learningLesson);window.history.pushState({},"",`${url.pathname}${url.search}${url.hash}`);if(url.hash)window.requestAnimationFrame(()=>document.querySelector(url.hash)?.scrollIntoView({behavior:"smooth",block:"start"}));}
 
   return (
     <AppShell activeTab={tab} density={preferences.density} connected={connected} connectionChecked={connectionChecked} dark={dark} email={email} freshness={macro.as_of || "Awaiting refresh"} presentationLevel={preferences.presentation_level} onNavigate={navigate} onPresentationLevel={level=>void savePreferences({...preferences,presentation_level:level})} onToggleTheme={toggleTheme} onSignOut={onSignOut} onLearnConcept={navigateLearn} onDismissNotice={()=>setNotice("")} status={busy} notice={notice}

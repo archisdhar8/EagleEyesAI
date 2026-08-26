@@ -48,6 +48,18 @@ def test_create_binding_preserves_period_and_benchmark() -> None:
     assert request.binding.benchmark == "SPY"
 
 
+def test_performed_wording_preserves_performance_metric_and_benchmark_alias() -> None:
+    request = interpret_dashboard_request(
+        "Show how my portfolio performed versus the S&P 500 and Nasdaq in a readable table and chart.", []
+    )
+    assert request.intent == DashboardChatIntent.CREATE_WIDGET
+    assert request.widget_type == "portfolio_performance"
+    assert request.visualization == "line_chart"
+    assert request.binding is not None and request.binding.benchmark == "SPY"
+    assert request.binding.benchmarks == ["SPY", "QQQ"]
+    assert request.clarification is None
+
+
 @pytest.mark.parametrize(
     "question,intent,expected",
     [

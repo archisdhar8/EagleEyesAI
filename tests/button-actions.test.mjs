@@ -29,8 +29,9 @@ test("stock research search starts ready instead of blocking on an empty univers
   assert.match(research, /useState\(Boolean\(deepLinkedTicker\)\)/);
   assert.match(research, /AbortController/);
   assert.match(research, /Choose a holding or search a company/);
+  assert.match(research, /\/research\/security\/\$\{encodeURIComponent\(ticker\)\}\/header/);
   assert.match(research, /\/research\/security\/\$\{encodeURIComponent\(ticker\)\}\/overview/);
-  assert.match(research, /Provider refreshes happen separately/);
+  assert.match(research, /Identity and market data are ready/);
 });
 
 test("critical portfolio and analysis actions remain wired", async () => {
@@ -113,30 +114,29 @@ test("default research presentation avoids false precision", async () => {
   const source = await dashboardSurface();
   const today = await readFile(todayPath, "utf8");
   assert.match(today, /Preparing the first portfolio snapshot/);
-  assert.match(source, /Independent evidence dimensions/);
-  assert.match(source, /not forced into one 100% distribution/);
+  assert.match(source, /Revenue segments/);
+  assert.match(source, /Historical analysis is shown only for P\/E/);
   assert.match(source, /One clear view of the evidence/);
   assert.match(source, /Stock, ETF, or company/);
-  assert.match(source, /Partial evidence/);
-  assert.match(source, /Bear, base, and bull cases/);
+  assert.match(source, /INSUFFICIENT_EVIDENCE/);
+  assert.match(source, /Bull case, bear case/);
   assert.match(source, /What kind of market are we in\?/);
   assert.match(source, /Similar historical market states/);
   assert.match(source, /Fundamentals/);
   assert.match(source, /Valuation/);
   assert.match(source, /Portfolio fit/);
-  assert.match(source, /What would disprove it/);
-  assert.match(source, /Generated research case; not saved as your belief/);
+  assert.match(source, /What would invalidate it/);
+  assert.match(source, /Generated research cases are model output, not a saved belief/);
 });
 
 test("research search explains filters, missing data, ETF holdings, and valuation logic", async () => {
   const research = await readFile(researchPath, "utf8");
   for (const copy of [
     "AAPL or Apple",
-    "Partial evidence",
-    "Missing:",
-    "Reported earnings",
-    "Forward statistics",
-    "Evidence through",
+    "INSUFFICIENT_EVIDENCE",
+    "Reported history",
+    "Forward consensus data unavailable under current entitlement",
+    "Source & method",
   ]) assert.match(research, new RegExp(copy));
 });
 

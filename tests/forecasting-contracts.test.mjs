@@ -13,9 +13,10 @@ test("market expectations keep market and user probabilities distinct", () => {
   assert.match(workspace, /percentage points/);
 });
 
-test("company research exposes mapped forward-looking context", () => {
-  assert.match(research, /Forward statistics/);
-  assert.match(research, /Prediction-market evidence is shown only when a verified company mapping exists/);
+test("company research preserves honest forward-looking availability", () => {
+  assert.match(research, /Forward consensus data unavailable under current entitlement/);
+  assert.match(research, /What moves it\?/);
+  assert.match(research, /Upcoming catalysts/);
   assert.match(backend, /forecasting\.build_intelligence\(user\.id, ticker=normalized/);
 });
 

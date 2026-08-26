@@ -40,6 +40,7 @@ export function AskPage({ messages, question, setQuestion, onSend, loading, cont
   const activeView = dashboardProps.views.find(view => view.id === dashboardProps.selectedView);
   const analysisLabel = activeView?.name || dashboardProps.job?.specification?.title || dashboardArtifact?.label || "Analysis";
   const canvasOpen = canvasState === "open";
+  const researchSection = typeof window === "undefined" ? null : new URL(window.location.href).searchParams.get("research_section");
 
   useEffect(() => {
     const latest = messages.at(-1);
@@ -91,6 +92,7 @@ export function AskPage({ messages, question, setQuestion, onSend, loading, cont
         </label>)}
       </div>
       <div className="ask-header-actions">
+        {contextTicker && researchSection && <a className="ask-open-analysis" href={`/research?ticker=${encodeURIComponent(contextTicker)}#${encodeURIComponent(researchSection === "market_data" ? "technicals" : researchSection === "portfolio_fit" ? "portfolio" : researchSection === "catalysts_risks" ? "catalysts" : researchSection)}`}>Back to Research ↩</a>}
         {hasAnalysis && !canvasOpen && <button className="ask-open-analysis" onClick={openCanvas}>{analysisLabel} ↗</button>}
         <button aria-expanded={historyOpen} aria-controls="ask-history-drawer" onClick={() => setHistoryOpen(value => !value)}>History</button>
         <button onClick={workspaceControls.onNew}>New chat</button>

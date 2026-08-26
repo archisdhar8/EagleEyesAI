@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Any
 
@@ -92,6 +93,23 @@ DEPENDENCY_MATRIX: dict[str, DependencyClass] = {
 
 
 _REQUESTED_CLAIMS = {
+    "PORTFOLIO_PERFORMANCE": ["hypothetical portfolio return versus SPY and Nasdaq 100", "actual-account limitation"],
+    "GAIN_LOSS_ATTRIBUTION": ["holding-level unrealized gain and loss contribution", "realized-return limitation"],
+    "RISK_EFFICIENCY": ["risk concentration relative to saved tolerance", "expected-return limitation"],
+    "DIVERSIFICATION": ["company, sector, strategy, and correlation diversification"],
+    "OVERLAP_RISK": ["correlated clusters and shared economic dependencies"],
+    "DOWNSIDE_CAPACITY": ["modeled loss and drawdown range"],
+    "POSITION_SIZING": ["position weights versus saved policy maximum"],
+    "CASH_RESERVE": ["saved cash floor and target allocation"],
+    "SECTOR_SHOCK": ["first-order technology-sector shock estimate"],
+    "DECISION_VS_INDEX": ["decision performance after taxes and fees"],
+    "THESIS_STRENGTH": ["saved thesis state and objective evidence strength"],
+    "POSITION_ACTION_REVIEW": ["evidence-based review queue without trade execution"],
+    "AVERAGING_DOWN_REVIEW": ["named-position thesis and price evidence"],
+    "TARGET_PRICE_REVIEW": ["named-stock valuation evidence and price bands"],
+    "OPTIONS_COSTS": ["option premium, spread, commission, and theta costs"],
+    "OPTIONS_EXPIRY": ["expiration versus expected catalyst timing"],
+    "TRADE_PLAN_METRICS": ["expected return, maximum loss, breakeven, and exit plan"],
     "OPPORTUNITY_RANKING": ["eligible opportunity ranking", "supporting evidence"],
     "THESIS_REPLACEMENT": ["personal weakest thesis", "objective weakest setup", "replacement evidence"],
     "PORTFOLIO_CHANGE": ["material change since compatible baseline"],
@@ -118,11 +136,49 @@ def _num(value: Any) -> float | None:
 
 
 def _summaries(tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [data for row in tool_results if isinstance((data := canonical_data(row) or {}), dict)]
+    output: list[dict[str, Any]] = []
+    for row in tool_results:
+        data = canonical_data(row)
+        if not isinstance(data, dict) or not data:
+            data = row.get("summary")
+        if isinstance(data, dict):
+            output.append(data)
+    return output
 
 
 def _first_summary(tool_results: list[dict[str, Any]]) -> dict[str, Any]:
     return next(iter(_summaries(tool_results)), {})
+
+
+def _summary_for(tool_results: list[dict[str, Any]], *tool_names: str) -> dict[str, Any]:
+    wanted = set(tool_names)
+    for row in tool_results:
+        if str(row.get("tool_name") or "") not in wanted:
+            continue
+        data = canonical_data(row)
+        if isinstance(data, dict) and data:
+            return data
+        if isinstance(row.get("summary"), dict):
+            return row["summary"]
+    return _first_summary(tool_results)
+
+
+def _pct(value: Any) -> str:
+    number = _num(value)
+    return "unavailable" if number is None else f"{number:.1%}"
+
+
+def _money(value: Any) -> str:
+    number = _num(value)
+    return "unavailable" if number is None else f"${number:,.0f}"
+
+
+def _markdown_table(headers: list[str], rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    return "| " + " | ".join(headers) + " |\n| " + " | ".join("---" for _ in headers) + " |\n" + "\n".join(
+        "| " + " | ".join(row) + " |" for row in rows
+    )
 
 
 def _job_rows(tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -224,7 +280,378 @@ def compose_supported_answer(
     unsupported: list[str] = []
     pending = [str(row.get("capability") or "calculation") for row in jobs]
 
-    if intent == "OPPORTUNITY_RANKING" and not summary.get("candidates"):
+    if intent == "PORTFOLIO_PERFORMANCE":
+        backtest = _summary_for(tool_results, "portfolio_backtest")
+        results = list(backtest.get("results") or [])
+        if results:
+            labels = {
+                "current_portfolio": "Current portfolio",
+                "benchmark_spy": "S&P 500 (SPY)",
+                "benchmark_relevant_qqq": "Nasdaq 100 (QQQ)",
+            }
+            rows = [[labels.get(str(row.get("key")), str(row.get("label") or row.get("key"))),
+                     _pct(row.get("total_return")), _pct(row.get("annual_return")), _pct(row.get("volatility")),
+                     _pct(row.get("maximum_drawdown")),
+                     f"{_num(row.get('ending_growth_of_one')):.2f}×" if _num(row.get("ending_growth_of_one")) is not None else "unavailable"]
+                    for row in results if str(row.get("key")) in labels]
+            answer = "## Hypothetical benchmark comparison\n\n" + _markdown_table(
+                ["Series", "Total return", "Annualized return", "Volatility", "Max drawdown", "Growth of $1"], rows,
+            )
+            period = ""
+            if backtest.get("period_start") and backtest.get("period_end"):
+                period = f" The common displayed period is **{backtest.get('period_start')} through {backtest.get('period_end')}**."
+            answer += "\n\nThis reconstructs the **current holdings and current weights** over the common stored history." + period + " It is not your actual account return because deposits, withdrawals, fills, dividends, taxes, and fees are not fully represented.\n\n**To calculate your actual return:** reply with or import dated transactions and external cash flows; EagleEyes can then calculate time-weighted and money-weighted performance without treating today's holdings as historical holdings."
+            supported.append(SupportedClaim(claim="Current-weight hypothetical portfolio backtest versus stored benchmarks"))
+            unsupported.append("Actual account performance without a complete transaction and valuation ledger")
+        else:
+            answer = (
+                "I cannot yet state your actual performance versus the S&P 500 or Nasdaq because EagleEyes does not have a complete transaction-and-cash-flow ledger for this account. "
+                "A current-weight hypothetical backtest against **SPY and QQQ** has been queued; it will compare the same common history and disclose drawdown and volatility.\n\n"
+                "**Needed for actual performance:** dated deposits and withdrawals, fills, dividends, fees, and account valuations. Current weights alone cannot reconstruct what you personally earned."
+            )
+            pending.append("current-weight benchmark backtest")
+            unsupported.append("Actual account return versus SPY and QQQ")
+            partial.append(SupportedClaim(claim="Specific benchmark calculation and missing actual-account inputs identified"))
+    elif intent == "GAIN_LOSS_ATTRIBUTION":
+        risk_summary = _summary_for(tool_results, "portfolio_risk")
+        positions = list(risk_summary.get("positions") or [])
+        known = [row for row in positions if _num(row.get("unrealized_gain_loss")) is not None]
+        if known:
+            winners = sorted((row for row in known if _num(row.get("unrealized_gain_loss")) >= 0), key=lambda row: _num(row.get("unrealized_gain_loss")) or 0, reverse=True)[:5]
+            losers = sorted((row for row in known if _num(row.get("unrealized_gain_loss")) < 0), key=lambda row: _num(row.get("unrealized_gain_loss")) or 0)[:5]
+            table_rows = [[str(row.get("ticker")), _money(row.get("unrealized_gain_loss")), _pct(row.get("weight")), "Gain" if _num(row.get("unrealized_gain_loss")) >= 0 else "Loss"] for row in [*winners, *losers]]
+            answer = "## Largest stored unrealized contributors\n\n" + _markdown_table(["Holding", "Unrealized P/L", "Current weight", "Direction"], table_rows)
+            answer += "\n\nThis uses saved aggregate cost basis and current market value. It excludes realized gains, dividends, deposits/withdrawals, taxes, and fees, so it is **not total-return attribution**."
+            supported.append(SupportedClaim(claim="Holding-level unrealized gain/loss from saved cost basis"))
+            unsupported.append("Complete total-return contribution without transaction history")
+        else:
+            largest = sorted(positions, key=lambda row: _num(row.get("weight")) or 0, reverse=True)[:5]
+            answer = "EagleEyes cannot truthfully rank gain and loss contributors because the saved holdings do not contain enough cost basis or transaction history. Current influence by portfolio weight is:\n\n" + "\n".join(f"- **{row.get('ticker')}** — {_pct(row.get('weight'))}" for row in largest)
+            answer += "\n\nAdd cost basis for unrealized P/L; add dated fills, cash flows, dividends, and fees for true contribution analysis."
+            partial.append(SupportedClaim(claim="Current position influence shown while attribution inputs are missing"))
+            unsupported.append("Gain/loss contribution without cost basis and transactions")
+    elif intent == "RISK_EFFICIENCY":
+        risk_summary = _summary_for(tool_results, "portfolio_risk")
+        backtest = _summary_for(tool_results, "portfolio_backtest")
+        profile = risk_summary.get("profile") or {}
+        contributors = list(risk_summary.get("risk_contributors") or [])
+        if not contributors:
+            contributors = list(risk_summary.get("positions") or [])
+        leaders = sorted(contributors, key=lambda row: _num(row.get("risk_contribution")) or _num(row.get("weight")) or 0, reverse=True)[:5]
+        performance_rows = list(backtest.get("results") or [])
+        comparison_rows = []
+        for row in performance_rows:
+            annual, volatility = _num(row.get("annual_return")), _num(row.get("volatility"))
+            comparison_rows.append([
+                str(row.get("label") or row.get("key")), _pct(annual), _pct(volatility),
+                _pct(row.get("maximum_drawdown")), f"{annual / volatility:.2f}" if annual is not None and volatility and volatility > 0 else "unavailable",
+            ])
+        answer = (
+            "## What the stored evidence says\n\n"
+            f"Your saved risk tolerance is **{profile.get('risk_tolerance', 'not saved')}/10** and loss capacity is **{profile.get('loss_capacity', 'not saved')}/10**."
+        )
+        if comparison_rows:
+            answer += " The current-weight historical proxy is:\n\n" + _markdown_table(
+                ["Series", "Annualized return", "Volatility", "Max drawdown", "Return / volatility"], comparison_rows,
+            )
+            answer += "\n\nThe last column is a simple historical return-to-volatility ratio, not a forecast or a Sharpe ratio. It lets you see whether the current mix delivered more or less historical return per unit of volatility than SPY and QQQ over the same window."
+        answer += "\n\n## Largest current risk/influence concentrations\n\n" + "\n".join(
+            f"- **{row.get('ticker')}** — " + (f"modeled risk contribution {_pct(row.get('risk_contribution'))}" if _num(row.get("risk_contribution")) is not None else f"portfolio weight {_pct(row.get('weight'))}") for row in leaders
+        )
+        answer += "\n\nThis can flag inefficient-looking historical risk and concentration, but it cannot prove a forward-looking optimum without expected-return assumptions. **Next question:** should EagleEyes optimize for lower drawdown, lower volatility, or a minimum return target?"
+        partial.append(SupportedClaim(claim="Saved risk preference and current risk concentration"))
+        unsupported.append("Risk efficiency without a supported expected-return model")
+    elif intent in {"DIVERSIFICATION", "OVERLAP_RISK"}:
+        intelligence = _summary_for(tool_results, "portfolio_intelligence")
+        concentration = intelligence.get("concentration") or {}
+        positions = list(concentration.get("positions") or intelligence.get("all_holdings") or [])
+        sectors = list(concentration.get("sector") or [])
+        correlation = intelligence.get("correlation") or {}
+        clusters = list(correlation.get("clusters") or [])
+        dependencies = list(intelligence.get("economic_dependencies") or [])
+        answer = "## Diversification and overlapping bets\n\n"
+        if concentration.get("effective_holdings") is not None:
+            answer += f"The saved weights behave like roughly **{_num(concentration.get('effective_holdings')):.1f} equally sized holdings**.\n\n"
+        if positions:
+            answer += "**Largest companies/funds**\n\n" + "\n".join(f"- **{row.get('ticker')}** — {_pct(row.get('weight'))}" for row in positions[:6]) + "\n\n"
+        if sectors:
+            answer += "**Largest classified sectors**\n\n" + "\n".join(f"- **{row.get('sector')}** — {_pct(row.get('weight'))}" for row in sectors[:5]) + "\n\n"
+        if clusters:
+            answer += "**Holdings behaving like the same bet**\n\n" + "\n".join(
+                f"- **{', '.join(row.get('holdings') or [])}** — {_pct(row.get('portfolio_weight'))} combined" +
+                (f"; strongest pair correlation {_num((row.get('strongest_pair') or {}).get('correlation')):.2f}" if _num((row.get('strongest_pair') or {}).get('correlation')) is not None else "")
+                for row in clusters[:4]
+            ) + "\n\n"
+        if dependencies:
+            answer += "**Shared economic drivers**\n\n" + "\n".join(f"- **{str(row.get('factor')).replace('_', ' ').title()}** — {_pct(row.get('mapped_portfolio_weight'))} mapped across {', '.join((row.get('holdings') or [])[:8])}" for row in dependencies[:5])
+        if not any((positions, sectors, clusters, dependencies)):
+            answer += "The cached intelligence result has no usable position, sector, correlation, or dependency rows. Refresh portfolio intelligence before drawing a diversification conclusion."
+            unsupported.append("Diversification conclusion without portfolio-intelligence coverage")
+        else:
+            supported.append(SupportedClaim(claim="Company, sector, correlation-cluster, and economic-dependency diversification"))
+    elif intent == "DOWNSIDE_CAPACITY":
+        scenario = _summary_for(tool_results, "portfolio_scenario", "portfolio_decision_lab")
+        simulation = scenario.get("latest_simulation") or scenario
+        outcomes = list(simulation.get("outcomes") or simulation.get("strategies") or [])
+        current = next((row for row in outcomes if row.get("strategy_key") in {"current", "current_portfolio"} or row.get("key") == "current_portfolio"), None)
+        if current:
+            drawdowns = current.get("drawdown_percentiles") or {}
+            answer = (
+                "The latest compatible model does not produce one certain loss percentage; it produces a distribution. "
+                f"For the current portfolio, probability of finishing below the starting value is **{_pct(current.get('probability_of_loss'))}** and the disclosed adverse drawdown estimate is **{_pct(drawdowns.get('p10') if drawdowns else current.get('modeled_drawdown'))}**.\n\n"
+                "This is a modeled historical/simulation result, not a guarantee or a worst-case bound. A crisis can exceed the modeled range."
+            )
+            supported.append(SupportedClaim(claim="Latest compatible modeled loss probability and adverse drawdown"))
+        else:
+            answer = "No compatible loss-distribution result is available yet, so EagleEyes will not invent a percentage. A canonical scenario simulation has been queued. Until it completes, current weights and historical drawdowns can identify exposure but cannot establish a major-decline loss estimate."
+            pending.append("portfolio loss-distribution simulation")
+            unsupported.append("Major-decline loss percentage before compatible simulation")
+            partial.append(SupportedClaim(claim="Specific pending calculation and limitation identified"))
+    elif intent == "POSITION_SIZING":
+        risk_summary = _summary_for(tool_results, "portfolio_risk")
+        positions = list(risk_summary.get("positions") or [])
+        policy = risk_summary.get("policy") or {}
+        limit = _num(policy.get("max_single_stock_weight"))
+        if limit is None:
+            answer = "No saved single-position maximum is available, so EagleEyes cannot label a position too large relative to your policy. The largest current positions are:\n\n" + "\n".join(f"- **{row.get('ticker')}** — {_pct(row.get('weight'))}" for row in positions[:8])
+            answer += "\n\nSave or approve a maximum single-stock weight to turn this into a policy-breach test."
+            partial.append(SupportedClaim(claim="Largest current position weights"))
+        else:
+            oversized = [row for row in positions if (_num(row.get("weight")) or 0) > limit]
+            answer = f"Your saved policy maximum is **{limit:.1%} per position** ({policy.get('status') or 'status unavailable'}).\n\n"
+            answer += _markdown_table(["Position", "Weight", "Above limit"], [[str(row.get("ticker")), _pct(row.get("weight")), f"{((_num(row.get('weight')) or 0)-limit):.1%}"] for row in oversized]) if oversized else "No current position exceeds that saved maximum."
+            answer += "\n\nFund ETFs may require look-through analysis before treating fund-level weight as single-company exposure."
+            supported.append(SupportedClaim(claim="Position weights compared with saved policy maximum"))
+    elif intent == "CASH_RESERVE":
+        risk_summary = _summary_for(tool_results, "portfolio_risk")
+        policy = risk_summary.get("policy") or {}
+        profile = risk_summary.get("profile") or {}
+        floor = _num(policy.get("minimum_cash_reserve"))
+        target = _num((policy.get("target_allocation") or {}).get("cash"))
+        answer = "## Saved cash framework\n\n"
+        answer += f"- Minimum cash reserve: **{_money(floor)}**\n" if floor is not None else "- Minimum cash reserve: **not saved**\n"
+        answer += f"- Target portfolio cash allocation: **{_pct(target)}**\n" if target is not None else "- Target portfolio cash allocation: **not saved**\n"
+        answer += f"- Saved annual withdrawals: **{_money(profile.get('annual_withdrawal'))}**\n"
+        answer += f"- Saved annual income need: **{_money(profile.get('annual_income_need'))}**\n\n"
+        answer += "Use the greater of the approved dollar floor, near-term spending/liquidity needs, and the amount required to keep the portfolio inside its target range. EagleEyes cannot personalize an emergency reserve further without monthly essential spending and near-term purchase timing."
+        supported.append(SupportedClaim(claim="Saved cash floor, allocation target, and withdrawal context"))
+    elif intent == "SECTOR_SHOCK":
+        intelligence = _summary_for(tool_results, "portfolio_intelligence")
+        concentration = intelligence.get("concentration") or {}
+        sectors = list(concentration.get("sector") or [])
+        technology = sum((_num(row.get("weight")) or 0) for row in sectors if "tech" in str(row.get("sector") or "").lower())
+        magnitude_match = re.search(r"(\d+(?:\.\d+)?)%", question)
+        magnitude = float(magnitude_match.group(1)) / 100 if magnitude_match else .20
+        if technology > 0:
+            first_order = -(technology * magnitude)
+            answer = (
+                f"Classified technology exposure is **{technology:.1%}**. A **{magnitude:.0%}** decline applied only to that mapped sleeve implies an immediate first-order portfolio effect of about **{first_order:.1%}**.\n\n"
+                "That is arithmetic exposure mapping—not a stress-test forecast. It excludes ETF look-through gaps, cross-sector spillovers, changing correlations, options, and any recovery. A full scenario model may show a larger or smaller result."
+            )
+            supported.append(SupportedClaim(claim="First-order technology-sector exposure shock"))
+        else:
+            answer = "Technology-sector weight is not sufficiently classified in the current intelligence snapshot, so EagleEyes cannot multiply a 20% sector move into a defensible portfolio loss. Refresh classifications and ETF look-through first."
+            unsupported.append("Technology shock estimate without classified exposure")
+            partial.append(SupportedClaim(claim="Classification prerequisite for the requested shock identified"))
+    elif intent == "DECISION_VS_INDEX":
+        backtest = _summary_for(tool_results, "portfolio_backtest")
+        results = list(backtest.get("results") or [])
+        current = next((row for row in results if row.get("key") == "current_portfolio"), None)
+        benchmarks = [row for row in results if str(row.get("key") or "").startswith("benchmark_")]
+        answer = "## Best available gross proxy\n\n"
+        if current and benchmarks:
+            rows = []
+            current_return = _num(current.get("total_return"))
+            for row in benchmarks:
+                benchmark_return = _num(row.get("total_return"))
+                gap = current_return - benchmark_return if current_return is not None and benchmark_return is not None else None
+                rows.append([str(row.get("label") or row.get("key")), _pct(current_return), _pct(benchmark_return), _pct(gap)])
+            answer += _markdown_table(["Benchmark", "Current-weight portfolio", "Benchmark", "Gross gap"], rows)
+            positive_gaps = [(_num(current.get("total_return")) or 0) - (_num(row.get("total_return")) or 0) for row in benchmarks]
+            answer += "\n\nThe gross gap is also the approximate **maximum combined tax, fee, timing, and trading drag** the portfolio could absorb before losing that historical lead; a negative gap means there was no gross cushion in this proxy."
+            supported.append(SupportedClaim(claim="Current-weight gross historical comparison versus SPY and QQQ"))
+        else:
+            answer += "The current-weight SPY/QQQ comparison could not be calculated from the stored common price window."
+        answer += (
+            "\n\nThis is not your realized decision performance: today's holdings create survivorship and timing bias. "
+            "For the after-tax, after-fee answer, EagleEyes still needs dated buys, sells, deposits, withdrawals, dividends, realized tax lots, tax rates by account, commissions, and spread/slippage estimates.\n\n"
+            "**Next step:** import that ledger, or reply with the evaluation period, benchmark, and estimated all-in annual drag to run an explicit approximation."
+        )
+        unsupported.append("After-tax, after-fee decision attribution without a complete ledger")
+        partial.append(SupportedClaim(claim="Specific ledger requirements and current-weight backtest limitation identified"))
+    elif intent == "THESIS_STRENGTH":
+        thesis = _summary_for(tool_results, "thesis_invalidation", "thesis_monitor")
+        saved = list(thesis.get("saved_theses") or [])
+        if saved:
+            rows = [[str(row.get("ticker")), str(row.get("status") or "saved"), str((row.get("monitor") or {}).get("overall_status") or "not evaluated")] for row in saved[:15]]
+            answer = "## Saved thesis status\n\n" + _markdown_table(["Holding", "Thesis", "Monitor"], rows)
+            answer += "\n\nA strong thesis requires both a saved claim and current supporting evidence; the monitor status is not a return forecast."
+            supported.append(SupportedClaim(claim="Saved thesis and monitor status"))
+        else:
+            largest = sorted(
+                list(thesis.get("largest_positions") or []),
+                key=lambda row: _near_score(row, ("health_score", "fundamental_score", "valuation_score", "momentum_score")),
+                reverse=True,
+            )
+            answer = "No personal theses are saved, so the honest substitute is an **objective evidence-strength ranking**:\n\n" + "\n".join(f"- {_holding_line(row)}" for row in largest[:10])
+            answer += "\n\nThese leaders have stronger stored evidence; that does not prove your original investment claim. **Reply with one holding and one sentence explaining why you own it** (for example, `MSFT: durable cloud growth with stable margins`). EagleEyes can turn that into a draft thesis with supporting evidence and explicit invalidation tests for you to review—not silently save it."
+            partial.append(SupportedClaim(claim="Objective holding evidence while personal thesis state is absent"))
+            unsupported.append("Personal thesis-strength ranking without saved theses")
+    elif intent == "POSITION_ACTION_REVIEW":
+        overview = _summary_for(tool_results, "portfolio_overview")
+        candidates = list(overview.get("candidates") or overview.get("opportunities") or [])
+        holdings = list(overview.get("all_holdings") or overview.get("positions") or [])
+        ranked = candidates or sorted(holdings, key=lambda row: _num(row.get("health_score")) or _num(row.get("opportunity_score")) or -1, reverse=True)
+        if ranked:
+            answer = "EagleEyes cannot issue automatic buy/sell instructions, but it can create a review queue from current verified evidence.\n\n" + _markdown_table(
+                ["Holding", "Evidence score", "Review category", "Reason"],
+                [[str(row.get("ticker")), f"{(_num(row.get('opportunity_score')) or _num(row.get('health_score')) or 0):.1f}",
+                  "Hold / verify" if index < 5 else "Reduce / exit review",
+                  "; ".join((row.get("opposing_evidence") or row.get("risk_flags") or [])[:2]) or "Confirm thesis, valuation, sizing, and taxes"]
+                 for index, row in enumerate(ranked[:10])],
+            )
+            answer += "\n\nThese are research categories, not trade instructions. A reduce/exit decision still requires saved thesis breakers, tax lots, transaction costs, and an approved policy."
+            partial.append(SupportedClaim(claim="Evidence-based position review queue"))
+        else:
+            answer = "No eligible portfolio ranking is available, so no position can be placed into a buy/hold/reduce/exit review category. Refresh the portfolio overview and save thesis/policy context first."
+            unsupported.append("Position action review without eligible portfolio evidence")
+    elif intent == "AVERAGING_DOWN_REVIEW":
+        ticker = next((str(row.get("ticker")) for row in tool_results if row.get("ticker")), None)
+        company = _summary_for(tool_results, "company_analysis")
+        if not ticker and context:
+            ticker = None
+        if not ticker and not company.get("ticker"):
+            risk = _summary_for(tool_results, "portfolio_risk")
+            losing = sorted(
+                [row for row in risk.get("positions") or [] if (_num(row.get("unrealized_gain_loss")) or 0) < 0],
+                key=lambda row: _num(row.get("unrealized_gain_loss")) or 0,
+            )
+            answer = "## Current losing positions with stored cost basis\n\n"
+            if losing:
+                answer += _markdown_table(
+                    ["Holding", "Unrealized P/L", "Current weight"],
+                    [[str(row.get("ticker")), _money(row.get("unrealized_gain_loss")), _pct(row.get("weight"))] for row in losing[:10]],
+                )
+            else:
+                answer += "No current position has a negative stored unrealized P/L, or cost basis is missing."
+            answer += "\n\nA loss alone is not a reason to add. Name one ticker and the proposed dollar amount. EagleEyes will test: thesis/breaker status, evidence change since purchase, current valuation, resulting weight versus policy, and whether the lower price improved expected payoff rather than merely lowering average cost."
+            user_gaps.append("A losing-position ticker and proposed add size")
+            unsupported.append("Averaging-down decision without a named position")
+            partial.append(SupportedClaim(claim="Minimum clarification and decision criteria identified"))
+        else:
+            name = ticker or str(company.get("ticker"))
+            answer = f"For **{name}**, adding is justified only if the original thesis remains supported, no breaker has triggered, valuation has improved on unchanged or stronger fundamentals, and the resulting position stays inside policy limits. A lower price by itself is not evidence.\n\nCurrent stored company evidence was retrieved, but a personal decision still requires the purchase thesis, cost basis, and proposed add size."
+            partial.append(SupportedClaim(claim=f"Objective averaging-down decision framework for {name}"))
+    elif intent == "TARGET_PRICE_REVIEW":
+        company = _summary_for(tool_results, "company_analysis")
+        ticker = str(company.get("ticker") or "")
+        if not ticker:
+            overview = _summary_for(tool_results, "portfolio_overview")
+            candidates = list(overview.get("candidates") or overview.get("opportunities") or overview.get("all_holdings") or [])
+            candidates = sorted(
+                candidates,
+                key=lambda row: _num(row.get("valuation_score")) or _num(row.get("valuation")) or -1,
+                reverse=True,
+            )
+            answer = "## Relative valuation starting point\n\n"
+            if candidates:
+                answer += _markdown_table(
+                    ["Holding", "Stored valuation score", "Evidence score"],
+                    [[str(row.get("ticker")), f"{(_num(row.get('valuation_score')) or _num(row.get('valuation')) or 0):.1f}", f"{(_num(row.get('health_score')) or _num(row.get('opportunity_score')) or _num(row.get('decision_score')) or 0):.1f}"] for row in candidates[:8]],
+                )
+                answer += "\n\nA higher stored valuation score means relatively more supportive valuation evidence; it is not a dollar price target."
+            answer += "\n\nName one ticker and choose a method—`earnings multiple`, `free-cash-flow yield`, or `DCF`. If you do not have assumptions, EagleEyes can show a labeled sensitivity table rather than one false-precision target."
+            user_gaps.append("A stock ticker")
+            unsupported.append("Target-price bands without a named stock")
+            partial.append(SupportedClaim(claim="Company-specific target-price prerequisites identified"))
+        else:
+            price_state = company.get("price_state") or {}
+            valuation = company.get("valuation") or {}
+            price = _num(price_state.get("price") or price_state.get("current_price") or company.get("price"))
+            valuation_score = _num(valuation.get("score") or company.get("valuation_score"))
+            answer = f"## {ticker} valuation starting point\n\n- Stored price: **{_money(price)}**\n- Relative valuation score: **{valuation_score:.1f}/100**" if valuation_score is not None else f"## {ticker} valuation starting point\n\n- Stored price: **{_money(price)}**\n- Relative valuation score: **unavailable**"
+            answer += "\n\nChoose `earnings multiple`, `free-cash-flow yield`, or `DCF`, and provide your normalized earnings/cash flow plus growth and margin-of-safety assumptions. EagleEyes will return attractive/fair/overvalued bands as a sensitivity table; it will not disguise unstated assumptions as a verified target."
+            partial.append(SupportedClaim(claim=f"Stored relative valuation evidence for {ticker}"))
+            unsupported.append("Intrinsic-value price bands without a verified valuation model")
+    elif intent in {"OPTIONS_COSTS", "OPTIONS_EXPIRY", "TRADE_PLAN_METRICS"}:
+        missing_by_intent = {
+            "OPTIONS_COSTS": "option contracts, fills, bid/ask quotes at execution, commissions, current marks, implied volatility, and theta/Greeks",
+            "OPTIONS_EXPIRY": "option symbol, strike, expiration, position direction, expected catalyst date, implied volatility, and expected-move horizon",
+            "TRADE_PLAN_METRICS": "each trade's legs, quantities, fills/credits, expiration, underlying price, commissions, thesis, and exit rules",
+        }
+        label = {"OPTIONS_COSTS": "option-cost", "OPTIONS_EXPIRY": "expiration-fit", "TRADE_PLAN_METRICS": "trade-plan"}[intent]
+        risk = _summary_for(tool_results, "portfolio_risk")
+        position_count = len(risk.get("positions") or [])
+        answer = f"The saved portfolio contains **{position_count} weighted positions**, but none has the contract-level fields needed for a verified {label} calculation.\n\n"
+        if intent == "OPTIONS_COSTS":
+            contracts_match = re.search(r"\b(?:long|short|contracts?)\s+(\d+)\b|\b(\d+)\s+contracts?\b", question, re.I)
+            contracts = int(next((value for value in (contracts_match.groups() if contracts_match else ()) if value), "0"))
+            def option_number(field: str) -> float | None:
+                match = re.search(rf"\b{field}\s*[:=]?\s*(-?\d+(?:\.\d+)?)", question, re.I)
+                return float(match.group(1)) if match else None
+            fill, bid, ask, commission, theta = (option_number(field) for field in ("fill", "bid", "ask", "commission", "theta"))
+            if contracts and fill is not None:
+                premium = fill * 100 * contracts
+                answer += "## Calculated from the supplied ticket\n\n"
+                answer += f"- Premium notional: **${premium:,.2f}** ({fill:.2f} × 100 × {contracts})\n"
+                if bid is not None and ask is not None:
+                    answer += f"- Full quoted spread notional: **${max(0, ask - bid) * 100 * contracts:,.2f}**\n"
+                if commission is not None:
+                    answer += f"- Supplied commission: **${commission:,.2f}** (treated as the total because no per-contract label was supplied)\n"
+                if theta is not None:
+                    answer += f"- Current daily theta estimate: **${theta * 100 * contracts:,.2f} per day** at the supplied theta\n"
+                answer += "\nThese values are arithmetic from your message and are not yet saved or market-verified.\n\n"
+            answer += (
+                "## What EagleEyes will calculate\n\n"
+                "- Premium paid/received = option price × 100 × contracts\n"
+                "- Entry spread estimate = bid/ask spread × 100 × contracts (with the fill location shown separately)\n"
+                "- Commissions = per-contract fee × contracts, including both entry and planned exit\n"
+                "- Daily time decay estimate = position theta × contracts × 100\n\n"
+                "Paste one line such as: `AAPL 200C, long 2, expiry 2026-12-18, fill 8.40, bid 8.10, ask 8.60, commission 1.30, theta -0.07`."
+            )
+        elif intent == "OPTIONS_EXPIRY":
+            dates = [date for date in re.findall(r"\b\d{4}-\d{2}-\d{2}\b", question)]
+            if len(dates) >= 2:
+                from datetime import date as calendar_date
+                expiry = calendar_date.fromisoformat(dates[0])
+                catalyst = calendar_date.fromisoformat(dates[1])
+                answer += f"## Calculated from the supplied dates\n\n- Expiration-to-catalyst buffer: **{(expiry - catalyst).days} days** ({expiry} minus {catalyst})\n\nA negative buffer means the option expires before the catalyst. This timing result is arithmetic and is not yet saved.\n\n"
+            answer += (
+                "## Useful timing checks\n\n"
+                "- Catalyst buffer = expiration date − expected catalyst date\n"
+                "- One-standard-deviation move ≈ stock price × implied volatility × √(days/365)\n"
+                "- Compare expected catalyst timing with theta acceleration and the option's breakeven—not DTE alone.\n\n"
+                "Paste: `ticker, strike/type, long or short, expiration, catalyst date, stock price, implied volatility, expected move horizon`. EagleEyes will calculate the buffer and flag whether the thesis window extends beyond expiration."
+            )
+        else:
+            contracts_match = re.search(r"\b(?:quantity|qty|long|short)\s*[:=]?\s*(\d+)\b", question, re.I)
+            strike_match = re.search(r"\bstrike\s*[:=]?\s*(\d+(?:\.\d+)?)|\b(\d+(?:\.\d+)?)[CP]\b", question, re.I)
+            fill_match = re.search(r"\bfill\s*[:=]?\s*(\d+(?:\.\d+)?)", question, re.I)
+            contracts = int(contracts_match.group(1)) if contracts_match else 0
+            strike = float(next((value for value in (strike_match.groups() if strike_match else ()) if value), "0"))
+            fill = float(fill_match.group(1)) if fill_match else None
+            is_call = bool(re.search(r"\bcall\b|\d+(?:\.\d+)?C\b", question, re.I))
+            is_put = bool(re.search(r"\bput\b|\d+(?:\.\d+)?P\b", question, re.I))
+            is_long = bool(re.search(r"\blong\b", question, re.I))
+            if is_long and contracts and strike and fill is not None and (is_call or is_put):
+                breakeven = strike + fill if is_call else strike - fill
+                answer += "## Calculated from the supplied long-option leg\n\n"
+                answer += f"- Maximum premium loss: **${fill * 100 * contracts:,.2f}** before commissions\n"
+                answer += f"- Expiration breakeven: **${breakeven:,.2f}**\n\nExpected return still requires outcome probabilities, and an exit plan still requires your profit target, breaker, and time stop.\n\n"
+            answer += (
+                "## Metrics that can be calculated from a trade ticket\n\n"
+                "- Long option maximum loss = premium + commissions\n"
+                "- Long call breakeven = strike + premium per share; long put breakeven = strike − premium per share\n"
+                "- Vertical-spread maximum loss and gain come from strike width and net debit/credit\n"
+                "- Expected return requires explicit outcome probabilities; EagleEyes will show the probability assumptions\n"
+                "- Exit plan should specify profit target, thesis breaker, time stop, and latest exit date\n\n"
+                "Paste each leg as `ticker, call/put, long/short, strike, expiry, quantity, fill`, plus the underlying price, probabilities, and exit rules."
+            )
+        answer += f"\n\n**Still missing:** {missing_by_intent[intent]}. No numeric trade value was inferred from stock-only holdings."
+        unsupported.append(f"{label} analytics without an options/trade ledger")
+        user_gaps.append(missing_by_intent[intent])
+        partial.append(SupportedClaim(claim=f"Specific missing {label} inputs identified"))
+    elif intent == "OPPORTUNITY_RANKING" and not summary.get("candidates"):
         rows = sorted(summary.get("ineligible_candidates") or [],
                       key=lambda row: _near_score(row, ("fundamental_quality", "valuation", "momentum", "portfolio_fit")), reverse=True)[:3]
         body = []
@@ -248,7 +675,7 @@ def compose_supported_answer(
         answer = "I cannot rank your personal theses because none are saved. Based only on objective stored evidence, the weakest current setups are:\n\n" + "\n".join(f"- {_holding_line(row)}" for row in weak)
         if candidate_text:
             answer += "\n\nWatchlist evidence (not a forced replacement):\n" + candidate_text
-        answer += "\n\nSave a thesis and its breakers to make the replacement claim personal."
+        answer += "\n\n**Next question:** which of these holdings do you own for a specific company thesis rather than allocation or income exposure? Reply with one ticker and the reason you own it; EagleEyes can draft a reviewable thesis and breakers before comparing replacements."
         supported.append(SupportedClaim(claim="Objective weakest-evidence holdings", scope="objective"))
         unsupported.append("Personal weakest-thesis ranking and personalized replacement")
     elif intent == "PORTFOLIO_CHANGE" and not (summary.get("historical_snapshot") or {}).get("exists"):
@@ -327,10 +754,17 @@ def compose_supported_answer(
         answer += "\n\n**Holdings needing attention**\n\n" + "\n".join(holding_lines[:20] or ["- No lower-confidence holding is recorded."])
         supported.append(SupportedClaim(claim="Field-level and per-holding data quality"))
     elif intent == "SCORE_ATTRIBUTION" and not summary.get("holding"):
+        overview = _summary_for(tool_results, "portfolio_overview")
+        holdings = list(overview.get("candidates") or overview.get("all_holdings") or overview.get("positions") or [])
+        if not holdings and context:
+            holdings = list(context.positions)
         answer = (
             "Name a holding (for example, `MSFT`) or open that holding's research page before asking why its score changed. "
-            "Score attribution requires one company plus a compatible prior score snapshot; no company-specific explanation was generated."
+            "Score attribution requires one company plus a compatible prior score snapshot."
         )
+        if holdings:
+            answer += "\n\n**Available holdings to inspect:** " + ", ".join(f"`{row.get('ticker')}`" for row in holdings[:12]) + "."
+        answer += "\n\nReply with one ticker. EagleEyes will show the prior and current score, component deltas, evidence dates, and whether the change came from fundamentals, valuation, momentum, portfolio fit, or a methodology/version change."
         user_gaps.append("A holding ticker")
         unsupported.append("Score attribution without a named holding")
     elif intent == "THESIS_INVALIDATION" and not (summary.get("thesis") or {}).get("exists"):
@@ -346,7 +780,12 @@ def compose_supported_answer(
                 risks.append(f"weak momentum evidence {_num(row.get('momentum_score')):.0f}/100")
             body.append(f"- **{row.get('ticker')}** — {', '.join(risks) or 'no objective breaker-like risk crossed the stored thresholds'}."
                         )
-        answer = "No saved theses or personal breakers exist, so I cannot claim what would invalidate your thesis. These are objective, non-personalized risks for the largest positions:\n\n" + "\n".join(body)
+        answer = "No saved personal breakers exist yet. These are the objective risks most suitable for turning into explicit invalidation tests:\n\n" + "\n".join(body)
+        answer += (
+            "\n\n**Make this actionable:** reply with one holding and the core reason you own it. EagleEyes will draft three reviewable breakers: "
+            "one operating/fundamental threshold, one valuation or capital-allocation threshold, and one portfolio-risk threshold. "
+            "You can edit or reject them before anything is saved."
+        )
         supported.append(SupportedClaim(claim="Objective risks for largest positions", scope="objective"))
         unsupported.append("Personal thesis invalidation conditions")
     elif intent == "PORTFOLIO_ANALYSIS" and not summary.get("optimizer_run"):

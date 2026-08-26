@@ -136,6 +136,7 @@ _SCENARIO_ALIASES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("oil", "decrease", ("oil falls", "oil prices fall")),
     ("us_dollar", "increase", ("dollar strengthens", "stronger dollar", "usd strengthens")),
     ("us_dollar", "decrease", ("dollar weakens", "weaker dollar", "usd weakens")),
+    ("technology_sector", "decrease", ("technology stocks fell", "technology stocks fall", "tech stocks fell", "tech stocks fall", "technology sector fell", "technology sector falls")),
 )
 
 
@@ -145,7 +146,11 @@ def parse_scenario_factors(question: str) -> list[ScenarioFactor]:
     seen: set[tuple[str, str]] = set()
     for factor, direction, aliases in _SCENARIO_ALIASES:
         if any(alias in lowered for alias in aliases) and (factor, direction) not in seen:
-            factors.append(ScenarioFactor(factor, direction))
+            magnitude = None
+            if factor == "technology_sector":
+                match = re.search(r"(?:technology|tech)(?:\s+sector|\s+stocks?)?\s+(?:fell|falls?|declined?|drops?)\s+(\d+(?:\.\d+)?)%", lowered)
+                magnitude = float(match.group(1)) / 100 if match else None
+            factors.append(ScenarioFactor(factor, direction, magnitude))
             seen.add((factor, direction))
     return factors
 

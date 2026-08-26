@@ -8,6 +8,7 @@ from backend import ask_portfolio, database, read_models
 from backend.ask_runtime import build_portfolio_context
 from backend.main import (
     _benchmark_outlook_chat_tools, _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
+    _interactive_performance_chat_tool,
     _cors_allowed_origins, _cors_allow_origin_regex, _decision_workspace_inputs, _execute_chat_plan_tools, _portfolio_chat_tools, _portfolio_risk_chat_tools,
     _security_ranking_chat_tools, app,
 )
@@ -202,6 +203,49 @@ def test_balanced_rebalance_answer_uses_latest_saved_allocations(monkeypatch) ->
     assert "SPY" in answer and "15.0%" in answer
 
 
+def test_deterministic_company_answer_ignores_missing_ticker_clarification_payload() -> None:
+    tools = [{
+        "tool_name": "company_analysis",
+        "analysis_result": {
+            "capability": "company_analysis",
+            "calculation_version": "company-analysis-v1",
+            "status": "PARTIAL",
+            "data": {"message": "Name one supported company or ticker."},
+            "coverage": {},
+            "freshness": {"calculated_at": "2026-08-26T00:00:00Z"},
+            "verification": {"passed": True, "answer_allowed": True, "recommendation_allowed": False},
+        },
+    }]
+
+    assert _deterministic_chat_answer("TARGET_PRICE_REVIEW", tools) is None
+
+
+def test_interactive_performance_chat_tool_returns_portfolio_and_two_benchmarks(monkeypatch) -> None:
+    monkeypatch.setattr("backend.main.portfolio_performance_widget", lambda portfolio, years, benchmarks=None: {
+        "data": {
+            "total_return": .12, "annualized_volatility": .10,
+                "series": [{"date": "2025-01-01", "value": 0}, {"date": "2025-07-01", "value": .05}, {"date": "2026-01-01", "value": .12}],
+                "benchmarks": [
+                    {"ticker": "SPY", "total_return": .10, "series": [{"date": "2025-01-01", "value": 0}, {"date": "2025-07-01", "value": .04}, {"date": "2026-01-01", "value": .10}]},
+                    {"ticker": "QQQ", "total_return": .15, "series": [{"date": "2025-01-01", "value": 0}, {"date": "2025-07-01", "value": .07}, {"date": "2026-01-01", "value": .15}]},
+            ],
+        },
+        "presentation": {"period_start": "2025-01-01", "period_end": "2026-01-01"},
+        "how_calculated": "current weights", "assumptions": ["not actual account return"],
+        "as_of": "2026-01-01",
+    })
+
+    tools, evidence = _interactive_performance_chat_tool(
+        {"holdings": [{"ticker": "MSFT", "weight": 1.0}]}, benchmarks=["SPY", "QQQ"],
+    )
+
+    assert [row["key"] for row in tools[0]["summary"]["results"]] == [
+        "current_portfolio", "benchmark_spy", "benchmark_relevant_qqq",
+    ]
+    assert tools[0]["summary"]["results"][1]["volatility"] is not None
+    assert evidence[0]["claim_type"] == "MODEL_OUTPUT"
+
+
 def test_move_out_ten_stocks_returns_long_rebalance_review_with_saved_context(monkeypatch) -> None:
     holdings = [{"ticker": f"S{index}", "weight": .05} for index in range(12)]
     monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{
@@ -273,7 +317,11 @@ def test_saved_portfolio_risk_answer_never_needs_provider_calls(monkeypatch) -> 
     tools, evidence = _portfolio_risk_chat_tools("user-1")
     answer = _deterministic_chat_answer("PORTFOLIO_RISK", tools)
     assert tools[0]["status"] == "complete"
-    assert tools[0]["summary"]["largest_position"] == {"ticker": "AAPL", "weight": .30, "account_type": "taxable"}
+    largest = tools[0]["summary"]["largest_position"]
+    assert {key: largest[key] for key in ("ticker", "weight", "account_type")} == {
+        "ticker": "AAPL", "weight": .30, "account_type": "taxable",
+    }
+    assert largest["market_value"] is None and largest["cost_basis"] is None
     assert tools[0]["summary"]["sector_and_industry"]["sector"][0]["sector"] == "Technology"
     assert tools[0]["summary"]["correlation"]["clusters"][0]["holdings"] == ["AAPL", "MSFT"]
     assert evidence[0]["claim_type"] == "MODEL_OUTPUT"

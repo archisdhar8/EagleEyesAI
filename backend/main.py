@@ -74,7 +74,8 @@ from .fund_data import ensure_fund_data, holdings_freshness, recognized_fund, re
 from .research_workspace import comparisons as research_comparison_payload
 from .research_workspace import ideas as research_ideas_payload
 from .research_workspace import search as research_search_payload
-from .research_workspace import sector_summaries, theme_summaries
+from .research_workspace import build_research_intelligence, sector_summaries, theme_summaries
+from .research_read_model import build_shared_research_model
 from .scenarios import refresh as refresh_scenarios
 from .today_briefing import INDEXES, MARKET_SERIES, SECTORS, build_today_briefing
 from .error_monitoring import configure_error_monitoring
@@ -214,6 +215,8 @@ class ChatPageContext(BaseModel):
     decision_id: str | None = Field(default=None, max_length=80)
     thesis_id: str | None = Field(default=None, max_length=80)
     portfolio_id: str | None = Field(default=None, max_length=80)
+    research_section: str | None = Field(default=None, max_length=40)
+    research_capabilities: list[str] = Field(default_factory=list, max_length=12)
     dashboard_resource_type: Literal["draft", "view"] | None = None
     dashboard_resource_id: str | None = Field(default=None, max_length=80)
     enabled_context: list[Literal["evidence", "thesis", "portfolio"]] = Field(
@@ -1828,7 +1831,11 @@ def _safe_research_part(callable_: Any, fallback: Any) -> Any:
         value = callable_()
         return value.model_dump(mode="json") if hasattr(value, "model_dump") else value
     except Exception as exc:
-        record_metric("research.overview.partial", tags={"error_type": type(exc).__name__})
+        error_class = type(exc).__name__
+        record_metric("research.overview.dependency_failed", tags={"error_type": error_class})
+        if isinstance(fallback, dict):
+            return {**fallback, "failure_state": "DEPENDENCY_FAILED", "execution_status": "FAILED",
+                    "error_class": error_class}
         return fallback
 
 
@@ -1989,35 +1996,65 @@ def consolidated_research_security_overview(
     active = theses.active_thesis(user.id, normalized)
     security["decision_context"] = theses.decision_contexts(user.id, [normalized]).get(normalized, {})
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         earnings_future = executor.submit(lambda: _safe_research_part(lambda: earnings_intelligence_view(normalized, user), {"status": "unavailable", "warnings": ["Stored earnings evidence is unavailable."]}))
         forecast_future = executor.submit(lambda: _safe_research_part(lambda: forecasting.build_intelligence(user.id, ticker=normalized, limit=30), {"markets": [], "warnings": ["Stored forward-looking evidence is unavailable."]}))
         changes_future = executor.submit(lambda: _safe_research_part(lambda: evidence.get_changes(user.id, normalized, baseline_type="LAST_RESEARCH_REVIEW"), {"status": "unavailable", "changes": [], "warnings": ["No prior research review is available for comparison."]}))
+        snapshot_future = executor.submit(lambda: _safe_research_part(lambda: security_snapshot_overview(normalized), {"status": "unavailable", "warnings": ["Stored market and fundamental snapshot is unavailable."]}))
         earnings_payload = earnings_future.result()
         forecast_payload = forecast_future.result()
         changes_payload = changes_future.result()
+        snapshot_payload = snapshot_future.result()
 
     freshness = security.get("freshness") or {}
     missing = list((security.get("field_coverage") or {}).get("missing") or [])
+    cases = _research_cases(normalized, security, active)
+    membership = {
+        "holding": normalized in holding_symbols,
+        "watchlist": normalized in watchlist,
+        "holding_detail": next((item for item in portfolio_holdings if str(item.get("ticker") or "").upper() == normalized), None),
+    }
+    legacy_intelligence = build_research_intelligence(
+        security, earnings=earnings_payload, forecasts=forecast_payload, cases=cases,
+        market_snapshot=snapshot_payload,
+        portfolio={"id": portfolio.get("id"), "name": portfolio.get("name")} if portfolio else None,
+        membership=membership,
+    )
+    shared_intelligence = _safe_research_part(
+        lambda: build_shared_research_model(
+            normalized,
+            portfolio={"portfolio": {"id": portfolio.get("id"), "name": portfolio.get("name")} if portfolio else None,
+                       "membership": membership, "holdings": portfolio_holdings},
+        ),
+        {"status": "DEPENDENCY_FAILED", "coverage": 0.0, "sections": {}, "fields": {},
+         "warnings": ["Shared Research capability model is unavailable."]},
+    )
     response = {
         "ticker": normalized,
         "security": security,
         "universe": payload.get("universe"),
         "method": payload.get("method"),
         "portfolio": {"id": portfolio.get("id"), "name": portfolio.get("name")} if portfolio else None,
-        "membership": {
-            "holding": normalized in holding_symbols,
-            "watchlist": normalized in watchlist,
-            "holding_detail": next((item for item in portfolio_holdings if str(item.get("ticker") or "").upper() == normalized), None),
-        },
+        "membership": membership,
         "earnings": earnings_payload,
         "forecasts": forecast_payload,
         "changes": changes_payload,
-        "cases": _research_cases(normalized, security, active),
+        "cases": cases,
+        "intelligence": {**legacy_intelligence, **shared_intelligence,
+                         "version": legacy_intelligence.get("version"),
+                         "capability_version": shared_intelligence.get("version"),
+                         "identity": {**(legacy_intelligence.get("identity") or {}), **(shared_intelligence.get("identity") or {})},
+                         "market": {**(legacy_intelligence.get("market") or {}), **(shared_intelligence.get("market") or {})},
+                         "overview": {**(legacy_intelligence.get("overview") or {}), **(shared_intelligence.get("overview") or {})},
+                         "financial_health": {**(legacy_intelligence.get("financial_health") or {}), **(shared_intelligence.get("financial_health") or {})},
+                         "valuation": {**(legacy_intelligence.get("valuation") or {}), **(shared_intelligence.get("valuation") or {})},
+                         "earnings": earnings_payload, "forecasts": forecast_payload,
+                         "changes": changes_payload, "cases": cases},
+        "research_capabilities": shared_intelligence,
         "freshness": freshness,
         "confidence": _case_confidence(security),
         "missing_data": missing,
-        "partial": bool(missing),
+        "partial": shared_intelligence.get("status") != "SUCCESS",
         "refresh": {"mode": "stored_evidence", "queued_when_stale": True, "interactive_provider_calls": False},
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "cache": {"status": "miss", "ttl_seconds": _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS},
@@ -2028,6 +2065,70 @@ def consolidated_research_security_overview(
             oldest = min(_RESEARCH_OVERVIEW_CACHE, key=lambda key: _RESEARCH_OVERVIEW_CACHE[key][0])
             _RESEARCH_OVERVIEW_CACHE.pop(oldest, None)
     return response
+
+
+@app.get("/api/research/security/{ticker}/header")
+def research_security_header(
+    ticker: str, portfolio_id: str | None = Query(default=None),
+    user: AuthenticatedUser = Depends(require_user),
+) -> dict[str, Any]:
+    """Return the bounded identity/price first-paint contract before the full dossier."""
+    normalized = ticker.strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", normalized):
+        raise HTTPException(422, "Invalid ticker")
+    portfolio, holdings = _selected_research_portfolio(user.id, portfolio_id)
+    selected_portfolio_id = str(portfolio.get("id")) if portfolio else "none"
+    cache_key = f"{user.id}:{selected_portfolio_id}:{normalized}"
+    with _RESEARCH_OVERVIEW_CACHE_LOCK:
+        cached = _RESEARCH_OVERVIEW_CACHE.get(cache_key)
+        if cached and time.monotonic() - cached[0] < _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS:
+            response = deepcopy(cached[1])
+            response["stage"] = "full"
+            response["cache"] = {"status": "hit", "ttl_seconds": _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS}
+            return response
+    bundle = database.research_header_data(normalized)
+    model = _safe_research_part(
+        lambda: build_shared_research_model(normalized, bundle=bundle),
+        {"ticker": normalized, "status": "DEPENDENCY_FAILED", "coverage": 0.0, "sections": {}, "fields": {},
+         "warnings": ["Header evidence dependency failed."]},
+    )
+    if not model.get("fields") or not model.get("fields", {}).get("header.ticker", {}).get("value"):
+        raise HTTPException(404, "Security research is not available")
+    profile = get_profile(user)
+    watchlist = [str(item).strip().upper() for item in profile.get("watchlist", [])]
+    holding_symbols = [str(item.get("ticker") or "").strip().upper() for item in holdings]
+    membership = {"holding": normalized in holding_symbols, "watchlist": normalized in watchlist,
+                  "holding_detail": next((item for item in holdings if str(item.get("ticker") or "").upper() == normalized), None)}
+    return {"ticker": normalized, "membership": membership, "research_capabilities": model,
+            "portfolio": {"id": portfolio.get("id"), "name": portfolio.get("name")} if portfolio else None,
+            "partial": True, "stage": "header", "cache": {"status": "miss"}}
+
+
+@app.get("/api/research/security/{ticker}/core")
+def research_security_core(
+    ticker: str, portfolio_id: str | None = Query(default=None),
+    user: AuthenticatedUser = Depends(require_user),
+) -> dict[str, Any]:
+    """Return portfolio-independent overview, health, and valuation evidence."""
+    normalized = ticker.strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", normalized):
+        raise HTTPException(422, "Invalid ticker")
+    portfolio, holdings = _selected_research_portfolio(user.id, portfolio_id)
+    profile = get_profile(user)
+    watchlist = [str(item).strip().upper() for item in profile.get("watchlist", [])]
+    holding_symbols = [str(item.get("ticker") or "").strip().upper() for item in holdings]
+    membership = {"holding": normalized in holding_symbols, "watchlist": normalized in watchlist,
+                  "holding_detail": next((item for item in holdings if str(item.get("ticker") or "").upper() == normalized), None)}
+    model = _safe_research_part(
+        lambda: build_shared_research_model(normalized),
+        {"ticker": normalized, "status": "DEPENDENCY_FAILED", "coverage": 0.0, "sections": {}, "fields": {},
+         "warnings": ["Core Research evidence dependency failed."]},
+    )
+    if not model.get("fields") or not model.get("fields", {}).get("header.ticker", {}).get("value"):
+        raise HTTPException(404, "Security research is not available")
+    return {"ticker": normalized, "membership": membership, "research_capabilities": model,
+            "portfolio": {"id": portfolio.get("id"), "name": portfolio.get("name")} if portfolio else None,
+            "partial": model.get("status") != "SUCCESS", "stage": "core", "cache": {"status": "miss"}}
 
 
 @app.get("/api/research/securities/{ticker}/overview")
@@ -3311,7 +3412,12 @@ def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None,
     total = sum(raw_weights)
     positions = sorted([
         {"ticker": str(item.get("ticker") or "").upper(), "weight": value / total,
-         "account_type": item.get("account_type") or "unknown"}
+         "account_type": item.get("account_type") or "unknown",
+         "market_value": item.get("market_value"), "cost_basis": item.get("cost_basis"),
+         "unrealized_gain_loss": (
+             float(item.get("market_value")) - float(item.get("cost_basis"))
+             if item.get("market_value") is not None and item.get("cost_basis") not in (None, 0) else None
+         )}
         for item, value in zip(holdings, raw_weights) if value > 0
     ], key=lambda item: item["weight"], reverse=True) if total > 0 else []
     account_weights: dict[str, float] = {}
@@ -3326,6 +3432,9 @@ def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None,
             intelligence = dict((cached.get("ask_cache") or {}).get("portfolio_intelligence") or {})
         except Exception:
             intelligence = {}
+    profile = database.load_profile(user_id) or {}
+    policy = database.load_investment_policy(user_id) or {}
+    risk_rows = list((intelligence.get("risk_contribution") or {}).get("positions") or []) if isinstance(intelligence.get("risk_contribution"), dict) else list(intelligence.get("risk_contribution") or [])
     summary = {
         "portfolio_id": (portfolio or {}).get("id"), "portfolio_name": (portfolio or {}).get("name"),
         "holding_count": len(holdings), "weighted_position_count": len(positions), "positions": positions,
@@ -3339,6 +3448,9 @@ def _portfolio_risk_chat_tools(user_id: str, portfolio_id: str | None = None,
         "correlation": intelligence.get("correlation") or {},
         "economic_dependencies": intelligence.get("economic_dependencies") or [],
         "risk_contribution": intelligence.get("risk_contribution") or {},
+        "risk_contributors": risk_rows,
+        "profile": {key: profile.get(key) for key in ("risk_tolerance", "loss_capacity", "annual_withdrawal", "annual_income_need")},
+        "policy": {key: policy.get(key) for key in ("status", "minimum_cash_reserve", "max_single_stock_weight", "max_sector_weight", "target_allocation", "acceptable_ranges")},
         "coverage": intelligence.get("coverage") or {},
         "limitations": "Position and account weights come directly from saved holdings. Sector, industry, correlation, shared-dependency, and covariance fields are included only when a cached portfolio-intelligence snapshot is available; ETF look-through is not inferred.",
     }
@@ -3431,7 +3543,15 @@ def _deterministic_chat_answer(intent: str, tool_results: list[dict[str, Any]], 
     if phase6 and isinstance(phase6.get("analysis_result"), dict):
         canonical = AnalysisResult.model_validate(phase6["analysis_result"])
         if canonical.capability == "company_analysis" and canonical.data:
-            return phase6_domains.render_company(phase6_domains.CompanyAnalysisResult.model_validate(canonical.data))
+            # Clarification payloads deliberately contain only a message when no
+            # ticker was supplied.  They are not CompanyAnalysisResult objects;
+            # let the intent-specific resolver turn them into a readable prompt.
+            try:
+                company = phase6_domains.CompanyAnalysisResult.model_validate(canonical.data)
+            except ValueError:
+                company = None
+            if company is not None and intent != "TARGET_PRICE_REVIEW":
+                return phase6_domains.render_company(company)
         if canonical.capability == "company_comparison" and canonical.status in {AnalysisStatus.SUCCESS, AnalysisStatus.PARTIAL} and canonical.data:
             try:
                 comparison = phase6_domains.CompanyComparisonResult.model_validate(canonical.data)
@@ -3908,10 +4028,17 @@ def _phase7_chat_tools(user_id: str, question: str) -> tuple[list[dict[str, Any]
                                       "coverage": payload.get("coverage"), "thesis_impact": payload.get("thesis_impact"),
                                       "warnings": payload.get("warnings") or []}})
             grounded.append({"label": f"{ticker} structured earnings intelligence", "as_of": payload.get("reported_at"), "url": (payload.get("source") or {}).get("url"), "data": payload})
-    if any(term in lowered for term in ("portfolio concentrated", "portfolio concentration", "hidden exposure", "same macro risk", "shared macro", "weakening fundamentals", "portfolio reports")):
+    if any(term in lowered for term in (
+        "portfolio concentrated", "portfolio concentration", "hidden exposure", "same macro risk", "shared macro",
+        "weakening fundamentals", "portfolio reports", "diversif", "same bet", "overlapping bet",
+        "technology stocks", "tech stocks", "sector shock",
+    )):
         payload = _portfolio_intelligence_payload(user_id).get("intelligence", {})
         tools.append({"tool_name": "portfolio_intelligence", "status": "complete", "title": "Portfolio concentration and dependencies",
-                      "summary": {key: payload.get(key) for key in ("performance_methodology", "concentration", "thesis_health", "coverage")}})
+                      "summary": {key: payload.get(key) for key in (
+                          "performance_methodology", "concentration", "correlation", "economic_dependencies",
+                          "risk_contribution", "thesis_health", "coverage", "methodology",
+                      )}})
         grounded.append({"label": "Deterministic portfolio intelligence", "as_of": payload.get("as_of"), "url": None, "data": payload})
     return tools, grounded
 
@@ -4089,10 +4216,105 @@ def _phase6_chat_tools(tool: str, user_id: str, question: str,
     return [result], evidence_rows
 
 
+def _interactive_performance_chat_tool(
+    portfolio: dict[str, Any], *, years: int = 1, benchmarks: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return the bounded canvas performance calculation as readable Ask evidence."""
+    widget = portfolio_performance_widget(portfolio, years, benchmarks=benchmarks or ["SPY", "QQQ"])
+    data = dict(widget.get("data") or {})
+
+    def result_row(key: str, label: str, total_return: Any, volatility: Any,
+                   series: list[dict[str, Any]]) -> dict[str, Any]:
+        total = float(total_return or 0)
+        dated = [row for row in series if row.get("date") and row.get("value") is not None]
+        duration = 1.0
+        if len(dated) >= 2:
+            try:
+                duration = max(
+                    (date.fromisoformat(str(dated[-1]["date"])) - date.fromisoformat(str(dated[0]["date"]))).days / 365.25,
+                    1 / 252,
+                )
+            except ValueError:
+                duration = 1.0
+        peak, drawdown = 1.0, 0.0
+        daily_returns: list[float] = []
+        previous_wealth: float | None = None
+        for point in dated:
+            wealth = 1 + float(point["value"])
+            peak = max(peak, wealth)
+            drawdown = min(drawdown, wealth / peak - 1)
+            if previous_wealth not in (None, 0):
+                daily_returns.append(wealth / previous_wealth - 1)
+            previous_wealth = wealth
+        observed_volatility = volatility
+        if observed_volatility is None and len(daily_returns) > 1:
+            observed_volatility = pd.Series(daily_returns).std() * math.sqrt(252)
+        return {
+            "key": key, "label": label, "total_return": total,
+            "annual_return": (1 + total) ** (1 / duration) - 1 if total > -1 else -1,
+            "volatility": observed_volatility, "maximum_drawdown": drawdown,
+            "ending_growth_of_one": 1 + total,
+        }
+
+    results = [result_row(
+        "current_portfolio", "Current-weight portfolio", data.get("total_return"),
+        data.get("annualized_volatility"), list(data.get("series") or []),
+    )]
+    for benchmark in data.get("benchmarks") or []:
+        ticker = str(benchmark.get("ticker") or "").upper()
+        key = "benchmark_spy" if ticker == "SPY" else "benchmark_relevant_qqq" if ticker == "QQQ" else f"benchmark_{ticker.lower()}"
+        results.append(result_row(key, ticker, benchmark.get("total_return"), None, list(benchmark.get("series") or [])))
+    summary = {
+        "results": results,
+        "period_start": (widget.get("presentation") or {}).get("period_start"),
+        "period_end": (widget.get("presentation") or {}).get("period_end"),
+        "methodology": widget.get("how_calculated"),
+        "limitations": list(widget.get("assumptions") or []),
+    }
+    return [{
+        "tool_name": "portfolio_backtest", "status": "complete",
+        "title": "Current-weight benchmark comparison", "summary": summary,
+    }], [{
+        "label": "Current-weight portfolio performance versus benchmarks",
+        "as_of": widget.get("as_of"), "url": None, "data": summary, "claim_type": "MODEL_OUTPUT",
+    }]
+
+
 def _execute_ask_tool(tool: str, user_id: str, question: str,
                       portfolio_id: str | None = None,
                       tickers: tuple[str, ...] = (),
-                      context: PortfolioContext | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                      context: PortfolioContext | None = None,
+                      research_capabilities: tuple[str, ...] = ()) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if tool in {"research_context", "research_portfolio_fit", "research_peer_selection"}:
+        ticker = tickers[0] if tickers else ""
+        if not ticker:
+            return [{"tool_name": tool, "status": "unavailable", "title": "Research context",
+                     "summary": {"message": "Name one supported company or ticker."}}], []
+        if tool == "research_peer_selection":
+            peers = database.research_peer_tickers(ticker)
+            payload = {"ticker": ticker, "eligible_peers": peers[:8],
+                       "message": "Choose one of these existing-universe peers to compare." if peers else "No qualifying peer is available."}
+            return [{"tool_name": tool, "status": "complete" if peers else "unavailable", "title": f"Choose a {ticker} peer",
+                     "summary": payload}], [{"label": f"{ticker} validated peer universe", "as_of": datetime.now(timezone.utc).isoformat(),
+                                               "url": None, "data": payload, "claim_type": "VERIFIED_FACT"}]
+        portfolio_payload = None
+        if tool == "research_portfolio_fit":
+            if not context:
+                return [{"tool_name": tool, "status": "unavailable", "title": f"{ticker} portfolio fit",
+                         "summary": {"message": "Select an authenticated portfolio first."}}], []
+            portfolio_payload = {"portfolio": {"id": context.portfolio_id}, "holdings": list(context.positions)}
+        model = build_shared_research_model(ticker, portfolio=portfolio_payload)
+        requested = tuple(key for key in research_capabilities if key in model.get("fields", {}))
+        allowed = requested or tuple(key for key in model.get("fields", {}) if key.startswith("portfolio." if tool == "research_portfolio_fit" else "header."))
+        selected = {key: model["fields"][key] for key in allowed}
+        payload = {"ticker": ticker, "capability_version": model.get("version"), "fields": selected,
+                   "requested_capabilities": list(allowed), "section_statuses": model.get("sections", {})}
+        available = [key for key, value in selected.items() if value.get("status") in {"AVAILABLE", "STALE"}]
+        status = "complete" if available else "unavailable"
+        canonical = adapt_legacy_tool_result({"tool_name": tool, "status": status, "summary": payload}, capability=tool)
+        return [with_canonical_result({"tool_name": tool, "status": status, "title": f"{ticker} bounded Research context",
+                 "summary": payload}, canonical)], [{"label": f"{ticker} bounded Research capabilities",
+                 "as_of": model.get("generated_at"), "url": None, "data": payload, "claim_type": "MODEL_OUTPUT"}]
     triggers = {
         "company_research": "",
         "evidence_changes": " what changed",
@@ -4177,11 +4399,26 @@ def _execute_ask_tool(tool: str, user_id: str, question: str,
         if not context or not context.normalized_weights:
             return [{"tool_name": tool, "status": "unavailable", "title": "Portfolio backtest",
                      "summary": {"message": "Select a portfolio with supported holdings before requesting a backtest."}}], []
+        broad_interactive_comparison = any(phrase in question.lower() for phrase in (
+            "portfolio performed", "portfolio performance versus", "portfolio performance against",
+            "more risk than necessary", "expected return", "decisions outperform", "after taxes and fees",
+        ))
+        if broad_interactive_comparison:
+            try:
+                return _interactive_performance_chat_tool(
+                    context.portfolio_payload(), years=1, benchmarks=["SPY", "QQQ"],
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                return [{
+                    "tool_name": tool, "status": "unavailable", "title": "Current-weight benchmark comparison",
+                    "summary": {"message": f"The bounded benchmark calculation could not be completed ({type(exc).__name__})."},
+                }], []
         end = date.today()
         years_match = re.search(r"\b(\d{1,2})\s+years?\b", question.lower())
         years = max(1, min(20, int(years_match.group(1)) if years_match else 5))
+        requested_benchmark = "QQQ" if "nasdaq" in question.lower() or re.search(r"\bqqq\b", question, re.I) else "SPY"
         payload = {
-            "alternatives": {"current_portfolio": context.normalized_weights}, "benchmark": "SPY",
+            "alternatives": {"current_portfolio": context.normalized_weights}, "benchmark": requested_benchmark,
             "start_date": date(end.year - years, end.month, min(end.day, 28)).isoformat(),
             "end_date": end.isoformat(), "rebalance_policy": "monthly", "transaction_cost_bps": None,
         }
@@ -4232,13 +4469,14 @@ def _instrumented_ask_tool(tool: str, user_id: str, question: str,
                            tickers: tuple[str, ...] = (),
                            context: PortfolioContext | None = None, *,
                            request_id: str | None = None, capability: str | None = None,
-                           deadline: DeadlineContext | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                           deadline: DeadlineContext | None = None,
+                           research_capabilities: tuple[str, ...] = ()) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     started=time.monotonic(); started_at=telemetry_utc_now()
     deadline_start = deadline.remaining_ms() if deadline else None
     status = "FAILED"; error_class = None; cache_state = "not_tracked"
     read_model_telemetry: dict[str, Any] = {}
     try:
-        result=_execute_ask_tool(tool,user_id,question,portfolio_id,tickers,context)
+        result=_execute_ask_tool(tool,user_id,question,portfolio_id,tickers,context,research_capabilities)
         statuses = [str(row.get("status") or "partial").upper() for row in result[0]]
         status = "FAILED" if "FAILED" in statuses else "UNAVAILABLE" if statuses and all(value == "UNAVAILABLE" for value in statuses) else "PARTIAL" if "PARTIAL" in statuses else "SUCCESS"
         cache_state = next((
@@ -4286,6 +4524,7 @@ def _execute_chat_plan_tools(
     request_id: str | None = None, capability: str | None = None,
     deadline: DeadlineContext | None = None,
     compositional_plan: capability_planner.CapabilityPlan | None = None,
+    research_capabilities: tuple[str, ...] = (),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[ask_execution.NodeOutcome]]:
     """Execute the approved read-only capability graph with per-request bounded concurrency."""
     request_id = request_id or str(uuid.uuid4())
@@ -4311,7 +4550,7 @@ def _execute_chat_plan_tools(
         def execute(_: ask_execution.NodeExecutionContext, __: dict[str, ask_execution.NodeOutcome]) -> ask_execution.NodeExecutionValue:
             results, grounded = _instrumented_ask_tool(
                 tool, user_id, question, portfolio_id, tickers, context,
-                deadline=deadline,
+                deadline=deadline, research_capabilities=research_capabilities,
             )
             results = results or [{"tool_name": tool, "status": "unavailable",
                                    "title": tool.replace("_", " ").title(),
@@ -4812,7 +5051,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
     execution_started_at = telemetry_utc_now()
     tool_results, evidence_rows, execution_steps, execution_outcomes = _execute_chat_plan_tools(
         plan.tools, user.id, routed_question, started, requested_portfolio_id, plan.tickers, portfolio_context,
-        request_id, plan.intent, deadline, compositional_plan,
+        request_id, plan.intent, deadline, compositional_plan, plan.research_capabilities,
     )
     tool_results = enforce_output_symbol_boundary(tool_results, portfolio_context)
     tools_elapsed = time.monotonic() - tool_started

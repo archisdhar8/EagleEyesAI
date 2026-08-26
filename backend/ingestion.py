@@ -17,6 +17,7 @@ import requests
 from dotenv import load_dotenv
 
 from . import database
+from .sec_inline_xbrl import parse_inline_xbrl, research_facts
 from .regimes import generate_and_store_regimes, month_ends
 from .scenarios import canonical_contract_series, refresh as refresh_scenarios
 
@@ -35,7 +36,17 @@ TIINGO_PRICES_URL = "https://api.tiingo.com/tiingo/daily/{ticker}/prices"
 FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 POLYGON_TICKERS_URL = "https://api.polygon.io/v3/reference/tickers"
+POLYGON_TICKER_DETAILS_URL = "https://api.polygon.io/v3/reference/tickers/{ticker}"
+POLYGON_OPEN_CLOSE_URL = "https://api.polygon.io/v1/open-close/{ticker}/{date}"
+POLYGON_SHORT_INTEREST_URL = "https://api.polygon.io/stocks/v1/short-interest"
+POLYGON_SHORT_VOLUME_URL = "https://api.polygon.io/stocks/v1/short-volume"
+POLYGON_FLOAT_URL = "https://api.polygon.io/stocks/vX/float"
+POLYGON_FORM4_URL = "https://api.polygon.io/stocks/filings/vX/form-4"
+POLYGON_13F_URL = "https://api.polygon.io/stocks/filings/vX/13-F"
+POLYGON_10K_SECTIONS_URL = "https://api.polygon.io/stocks/filings/10-K/vX/sections"
+POLYGON_RISK_FACTORS_URL = "https://api.polygon.io/stocks/filings/vX/risk-factors"
 
 ETF_TICKERS = {
     "SPY", "QQQ", "VTI", "IWM", "DIA", "BND", "AGG", "TLT", "SHY", "IEF",
@@ -70,10 +81,14 @@ SEC_TAGS = {
     "total_liabilities": ["Liabilities"],
     "shareholder_equity": ["StockholdersEquity"],
     "operating_cash_flow": ["NetCashProvidedByUsedInOperatingActivities"],
-    "capex": ["PaymentsToAcquirePropertyPlantAndEquipment"],
+    "capex": ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"],
     "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+    "shares_outstanding": ["EntityCommonStockSharesOutstanding", "CommonStockSharesOutstanding"],
     "total_debt": ["LongTermDebt", "LongTermDebtAndFinanceLeaseObligations"],
     "cash": ["CashAndCashEquivalentsAtCarryingValue"],
+    "depreciation_amortization": ["DepreciationDepletionAndAmortization", "DepreciationDepletionAndAmortizationPropertyPlantAndEquipment", "DepreciationAmortizationAndOther"],
+    "income_tax_expense": ["IncomeTaxExpenseBenefit"],
+    "pretax_income": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"],
 }
 
 
@@ -398,6 +413,7 @@ def upsert_news_frame(frame: pd.DataFrame, provider: str = "polygon_news") -> in
                 key: clean(getattr(row, key, None))
                 for key in (
                     "source", "summary", "event_type", "sentiment_label", "sentiment_score",
+                    "sentiment_reasoning", "provider_insights",
                     "catalyst_type", "risk_type", "management_tone", "regulatory_risk",
                     "legal_risk", "news_data_quality_score",
                 )
@@ -972,18 +988,241 @@ def refresh_news(tickers: Iterable[str] | None = None, lookback_days: int = 7) -
         raise_provider_error(response)
         for item in response.json().get("results", []):
             publisher = item.get("publisher") or {}
+            insight = next(
+                (value for value in item.get("insights") or [] if str(value.get("ticker") or "").upper() == ticker),
+                None,
+            )
+            sentiment = str((insight or {}).get("sentiment") or "unknown").lower()
+            if sentiment not in {"positive", "negative", "neutral"}:
+                sentiment = "unknown"
             rows.append(
                 {
                     "ticker": ticker, "published_at": item.get("published_utc"),
                     "source": publisher.get("name") or "Polygon", "headline": item.get("title"),
                     "summary": item.get("description"), "url": item.get("article_url"),
-                    "event_type": "other", "sentiment_label": "unknown", "sentiment_score": 0.0,
+                    "event_type": "other", "sentiment_label": sentiment, "sentiment_score": None,
+                    "sentiment_reasoning": (insight or {}).get("sentiment_reasoning"),
+                    "provider_insights": item.get("insights") or [],
                     "relevance_score": 55.0, "catalyst_type": "none", "risk_type": "none",
                     "management_tone": None, "regulatory_risk": False, "legal_risk": False,
                     "news_data_quality_score": 60.0, "is_real_data": True,
                 }
             )
     return upsert_news_frame(pd.DataFrame(rows), "polygon_news") if rows else 0
+
+
+def _polygon_get(session: requests.Session, url: str, api_key: str, **params: Any) -> dict[str, Any]:
+    response = request_with_retries(session, url, params={**params, "apiKey": api_key}, timeout=45)
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Polygon returned an unexpected payload")
+    return payload
+
+
+def _research_observation_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
+    for row in rows:
+        conn.execute(
+            """INSERT INTO public.research_source_observations(
+            ticker,provider,dataset,metric,effective_at,value_numeric,value_text,
+            value_json,source_url,entitlement,metadata
+            ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(ticker,provider,dataset,metric,effective_at) DO UPDATE SET
+            value_numeric=excluded.value_numeric,value_text=excluded.value_text,
+            value_json=excluded.value_json,source_url=excluded.source_url,
+            entitlement=excluded.entitlement,metadata=excluded.metadata,retrieved_at=now()""",
+            (
+                row["ticker"], row.get("provider", "polygon"), row["dataset"], row["metric"],
+                row["effective_at"], row.get("value_numeric"), row.get("value_text"),
+                database._jsonb(row.get("value_json")) if row.get("value_json") is not None else None,
+                row.get("source_url"), row.get("entitlement", "existing_configured_plan"),
+                database._jsonb(row.get("metadata") or {}),
+            ),
+        )
+    return len(rows)
+
+
+def _store_polygon_documents(conn: Any, ticker: str, document_type: str, items: list[dict[str, Any]], source_url: str) -> int:
+    security = conn.execute(
+        """SELECT id FROM public.securities WHERE ticker=%s ORDER BY
+        CASE WHEN asset_type='stock' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1""", (ticker,),
+    ).fetchone()
+    if not security:
+        return 0
+    count = 0
+    for position, item in enumerate(items):
+        external_id = str(
+            item.get("accession_number") or item.get("filing_url")
+            or hashlib.sha256(json.dumps(item, sort_keys=True, default=str).encode()).hexdigest()
+        )
+        section = str(item.get("section") or item.get("risk_factor") or document_type)
+        text = str(item.get("text") or item.get("description") or item.get("risk_factor") or item.get("supporting_text") or "").strip()
+        row = conn.execute(
+            """INSERT INTO public.documents(
+            security_id,provider,document_type,external_id,title,source_url,published_at,content_hash,metadata
+            ) VALUES(%s,'polygon',%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(provider,external_id) DO UPDATE SET security_id=excluded.security_id,
+            document_type=excluded.document_type,title=excluded.title,source_url=excluded.source_url,
+            published_at=excluded.published_at,content_hash=excluded.content_hash,
+            metadata=excluded.metadata,fetched_at=now() RETURNING id""",
+            (
+                security["id"], document_type, f"{external_id}:{section}:{position}",
+                f"{ticker} {section.replace('_', ' ')}", item.get("filing_url") or source_url,
+                item.get("filing_date"), hashlib.sha256(text.encode()).hexdigest() if text else None,
+                database._jsonb({key: value for key, value in item.items() if key != "text"}),
+            ),
+        ).fetchone()
+        if text:
+            conn.execute(
+                """INSERT INTO public.document_chunks(document_id,chunk_index,content,metadata)
+                VALUES(%s,0,%s,%s) ON CONFLICT(document_id,chunk_index) DO UPDATE SET
+                content=excluded.content,metadata=excluded.metadata""",
+                (row["id"], text, database._jsonb({"provider": "polygon", "section": section, "deterministic_extract": True})),
+            )
+        count += 1
+    return count
+
+
+def refresh_polygon_research(tickers: Iterable[str] | None = None) -> int:
+    """Ingest only Polygon/Massive endpoints proven entitled by the audit.
+
+    A 403 is never converted to a substitute.  The caller receives the provider
+    error and the previously stored row remains the latest validated evidence.
+    """
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        raise RuntimeError("POLYGON_API_KEY is required")
+    selected = sorted({str(value).strip().upper() for value in (tickers or active_tickers()) if str(value).strip() and str(value).upper() != "CASH"})
+    session, observations, documents = requests.Session(), [], []
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    effective_now = datetime.now(timezone.utc).isoformat()
+    for ticker in selected:
+        details_url = POLYGON_TICKER_DETAILS_URL.format(ticker=ticker)
+        details = _polygon_get(session, details_url, api_key).get("results") or {}
+        effective = details.get("last_updated_utc") or effective_now
+        address = details.get("address") or {}
+        headquarters = ", ".join(str(value) for value in (address.get("city"), address.get("state"), address.get("country")) if value)
+        with database.postgres_connection() as conn:
+            upsert_securities(conn, [ticker])
+            conn.execute(
+                """INSERT INTO public.security_master(ticker,name,exchange,instrument_type,currency,active,coverage_tier,
+                figi,provider_mappings,metadata,verified_at) VALUES(%s,%s,%s,'common_stock',%s,true,'core_us',%s,%s,%s,%s)
+                ON CONFLICT(ticker) DO UPDATE SET name=excluded.name,exchange=excluded.exchange,currency=excluded.currency,
+                figi=coalesce(excluded.figi,public.security_master.figi),
+                provider_mappings=public.security_master.provider_mappings||excluded.provider_mappings,
+                metadata=public.security_master.metadata||excluded.metadata,verified_at=excluded.verified_at,updated_at=now()""",
+                (
+                    ticker, details.get("name") or ticker, details.get("primary_exchange"),
+                    str(details.get("currency_name") or "USD").upper(), details.get("composite_figi"),
+                    database._jsonb({"polygon": {"cik": details.get("cik"), "share_class_figi": details.get("share_class_figi")}}),
+                    database._jsonb({
+                        "description": details.get("description"), "address": address,
+                        "headquarters": headquarters or None, "employees": details.get("total_employees"),
+                        "market_cap": details.get("market_cap"), "share_class_shares_outstanding": details.get("share_class_shares_outstanding"),
+                        "weighted_shares_outstanding": details.get("weighted_shares_outstanding"), "list_date": details.get("list_date"),
+                        "homepage_url": details.get("homepage_url"), "sic_code": details.get("sic_code"),
+                        "sic_description": details.get("sic_description"), "polygon_ticker_details": details,
+                    }), effective,
+                ),
+            )
+        for metric_name, value in (
+            ("market_cap", details.get("market_cap")), ("employees", details.get("total_employees")),
+            ("shares_outstanding", details.get("weighted_shares_outstanding") or details.get("share_class_shares_outstanding")),
+            ("description", details.get("description")), ("headquarters", headquarters or None),
+            ("exchange", details.get("primary_exchange")),
+        ):
+            if value is not None:
+                observations.append({"ticker": ticker, "dataset": "ticker_details", "metric": metric_name,
+                                     "effective_at": effective, "value_numeric": value if isinstance(value, (int, float)) else None,
+                                     "value_text": value if isinstance(value, str) else None, "value_json": {"raw": value}, "source_url": details_url})
+
+        # The daily summary is explicitly entitled and contains pre/after prices.
+        for offset in range(0, 7):
+            session_date = today - timedelta(days=offset)
+            try:
+                open_close_url = POLYGON_OPEN_CLOSE_URL.format(ticker=ticker, date=session_date.isoformat())
+                daily = _polygon_get(session, open_close_url, api_key, adjusted="true")
+            except RuntimeError as exc:
+                if "404" in str(exc):
+                    continue
+                raise
+            if daily.get("close") is not None:
+                for metric_name, value in (("regular_close", daily.get("close")), ("pre_market_price", daily.get("preMarket")), ("after_hours_price", daily.get("afterHours"))):
+                    if value is not None:
+                        observations.append({"ticker": ticker, "dataset": "daily_open_close", "metric": metric_name,
+                                             "effective_at": f"{session_date.isoformat()}T21:00:00+00:00", "value_numeric": value,
+                                             "value_json": daily, "source_url": open_close_url, "metadata": {"latency_class": "end-of-day"}})
+                break
+
+        endpoints = (
+            ("short_interest", POLYGON_SHORT_INTEREST_URL, {"ticker": ticker, "limit": 10, "sort": "settlement_date.desc"}, "settlement_date"),
+            ("short_volume", POLYGON_SHORT_VOLUME_URL, {"ticker": ticker, "limit": 30, "sort": "date.desc"}, "date"),
+            ("float", POLYGON_FLOAT_URL, {"ticker": ticker, "limit": 10}, "effective_date"),
+        )
+        for dataset, url, params, date_field in endpoints:
+            for item in _polygon_get(session, url, api_key, **params).get("results") or []:
+                item_effective = item.get(date_field) or item.get("last_updated") or effective_now
+                for key, value in item.items():
+                    if isinstance(value, (int, float)):
+                        observations.append({"ticker": ticker, "dataset": dataset, "metric": key, "effective_at": item_effective,
+                                             "value_numeric": value, "value_json": item, "source_url": url})
+
+        cik = str(details.get("cik") or "").zfill(10)
+        if cik.strip("0"):
+            form4 = _polygon_get(session, POLYGON_FORM4_URL, api_key, issuer_cik=cik, limit=100, sort="filing_date.desc")
+            for item in form4.get("results") or []:
+                observations.append({"ticker": ticker, "dataset": "form_4", "metric": "insider_transaction",
+                                     "effective_at": item.get("transaction_date") or item.get("filing_date") or effective_now,
+                                     "value_json": item, "source_url": item.get("filing_url") or POLYGON_FORM4_URL})
+
+        for document_type, url, params in (
+            ("10_k_section", POLYGON_10K_SECTIONS_URL, {"ticker": ticker, "limit": 10, "sort": "period_end.desc"}),
+            ("risk_factor", POLYGON_RISK_FACTORS_URL, {"ticker": ticker, "limit": 100, "sort": "filing_date.desc"}),
+        ):
+            documents.append((ticker, document_type, _polygon_get(session, url, api_key, **params).get("results") or [], url))
+
+    with database.postgres_connection() as conn:
+        count = _research_observation_rows(conn, observations)
+        for ticker, document_type, items, url in documents:
+            count += _store_polygon_documents(conn, ticker, document_type, items, url)
+    return count
+
+
+def refresh_polygon_13f(tickers: Iterable[str] | None = None, max_pages: int = 10) -> int:
+    """Ingest 13-F holdings when an existing canonical CUSIP mapping exists.
+
+    Massive does not expose an issuer-ticker filter for this endpoint.  We do
+    not fuzzy-match issuer names; without a verified CUSIP the result is an
+    explicit zero-row capability rather than a potentially wrong ownership row.
+    """
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        raise RuntimeError("POLYGON_API_KEY is required")
+    selected = sorted({str(value).strip().upper() for value in (tickers or active_tickers()) if str(value).strip() and str(value).upper() != "CASH"})
+    with database.postgres_connection() as conn:
+        mappings = conn.execute(
+            "SELECT ticker,cusip FROM public.security_master WHERE ticker=ANY(%s) AND cusip IS NOT NULL", (selected,),
+        ).fetchall()
+    by_cusip = {str(row["cusip"]).replace(" ", "").upper(): row["ticker"] for row in mappings}
+    if not by_cusip:
+        return 0
+    session, url, params, observations = requests.Session(), POLYGON_13F_URL, {
+        "limit": 1000, "sort": "filing_date.desc", "apiKey": api_key,
+    }, []
+    for _ in range(max(1, min(max_pages, 50))):
+        payload = _polygon_get(session, url, api_key, **{key: value for key, value in params.items() if key != "apiKey"})
+        for item in payload.get("results") or []:
+            ticker = by_cusip.get(str(item.get("cusip") or "").replace(" ", "").upper())
+            if ticker:
+                observations.append({"ticker": ticker, "dataset": "13_f", "metric": "institutional_holding",
+                                     "effective_at": item.get("filing_date") or datetime.now(timezone.utc).isoformat(),
+                                     "value_numeric": item.get("shares_or_principal_amount"), "value_json": item,
+                                     "source_url": item.get("filing_url") or POLYGON_13F_URL})
+        next_url = payload.get("next_url")
+        if not next_url:
+            break
+        url, params = next_url, {}
+    with database.postgres_connection() as conn:
+        return _research_observation_rows(conn, observations)
 
 
 def normalize_sec_payload(ticker: str, payload: dict[str, Any]) -> pd.DataFrame:
@@ -1037,6 +1276,60 @@ def upsert_sec_periods(frame: pd.DataFrame) -> int:
     return len(frame)
 
 
+def upsert_sec_companyfacts_observations(ticker: str, payload: dict[str, Any]) -> int:
+    """Persist non-dimensional Company Facts with filing-time lineage.
+
+    These rows support point-in-time histories.  Dimensional fields continue to
+    come exclusively from Inline XBRL contexts.
+    """
+    facts = payload.get("facts", {}).get("us-gaap", {})
+    rows: list[tuple[Any, ...]] = []
+    for metric_name, tags in SEC_TAGS.items():
+        for concept in tags:
+            fact = facts.get(concept) or {}
+            for unit, observations in (fact.get("units") or {}).items():
+                for item in observations:
+                    if not item.get("end") or not item.get("filed") or not item.get("accn") or item.get("form") not in {"10-K", "10-Q", "20-F", "40-F"}:
+                        continue
+                    context_id = hashlib.sha256("|".join(str(item.get(key) or "") for key in ("start", "end", "form", "fp", "accn", "frame", "metric")) .encode()).hexdigest()[:32]
+                    rows.append((
+                        "us-gaap", concept, context_id, item.get("start"), item["end"], item["filed"],
+                        item.get("fy"), item.get("fp"), item["form"], item["accn"], unit, item.get("val"),
+                        f"https://www.sec.gov/Archives/edgar/data/{str(payload.get('cik') or '').lstrip('0')}/{str(item['accn']).replace('-', '')}/",
+                        json.dumps({"canonical_metric": metric_name, "frame": item.get("frame"), "source": "SEC Company Facts"}),
+                    ))
+    if not rows:
+        return 0
+    rows = list({(row[1], row[2], row[9], row[10]): row for row in rows}.values())
+    with database.postgres_connection() as conn:
+        upsert_securities(conn, [ticker])
+        security = conn.execute("SELECT id FROM public.securities WHERE ticker=%s ORDER BY updated_at DESC LIMIT 1", (ticker,)).fetchone()
+        conn.execute(
+            """CREATE TEMP TABLE sec_companyfacts_stage(
+            security_id uuid,taxonomy text,concept text,context_id text,period_start date,period_end date,
+            filed_at date,fiscal_year integer,fiscal_period text,form_type text,accession_number text,
+            unit text,value numeric,source_url text,metadata_text text) ON COMMIT DROP"""
+        )
+        staged = ((security["id"], *row) for row in rows)
+        copy_rows(
+            conn,
+            """COPY sec_companyfacts_stage(security_id,taxonomy,concept,context_id,period_start,period_end,
+            filed_at,fiscal_year,fiscal_period,form_type,accession_number,unit,value,source_url,metadata_text) FROM STDIN""",
+            staged, f"sec-companyfacts-{ticker}",
+        )
+        conn.execute(
+            """INSERT INTO public.fundamental_dimensional_facts(
+            security_id,provider,taxonomy,concept,context_id,period_start,period_end,filed_at,fiscal_year,
+            fiscal_period,form_type,accession_number,unit,value,dimensions,source_url,metadata)
+            SELECT security_id,'sec_companyfacts',taxonomy,concept,context_id,period_start,period_end,filed_at,
+            fiscal_year,fiscal_period,form_type,accession_number,unit,value,'{}'::jsonb,source_url,metadata_text::jsonb
+            FROM sec_companyfacts_stage
+            ON CONFLICT(security_id,provider,accession_number,concept,context_id,unit) DO UPDATE SET
+            value=excluded.value,metadata=excluded.metadata,source_url=excluded.source_url,fetched_at=now()"""
+        )
+    return len(rows)
+
+
 def refresh_sec(tickers: Iterable[str] | None = None) -> int:
     user_agent = os.getenv("SEC_USER_AGENT")
     if not user_agent or "@" not in user_agent:
@@ -1062,10 +1355,106 @@ def refresh_sec(tickers: Iterable[str] | None = None) -> int:
         if response.status_code == 404:
             continue
         response.raise_for_status()
-        frame = normalize_sec_payload(ticker, response.json())
+        sec_payload = response.json()
+        frame = normalize_sec_payload(ticker, sec_payload)
+        upsert_sec_companyfacts_observations(ticker, sec_payload)
         if not frame.empty:
             frames.append(frame)
     return upsert_sec_periods(pd.concat(frames, ignore_index=True)) if frames else 0
+
+
+SEC_CONCEPT_TO_METRIC = {
+    concept: metric_name for metric_name, concepts in SEC_TAGS.items() for concept in concepts
+}
+
+
+def _recent_sec_filings(payload: dict[str, Any], limit: int = 6) -> list[dict[str, Any]]:
+    recent = (payload.get("filings") or {}).get("recent") or {}
+    keys = ("accessionNumber", "filingDate", "reportDate", "form", "primaryDocument")
+    rows = [dict(zip(keys, values)) for values in zip(*(recent.get(key) or [] for key in keys))]
+    return [row for row in rows if row.get("form") in {"10-K", "10-K/A", "10-Q", "10-Q/A", "20-F", "40-F"}][:limit]
+
+
+def refresh_sec_inline(tickers: Iterable[str] | None = None, filing_limit: int = 6) -> int:
+    """Parse Inline XBRL contexts/axes; Company Facts is not a substitute."""
+    user_agent = os.getenv("SEC_USER_AGENT")
+    if not user_agent or "@" not in user_agent:
+        raise RuntimeError("SEC_USER_AGENT is required and must include a contact email")
+    headers = {"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"}
+    selected = sorted({str(value).strip().upper() for value in (tickers or active_tickers()) if str(value).strip() and str(value).upper() != "CASH"})
+    session = requests.Session()
+    session.headers.update(headers)
+    ticker_response = request_with_retries(session, SEC_TICKERS_URL, params={}, timeout=45)
+    mapping = {str(item["ticker"]).upper(): str(item["cik_str"]).zfill(10) for item in ticker_response.json().values()}
+    stored = 0
+    for ticker in selected:
+        cik = mapping.get(ticker)
+        if not cik:
+            continue
+        submissions = request_with_retries(session, SEC_SUBMISSIONS_URL.format(cik=cik), params={}, timeout=45).json()
+        filings = _recent_sec_filings(submissions, max(1, min(filing_limit, 12)))
+        with database.postgres_connection() as conn:
+            upsert_securities(conn, [ticker])
+            security = conn.execute(
+                "SELECT id FROM public.securities WHERE ticker=%s ORDER BY updated_at DESC LIMIT 1", (ticker,),
+            ).fetchone()
+            if not security:
+                continue
+            for filing in filings:
+                accession = str(filing["accessionNumber"])
+                accession_path = accession.replace("-", "")
+                filing_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_path}/{filing['primaryDocument']}"
+                response = request_with_retries(session, filing_url, params={}, timeout=60)
+                facts = research_facts(parse_inline_xbrl(response.text))
+                form = str(filing.get("form") or "")
+                fiscal_period = "FY" if form.startswith(("10-K", "20-F", "40-F")) else None
+                for fact in facts:
+                    dimensions = fact.get("dimensions") or {}
+                    concept = str(fact["concept"])
+                    conn.execute(
+                            """INSERT INTO public.fundamental_dimensional_facts(
+                            security_id,provider,taxonomy,concept,context_id,period_start,period_end,filed_at,
+                            fiscal_period,form_type,accession_number,unit,value,dimensions,source_url,metadata
+                            ) VALUES(%s,'sec_inline_xbrl',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT(security_id,provider,accession_number,concept,context_id,unit) DO UPDATE SET
+                            value=excluded.value,dimensions=excluded.dimensions,source_url=excluded.source_url,
+                            metadata=excluded.metadata,fetched_at=now()""",
+                            (
+                                security["id"], fact["taxonomy"], concept, fact["context_id"], fact.get("period_start"),
+                                fact["period_end"], filing["filingDate"], fiscal_period, form, accession,
+                                fact.get("unit"), fact["value"], database._jsonb(dimensions), filing_url,
+                                database._jsonb({"report_date": filing.get("reportDate"), "parser_version": fact.get("parser_version"),
+                                                 "decimals": fact.get("decimals"), "raw_text": fact.get("raw_text")}),
+                            ),
+                        )
+                    stored += 1
+                    metric_name = SEC_CONCEPT_TO_METRIC.get(concept)
+                    if metric_name and not dimensions:
+                        conn.execute(
+                            """INSERT INTO public.fundamental_observations(
+                            security_id,provider,metric,period_start,period_end,filed_at,fiscal_period,value,unit,
+                            form_type,accession_number,source_url,context_id,metadata
+                            ) VALUES(%s,'sec_inline_xbrl',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT(security_id,provider,metric,period_end,filed_at,fiscal_period) DO UPDATE SET
+                            value=excluded.value,unit=excluded.unit,form_type=excluded.form_type,
+                            accession_number=excluded.accession_number,source_url=excluded.source_url,
+                            period_start=excluded.period_start,context_id=excluded.context_id,
+                            metadata=excluded.metadata,fetched_at=now()""",
+                            (
+                                security["id"], metric_name, fact.get("period_start"), fact["period_end"],
+                                filing["filingDate"], fiscal_period, fact["value"], fact.get("unit"), form,
+                                accession, filing_url, fact["context_id"],
+                                database._jsonb({"taxonomy": fact["taxonomy"], "concept": concept,
+                                                 "parser_version": fact.get("parser_version"), "report_date": filing.get("reportDate")}),
+                            ),
+                        )
+                        stored += 1
+                record_fetch(
+                    "sec_inline_xbrl", f"{ticker}:{accession}", "success", as_of=filing.get("filingDate"),
+                    source_url=filing_url, payload_hash=hashlib.sha256(response.content).hexdigest(),
+                    metadata={"ticker": ticker, "form": form, "facts_parsed": len(facts), "accession": accession},
+                )
+    return stored
 
 
 def refresh_security_evidence(tickers: Iterable[str], news_lookback_days: int = 7) -> dict[str, Any]:
@@ -1098,10 +1487,12 @@ def refresh_security_evidence(tickers: Iterable[str], news_lookback_days: int = 
         warnings.append("No Tiingo or Polygon key is configured for automatic price history.")
     if os.getenv("POLYGON_API_KEY"):
         operations.append(("polygon_news", lambda: refresh_news(selected) if news_lookback_days == 7 else refresh_news(selected, news_lookback_days)))
+        operations.append(("polygon_research", lambda: refresh_polygon_research(selected)))
     else:
         warnings.append("Polygon news refresh is not configured.")
     if os.getenv("SEC_USER_AGENT"):
         operations.append(("sec", lambda: refresh_sec(selected)))
+        operations.append(("sec_inline_xbrl", lambda: refresh_sec_inline(selected)))
     else:
         warnings.append("SEC fundamentals refresh is not configured.")
 
@@ -1238,6 +1629,9 @@ REFRESH_PROVIDERS: dict[str, Callable[[], int]] = {
     "markets": refresh_markets,
     "regimes": refresh_regime_labels,
     "security_catalog": refresh_security_catalog,
+    "polygon_research": refresh_polygon_research,
+    "polygon_13f": refresh_polygon_13f,
+    "sec_inline_xbrl": refresh_sec_inline,
 }
 HISTORY_PROVIDERS: dict[str, Callable[[], int]] = {
     "polygon": extend_polygon_history,

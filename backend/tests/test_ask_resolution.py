@@ -136,3 +136,115 @@ def test_event_answer_surfaces_independent_provider_limitations():
     }}])
     assert "No configured adapter supplies an earnings calendar." in answer
     assert "FRED observations do not supply a forward release calendar." in answer
+
+
+def test_gain_loss_attribution_uses_cost_basis_and_discloses_scope():
+    _, answer = compose_supported_answer(
+        intent="GAIN_LOSS_ATTRIBUTION", question="gains and losses", context=context(),
+        tool_results=[{"tool_name": "portfolio_risk", "status": "complete", "summary": {"positions": [
+            {"ticker": "MSFT", "weight": .6, "market_value": 1600, "cost_basis": 1000, "unrealized_gain_loss": 600},
+            {"ticker": "AMZN", "weight": .4, "market_value": 800, "cost_basis": 1000, "unrealized_gain_loss": -200},
+        ]}}], deterministic_answer=None,
+    )
+    assert "MSFT" in answer.direct_answer and "$600" in answer.direct_answer
+    assert "AMZN" in answer.direct_answer and "$-200" in answer.direct_answer
+    assert "not total-return attribution" in answer.direct_answer
+
+
+def test_risk_sizing_and_cash_answers_use_saved_profile_and_policy():
+    result = [{"tool_name": "portfolio_risk", "status": "complete", "summary": {
+        "positions": [{"ticker": "MSFT", "weight": .25}],
+        "profile": {"risk_tolerance": 6, "loss_capacity": 5, "annual_withdrawal": 12000, "annual_income_need": 8000},
+        "policy": {"status": "approved", "max_single_stock_weight": .20, "minimum_cash_reserve": 15000,
+                   "target_allocation": {"cash": .10}},
+    }}]
+    _, sizing = compose_supported_answer(intent="POSITION_SIZING", question="too large", context=context(),
+                                         tool_results=result, deterministic_answer=None)
+    assert "20.0%" in sizing.direct_answer and "MSFT" in sizing.direct_answer and "5.0%" in sizing.direct_answer
+    _, cash = compose_supported_answer(intent="CASH_RESERVE", question="cash", context=context(),
+                                       tool_results=result, deterministic_answer=None)
+    assert "$15,000" in cash.direct_answer and "10.0%" in cash.direct_answer
+
+
+def test_options_gap_is_specific_and_never_returns_capability_status():
+    _, answer = compose_supported_answer(
+        intent="OPTIONS_EXPIRY", question="enough time", context=context(),
+        tool_results=tool({"message": "portfolio risk returned SUCCESS"}), deterministic_answer="portfolio risk returned SUCCESS",
+    )
+    assert "option symbol" in answer.direct_answer
+    assert "portfolio risk returned SUCCESS" not in answer.direct_answer
+    assert answer.partial_claims
+
+
+def test_option_cost_followup_calculates_supplied_ticket_without_saving_it():
+    _, answer = compose_supported_answer(
+        intent="OPTIONS_COSTS",
+        question="AAPL 200C, long 2, expiry 2026-12-18, fill 8.40, bid 8.10, ask 8.60, commission 1.30, theta -0.07",
+        context=context(), tool_results=[{"tool_name": "portfolio_risk", "status": "complete", "summary": {"positions": [{"ticker": "AAPL"}]}}],
+        deterministic_answer=None,
+    )
+    assert "$1,680.00" in answer.direct_answer
+    assert "$100.00" in answer.direct_answer
+    assert "$-14.00 per day" in answer.direct_answer
+    assert "not yet saved or market-verified" in answer.direct_answer
+
+
+def test_risk_efficiency_uses_historical_proxy_before_asking_for_objective():
+    results = [
+        {"tool_name": "portfolio_risk", "status": "complete", "summary": {
+            "profile": {"risk_tolerance": 6, "loss_capacity": 5},
+            "positions": [{"ticker": "MSFT", "weight": 1.0}],
+        }},
+        {"tool_name": "portfolio_backtest", "status": "complete", "summary": {"results": [
+            {"key": "current_portfolio", "label": "Current", "annual_return": .12, "volatility": .10, "maximum_drawdown": -.08},
+            {"key": "benchmark_spy", "label": "SPY", "annual_return": .10, "volatility": .12, "maximum_drawdown": -.11},
+        ]}},
+    ]
+    _, answer = compose_supported_answer(
+        intent="RISK_EFFICIENCY", question="more risk than necessary", context=context(),
+        tool_results=results, deterministic_answer=None,
+    )
+    assert "Return / volatility" in answer.direct_answer
+    assert "SPY" in answer.direct_answer
+    assert "lower drawdown" in answer.direct_answer
+
+
+def test_after_tax_index_answer_shows_gross_gap_and_requests_ledger():
+    results = [{"tool_name": "portfolio_backtest", "status": "complete", "summary": {"results": [
+        {"key": "current_portfolio", "total_return": .14},
+        {"key": "benchmark_spy", "label": "SPY", "total_return": .10},
+    ]}}]
+    _, answer = compose_supported_answer(
+        intent="DECISION_VS_INDEX", question="after taxes and fees", context=context(),
+        tool_results=results, deterministic_answer=None,
+    )
+    assert "4.0%" in answer.direct_answer
+    assert "maximum combined tax, fee, timing, and trading drag" in answer.direct_answer
+    assert "import that ledger" in answer.direct_answer
+
+
+def test_averaging_down_without_ticker_lists_saved_losers_and_asks_for_size():
+    results = [{"tool_name": "portfolio_risk", "status": "complete", "summary": {"positions": [
+        {"ticker": "NKE", "weight": .03, "unrealized_gain_loss": -1200},
+    ]}}]
+    _, answer = compose_supported_answer(
+        intent="AVERAGING_DOWN_REVIEW", question="average down", context=context(),
+        tool_results=results, deterministic_answer=None,
+    )
+    assert "NKE" in answer.direct_answer and "$-1,200" in answer.direct_answer
+    assert "proposed dollar amount" in answer.direct_answer
+
+
+def test_target_price_without_ticker_shows_relative_valuation_then_asks_for_method():
+    results = [
+        {"tool_name": "company_analysis", "status": "partial", "summary": {"message": "ticker required"}},
+        {"tool_name": "portfolio_overview", "status": "complete", "summary": {"candidates": [
+            {"ticker": "MSFT", "valuation": 62, "opportunity_score": 70},
+        ]}},
+    ]
+    _, answer = compose_supported_answer(
+        intent="TARGET_PRICE_REVIEW", question="attractive price", context=context(),
+        tool_results=results, deterministic_answer=None,
+    )
+    assert "MSFT" in answer.direct_answer and "62.0" in answer.direct_answer
+    assert "earnings multiple" in answer.direct_answer and "DCF" in answer.direct_answer

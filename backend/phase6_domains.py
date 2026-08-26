@@ -28,7 +28,7 @@ from .analytical_contract import (
 
 
 DOMAIN_SCHEMA_VERSION = "1"
-COMPANY_CALCULATION_VERSION = "company-analysis-v1"
+COMPANY_CALCULATION_VERSION = "company-analysis-v2-shared-research"
 COMPARISON_CALCULATION_VERSION = "company-comparison-v1"
 MACRO_CALCULATION_VERSION = "macro-state-v1"
 MARKET_CALCULATION_VERSION = "market-state-v1"
@@ -83,6 +83,7 @@ class CompanyAnalysisResult(BaseModel):
     evidence_quality: EvidenceQuality
     freshness: dict[str, Any]
     lineage: list[dict[str, Any]]
+    research_capabilities: dict[str, Any] = Field(default_factory=dict)
 
 
 class CompanyComparisonResult(BaseModel):
@@ -241,6 +242,8 @@ def _lineage(domain: str, dataset: str, rows: list[dict[str, Any]]) -> dict[str,
 
 def build_company_analysis(ticker: str, stored: dict[str, Any], research_row: dict[str, Any], *,
                            thesis_state: dict[str, Any] | None = None) -> CompanyAnalysisResult:
+    from .research_read_model import build_shared_research_model
+
     ticker = ticker.upper()
     securities = [row for row in stored.get("securities", []) if str(row.get("ticker")).upper() == ticker]
     fundamentals = [row for row in stored.get("fundamentals", []) if str(row.get("ticker")).upper() == ticker]
@@ -262,6 +265,10 @@ def build_company_analysis(ticker: str, stored: dict[str, Any], research_row: di
                           ("thesis", bool(thesis_state))):
         (available if present else missing).append(name)
     inappropriate = asset_type in {"etf", "fund", "mutual_fund", "index"}
+    shared = build_shared_research_model(ticker, bundle=stored) if not inappropriate else {}
+    shared_financials = shared.get("financial_health") or {}
+    shared_valuation = shared.get("valuation") or {}
+    shared_market = shared.get("market") or {}
     return CompanyAnalysisResult(
         ticker=ticker,
         identity={"name": research_row.get("company") or security.get("company_name") or ticker,
@@ -272,15 +279,18 @@ def build_company_analysis(ticker: str, stored: dict[str, Any], research_row: di
         price_state={"price": research_row.get("price"), "as_of": research_row.get("price_as_of"),
                      "data_status": "STALE" if _is_stale(research_row.get("price_as_of"), 7) else "CURRENT" if prices else "UNAVAILABLE"},
         performance={key: market_stats.get(key) for key in ("return_1d", "return_1m", "return_3m", "return_1y", "annualized_return", "max_drawdown")},
-        fundamentals={**stats, "as_of": research_row.get("fundamentals_as_of")},
+        fundamentals={**stats, **shared_financials, "as_of": shared_financials.get("as_of") or research_row.get("fundamentals_as_of")},
         fundamental_trend=trend,
-        profitability={"net_margin": research_row.get("net_margin"), "net_income": stats.get("net_income"),
-                       "free_cash_flow": stats.get("free_cash_flow")},
-        balance_sheet={"total_assets": stats.get("total_assets"), "total_debt": stats.get("total_debt"),
+        profitability={"net_margin": shared_financials.get("net_margin", research_row.get("net_margin")), "net_income": stats.get("net_income"),
+                       "free_cash_flow": shared_financials.get("free_cash_flow", stats.get("free_cash_flow"))},
+        balance_sheet={"total_assets": stats.get("total_assets"), "total_debt": shared_financials.get("debt", stats.get("total_debt")),
+                       "cash": shared_financials.get("cash"), "net_cash_debt": shared_financials.get("net_cash_debt"),
                        "debt_to_assets": stats.get("debt_to_assets")},
-        valuation={**valuation, "score": research_row.get("valuation_score")},
+        valuation={**valuation, **shared_valuation, "score": research_row.get("valuation_score")},
         momentum={"score": research_row.get("technical_score"), "price_change_1y": research_row.get("price_change_1y"),
-                  "rsi_14": market_stats.get("rsi_14"), "sma_50": market_stats.get("sma_50"), "sma_200": market_stats.get("sma_200")},
+                  "rsi_14": shared_market.get("rsi_14", market_stats.get("rsi_14")),
+                  "sma_50": (shared_market.get("moving_averages") or {}).get("sma_50", market_stats.get("sma_50")),
+                  "sma_200": (shared_market.get("moving_averages") or {}).get("sma_200", market_stats.get("sma_200"))},
         earnings_state=dict(research_row.get("earnings_state") or {"status": "UNAVAILABLE", "reason": "Structured earnings state is not stored."}),
         news_state={**dict(research_row.get("news_sentiment") or {}), "latest": research_row.get("latest_news")},
         eagleeyes_score=research_row.get("final_score"),
@@ -291,6 +301,7 @@ def build_company_analysis(ticker: str, stored: dict[str, Any], research_row: di
                    "news_as_of": news[0].get("published_at") if news else None},
         lineage=[_lineage("company", "security_metadata", securities), _lineage("company", "prices", prices),
                  _lineage("company", "fundamentals", fundamentals), _lineage("company", "news", news)],
+        research_capabilities=shared,
     )
 
 
@@ -594,7 +605,7 @@ def materialize_company(user_id: str, ticker: str, *, stored: dict[str, Any] | N
     from .analysis import security_research
     from .earnings_intelligence import build_earnings_intelligence
     ticker = ticker.upper()
-    stored = stored if stored is not None else database.security_data([ticker], price_limit=756)
+    stored = stored if stored is not None else database.research_capability_data([ticker, "SPY", "QQQ", "XLK", "SOXX"], price_limit=1400)
     research_row = research_row or security_research([ticker], stored=stored)[0]
     if not research_row.get("earnings_state"):
         research_row = {**research_row, "earnings_state": build_earnings_intelligence(

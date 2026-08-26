@@ -1992,6 +1992,145 @@ def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
     }
 
 
+def research_capability_data(tickers: list[str], price_limit: int = 1400) -> dict[str, Any]:
+    """Return the normalized source bundle consumed by both Research and Ask."""
+    normalized = sorted({value.strip().upper() for value in tickers if value.strip() and value.upper() != "CASH"})
+    base = security_data(normalized, price_limit=price_limit)
+    base.update({"security_master": [], "source_observations": [], "filing_facts": [], "fundamental_observations": [], "filing_documents": []})
+    if not DATABASE_URL or not normalized:
+        return base
+    with postgres_connection() as conn:
+        tables = conn.execute(
+            """SELECT to_regclass('public.research_source_observations') AS source_table,
+            to_regclass('public.fundamental_dimensional_facts') AS fact_table"""
+        ).fetchone()
+        master = conn.execute("SELECT * FROM public.security_master WHERE ticker=ANY(%s)", (normalized,)).fetchall()
+        observations = conn.execute(
+            """SELECT ticker,provider,dataset,metric,effective_at,retrieved_at,value_numeric,
+            value_text,value_json,source_url,entitlement,metadata FROM (
+              SELECT *,row_number() OVER(PARTITION BY ticker,dataset,metric ORDER BY effective_at DESC,retrieved_at DESC) AS position
+              FROM public.research_source_observations WHERE ticker=ANY(%s)
+            ) ranked WHERE position<=40 ORDER BY ticker,effective_at DESC""", (normalized,),
+        ).fetchall() if tables["source_table"] else []
+        facts = conn.execute(
+            """SELECT * FROM (
+              SELECT s.ticker,f.*,row_number() OVER(PARTITION BY s.ticker ORDER BY f.filed_at DESC,f.period_end DESC,f.id DESC) AS position
+              FROM public.fundamental_dimensional_facts f JOIN public.securities s ON s.id=f.security_id
+              WHERE s.ticker=ANY(%s)
+            ) ranked WHERE position<=10000 ORDER BY ticker,filed_at DESC,period_end DESC,id DESC""", (normalized,),
+        ).fetchall() if tables["fact_table"] else []
+        fundamentals = conn.execute(
+            """SELECT s.ticker,f.* FROM public.fundamental_observations f JOIN public.securities s ON s.id=f.security_id
+            WHERE s.ticker=ANY(%s) ORDER BY s.ticker,f.filed_at DESC NULLS LAST,f.period_end DESC LIMIT 10000""",
+            (normalized,),
+        ).fetchall()
+        documents = conn.execute(
+            """SELECT s.ticker,d.provider,d.document_type,d.external_id,d.title,d.source_url,
+            d.published_at,d.fetched_at,d.metadata,c.content,c.metadata AS chunk_metadata
+            FROM public.documents d JOIN public.securities s ON s.id=d.security_id
+            LEFT JOIN public.document_chunks c ON c.document_id=d.id AND c.chunk_index=0
+            WHERE s.ticker=ANY(%s) AND d.document_type IN ('10_k_section','risk_factor')
+            ORDER BY s.ticker,d.published_at DESC NULLS LAST LIMIT 1000""", (normalized,),
+        ).fetchall()
+    def normalized_rows(rows: Any) -> list[dict[str, Any]]:
+        output = []
+        for row in rows:
+            item = dict(row)
+            for key, value in list(item.items()):
+                if isinstance(value, (datetime, date)):
+                    item[key] = _iso(value)
+                elif isinstance(value, Decimal):
+                    item[key] = _number(value)
+                elif key in {"id", "security_id"} and value is not None:
+                    item[key] = str(value)
+            output.append(item)
+        return output
+    base["security_master"] = normalized_rows(master)
+    base["source_observations"] = normalized_rows(observations)
+    base["filing_facts"] = normalized_rows(facts)
+    base["fundamental_observations"] = normalized_rows(fundamentals)
+    base["filing_documents"] = normalized_rows(documents)
+    return base
+
+
+def research_header_data(ticker: str, price_limit: int = 260) -> dict[str, Any]:
+    """Lightweight first-paint bundle; excludes XBRL facts, documents, peers and news expansion."""
+    normalized = ticker.strip().upper()
+    base = security_data([normalized], price_limit=price_limit)
+    base.update({"security_master": [], "source_observations": [], "filing_facts": [],
+                 "fundamental_observations": [], "filing_documents": []})
+    if not DATABASE_URL or not normalized:
+        return base
+    with postgres_connection() as conn:
+        master = conn.execute("SELECT * FROM public.security_master WHERE ticker=%s LIMIT 1", (normalized,)).fetchall()
+        observations = conn.execute(
+            """SELECT ticker,provider,dataset,metric,effective_at,retrieved_at,value_numeric,
+            value_text,value_json,source_url,entitlement,metadata FROM (
+              SELECT *,row_number() OVER(PARTITION BY ticker,dataset,metric ORDER BY effective_at DESC,retrieved_at DESC) AS position
+              FROM public.research_source_observations
+              WHERE ticker=%s AND metric=ANY(%s)
+            ) ranked WHERE position=1 ORDER BY effective_at DESC""",
+            (normalized, ["exchange", "market_cap", "headquarters", "description", "employees", "shares_outstanding",
+                          "regular_close", "after_hours_price"]),
+        ).fetchall()
+    def normalized_rows(rows: Any) -> list[dict[str, Any]]:
+        output = []
+        for row in rows:
+            item = dict(row)
+            for key, value in list(item.items()):
+                if isinstance(value, (datetime, date)):
+                    item[key] = _iso(value)
+                elif isinstance(value, Decimal):
+                    item[key] = _number(value)
+                elif key in {"id", "security_id"} and value is not None:
+                    item[key] = str(value)
+            output.append(item)
+        return output
+    base["security_master"] = normalized_rows(master)
+    base["source_observations"] = normalized_rows(observations)
+    return base
+
+
+def research_peer_tickers(ticker: str, limit: int = 8) -> list[str]:
+    normalized = ticker.strip().upper()
+    if not DATABASE_URL or not normalized:
+        return []
+    with postgres_connection() as conn:
+        target = conn.execute(
+            """SELECT sector,industry FROM public.securities WHERE ticker=%s
+            ORDER BY CASE WHEN industry IS NOT NULL THEN 0 ELSE 1 END,updated_at DESC LIMIT 1""", (normalized,),
+        ).fetchone()
+        if not target:
+            return []
+        rows = conn.execute(
+            """SELECT DISTINCT ON (ticker) ticker,industry,sector FROM public.securities
+            WHERE ticker<>%s AND active=true AND asset_type='stock'
+              AND ((%s::text IS NOT NULL AND industry=%s::text) OR (%s::text IS NOT NULL AND sector=%s::text))
+            ORDER BY ticker,CASE WHEN industry=%s THEN 0 ELSE 1 END,updated_at DESC LIMIT %s""",
+            (normalized, target["industry"], target["industry"], target["sector"], target["sector"], target["industry"], max(1, min(limit, 20))),
+        ).fetchall()
+    return [row["ticker"] for row in rows]
+
+
+def save_research_read_model(payload: dict[str, Any], portfolio_id: str | None = None) -> None:
+    if not DATABASE_URL:
+        return
+    ticker = str(payload.get("ticker") or "").upper()
+    as_of = payload.get("generated_at") or utc_now()
+    scope_key = f"portfolio:{portfolio_id}" if portfolio_id else "global"
+    with postgres_connection() as conn:
+        conn.execute(
+            """INSERT INTO public.research_read_models(
+            ticker,portfolio_id,scope_key,as_of,model_version,payload,section_statuses,provider_lineage)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(ticker,scope_key,as_of,model_version) DO UPDATE SET
+            payload=excluded.payload,section_statuses=excluded.section_statuses,
+            provider_lineage=excluded.provider_lineage,created_at=now()""",
+            (ticker, portfolio_id, scope_key, as_of, payload.get("version"), _jsonb(payload),
+             _jsonb(payload.get("sections") or {}), _jsonb(payload.get("lineage") or {})),
+        )
+
+
 def earnings_transcript_chunks(ticker: str, limit: int = 8) -> list[dict[str, Any]]:
     """Return a bounded set of earnings-relevant chunks; never loads a full transcript."""
     if not DATABASE_URL:
@@ -3380,8 +3519,34 @@ def price_history(tickers: list[str], limit_per_ticker: int = 5000) -> list[dict
     })
     if not DATABASE_URL or not normalized:
         return []
+    bounded_limit = max(1, min(limit_per_ticker, 10000))
     with postgres_connection() as conn:
-        rows = conn.execute(
+        if bounded_limit <= 1000:
+            # Interactive charts need a bounded recent window, not a scan of
+            # every provider's entire history for every holding.  Select one
+            # adjusted row per date (Tiingo first when duplicated) and stop at
+            # the requested window inside each indexed security lookup.
+            rows = conn.execute(
+                """SELECT s.ticker, bars.provider, bars.ts, bars.close
+                FROM public.securities s
+                CROSS JOIN LATERAL (
+                  SELECT provider, ts, close FROM (
+                    SELECT DISTINCT ON (p.ts) p.provider, p.ts,
+                    coalesce(p.adjusted_close, p.close) AS close
+                    FROM public.price_bars p
+                    WHERE p.security_id=s.id AND p.interval='1d'
+                      AND coalesce(p.adjusted_close, p.close) IS NOT NULL
+                    ORDER BY p.ts DESC,
+                      CASE WHEN p.provider='tiingo' THEN 0 WHEN p.provider='polygon' THEN 1 ELSE 2 END
+                  ) deduplicated
+                  ORDER BY ts DESC LIMIT %s
+                ) bars
+                WHERE s.ticker = ANY(%s)
+                ORDER BY s.ticker, bars.ts""",
+                (bounded_limit, normalized),
+            ).fetchall()
+        else:
+            rows = conn.execute(
             """WITH provider_stats AS (
               SELECT s.ticker, p.provider, count(*) AS samples,
               min(p.ts) AS first_bar, max(p.ts) AS last_bar
@@ -3410,8 +3575,8 @@ def price_history(tickers: list[str], limit_per_ticker: int = 5000) -> list[dict
               WHERE s.ticker = ANY(%s) AND p.interval='1d'
                 AND coalesce(p.adjusted_close, p.close) IS NOT NULL
             ) bars WHERE position <= %s ORDER BY ticker, ts""",
-            (normalized, normalized, max(1, min(limit_per_ticker, 10000))),
-        ).fetchall()
+                (normalized, normalized, bounded_limit),
+            ).fetchall()
     return [
         {
             "ticker": row["ticker"], "date": _iso(row["ts"]),

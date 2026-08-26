@@ -171,6 +171,37 @@ def test_common_uppercase_words_are_not_tickers():
     assert plan.tickers == ()
 
 
+def test_owner_release_gate_questions_use_explicit_routes_and_do_not_invent_benchmark_tickers():
+    cases = {
+        "How has my portfolio performed versus the S&P 500 and Nasdaq?": ("PORTFOLIO_PERFORMANCE", ("portfolio_backtest",)),
+        "Which holdings contributed most to my gains and losses?": ("GAIN_LOSS_ATTRIBUTION", ("portfolio_risk",)),
+        "Am I taking more risk than necessary for my expected return?": ("RISK_EFFICIENCY", ("portfolio_risk", "portfolio_backtest")),
+        "How diversified is my portfolio across companies, sectors, and strategies?": ("DIVERSIFICATION", ("portfolio_intelligence",)),
+        "Are several of my holdings effectively the same bet?": ("OVERLAP_RISK", ("portfolio_intelligence",)),
+        "What percentage of my portfolio could I lose in a major market decline?": ("DOWNSIDE_CAPACITY", ("portfolio_scenario",)),
+        "Which positions are too large relative to my risk tolerance?": ("POSITION_SIZING", ("portfolio_risk",)),
+        "How much cash should I keep available?": ("CASH_RESERVE", ("portfolio_risk",)),
+        "What would happen if technology stocks fell 20%?": ("SECTOR_SHOCK", ("portfolio_intelligence",)),
+        "Are my investment decisions outperforming a simple index fund after taxes and fees?": ("DECISION_VS_INDEX", ("decision_journal", "portfolio_backtest")),
+        "Which holdings still have a strong investment thesis?": ("THESIS_STRENGTH", ("thesis_invalidation",)),
+        "Which positions should I buy, hold, reduce, or exit?": ("POSITION_ACTION_REVIEW", ("portfolio_overview",)),
+        "Is this a good time to add to a losing position, or would that be averaging down without justification?": ("AVERAGING_DOWN_REVIEW", ("portfolio_risk",)),
+        "What price would make a stock attractive, fairly valued, or overvalued?": ("TARGET_PRICE_REVIEW", ("company_analysis", "portfolio_overview")),
+        "What upcoming earnings, economic releases, or company events could affect my positions?": ("PORTFOLIO_EVENTS", ("portfolio_events",)),
+        "How much am I paying in option premiums, spreads, commissions, and time decay?": ("OPTIONS_COSTS", ("portfolio_risk",)),
+        "Are my options positioned with enough time to expiration for the expected move?": ("OPTIONS_EXPIRY", ("portfolio_risk",)),
+        "What are my expected return, maximum loss, breakeven, and exit plan for each trade?": ("TRADE_PLAN_METRICS", ("portfolio_risk",)),
+    }
+    for question, expected in cases.items():
+        plan = build_plan(question, "research", {"portfolio_id": "portfolio-61"})
+        assert (plan.intent, plan.tools) == expected
+        assert not capability_planner.should_use_compositional_planner(question, plan.intent, plan.confidence)
+    benchmark = build_plan("How has my portfolio performed versus the S&P 500 and Nasdaq?", "research")
+    assert benchmark.tickers == ()
+    next_cash = build_plan("Where should my next $10,000 go?", "research", {"portfolio_id": "portfolio-61"})
+    assert (next_cash.intent, next_cash.tools) == ("CASH_ALLOCATION", ("cash_allocation",))
+
+
 def test_phase8_visual_followup_reuses_registered_analytical_capability() -> None:
     previous = {
         "intent": "PORTFOLIO_RISK",
@@ -195,6 +226,21 @@ def test_phase8_risk_market_and_backtest_followups_use_normal_capability_boundar
     assert backtest.requires_portfolio
 
 
+def test_structured_followup_reply_keeps_prior_analytical_intent() -> None:
+    option = build_plan(
+        "AAPL 200C, long 2, expiry 2026-12-18, fill 8.40, bid 8.10, ask 8.60, commission 1.30, theta -0.07",
+        "research", {"portfolio_id": "portfolio-61"}, {"intent": "OPTIONS_COSTS"},
+    )
+    assert option.intent == "OPTIONS_COSTS"
+    assert option.tools == ("portfolio_risk",)
+
+    target = build_plan(
+        "MSFT, DCF", "research", {"portfolio_id": "portfolio-61"}, {"intent": "TARGET_PRICE_REVIEW"},
+    )
+    assert target.intent == "TARGET_PRICE_REVIEW"
+    assert target.tools == ("company_analysis", "portfolio_overview")
+
+
 def test_job_status_followup_reuses_conversation_capability_without_job_id() -> None:
     scenario = build_plan("is it done?", "research", {"portfolio_id": "portfolio-61"}, {
         "pending_jobs": [{"job_id": "job-1", "kind": "SIMULATION", "status": "pending"}],
@@ -206,3 +252,23 @@ def test_job_status_followup_reuses_conversation_capability_without_job_id() -> 
         "analytical_context": {"active_capabilities": ["portfolio_analysis"]},
     })
     assert (completed_optimizer.intent, completed_optimizer.tools) == ("PORTFOLIO_ANALYSIS", ("portfolio_analysis",))
+
+
+def test_research_context_hints_enforce_bounded_tools() -> None:
+    valuation = build_plan("Explain this valuation for MSFT", "research", {
+        "ticker": "MSFT", "research_section": "valuation", "research_capabilities": ["valuation.pe_ttm"],
+    })
+    assert valuation.intent == "RESEARCH_CONTEXT"
+    assert valuation.tools == ("research_context",)
+    assert valuation.research_capabilities == ("valuation.pe_ttm",)
+
+    portfolio = build_plan("Show portfolio impact for NVDA", "research", {
+        "ticker": "NVDA", "research_section": "portfolio_fit", "research_capabilities": ["portfolio.correlation"],
+    })
+    assert portfolio.tools == ("research_portfolio_fit",)
+    assert portfolio.requires_portfolio is True
+
+    peer = build_plan("Compare with competitor for MSFT", "research", {
+        "ticker": "MSFT", "research_section": "overview", "research_capabilities": ["overview.competitor"],
+    })
+    assert peer.tools == ("research_peer_selection",)

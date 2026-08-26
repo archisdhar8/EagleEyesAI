@@ -138,7 +138,7 @@ def _descriptor(name: str, description: str, intents: tuple[str, ...], entities:
 # Names are the existing Ask/read-model/job capability names. Descriptors do not
 # create planner-only aliases and never expose a Python callable.
 CAPABILITY_REGISTRY: dict[str, CapabilityDescriptor] = {
-    "company_analysis": _descriptor("company_analysis", "Fast typed company analysis including supported earnings.", ("company", "earnings"), (EntityKind.SECURITY,), "CompanyAnalysisResult", min_entities=1, max_entities=1, source=SourceCategory.VERIFIED_FACT),
+    "company_analysis": _descriptor("company_analysis", "Bounded shared research intelligence for company overview, financial health, valuation, earnings, catalysts, risks, technicals, ownership/sentiment, and decision evidence.", ("company", "earnings", "research_intelligence"), (EntityKind.SECURITY,), "CompanyAnalysisResult", min_entities=1, max_entities=1, source=SourceCategory.VERIFIED_FACT),
     "company_comparison": _descriptor("company_comparison", "Compare supported companies and optionally enrich portfolio fit.", ("comparison",), (EntityKind.SECURITY,), "CompanyComparisonResult", min_entities=2, max_entities=MAX_COMPARISON_ENTITIES, optional=("portfolio",)),
     "valuation_ranking": _descriptor("valuation_ranking", "Compare valuation relative to supported growth evidence.", ("valuation",), (EntityKind.SECURITY, EntityKind.PORTFOLIO), "AnalysisResult", portfolio=True),
     "multifactor_screen": _descriptor("multifactor_screen", "Screen valuation, fundamentals, and momentum together.", ("fundamental_trend", "screen"), (EntityKind.SECURITY, EntityKind.PORTFOLIO), "AnalysisResult", portfolio=True),
@@ -374,7 +374,12 @@ def deterministic_capability_plan(question: str, entities: list[ResolvedEntity],
     else:
         if len(securities) >= 2 and any(word in lower for word in ("compare", " versus ", " vs ", "which one")):
             steps.append(_step("company_comparison", securities, ReasonCode.COMPARISON_CONTEXT))
-        elif securities and any(word in lower for word in ("fundamental", "valuation", "expensive", "earnings")):
+        elif securities and any(word in lower for word in (
+            "fundamental", "valuation", "expensive", "earnings", "make money", "business", "revenue segment",
+            "margin", "cash flow", "catalyst", "company risk", "technical", "moving average", "rsi", "support",
+            "resistance", "ownership", "insider", "short interest", "sentiment", "bull case", "bear case",
+            "investment case", "decision summary", "research source", "data freshness",
+        )):
             steps.append(_step("company_analysis", securities[:1], ReasonCode.PRIMARY_QUESTION))
         if has_portfolio and any(word in lower for word in ("expensive", "overvalued", "valuation relative")):
             steps.append(_step("valuation_ranking", entities, ReasonCode.PRIMARY_QUESTION))
@@ -486,6 +491,10 @@ def should_use_compositional_planner(question: str, direct_intent: str, confiden
         "DATA_QUALITY", "SCORE_ATTRIBUTION", "THESIS_INVALIDATION", "PORTFOLIO_ANALYSIS",
         "MULTIFACTOR_SCREEN", "RECOMMENDATION_COUNTERCASE", "CASH_ALLOCATION",
         "RESEARCH_RANKING",
+        "PORTFOLIO_PERFORMANCE", "GAIN_LOSS_ATTRIBUTION", "RISK_EFFICIENCY", "DIVERSIFICATION",
+        "OVERLAP_RISK", "DOWNSIDE_CAPACITY", "POSITION_SIZING", "CASH_RESERVE", "SECTOR_SHOCK",
+        "DECISION_VS_INDEX", "THESIS_STRENGTH", "POSITION_ACTION_REVIEW", "AVERAGING_DOWN_REVIEW",
+        "TARGET_PRICE_REVIEW", "OPTIONS_COSTS", "OPTIONS_EXPIRY", "TRADE_PLAN_METRICS",
     }
     if direct_intent in established_compound_routes:
         return False

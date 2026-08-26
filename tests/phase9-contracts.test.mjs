@@ -38,9 +38,11 @@ test("internal execution stays hidden while grounded navigation remains visible"
 });
 
 test("company research leads with one evidence report and only the approved actions", () => {
-  for (const section of ["Price", "Fundamentals", "Valuation", "Momentum", "Risk", "Portfolio fit"]) assert.ok(research.includes(section), section);
+  for (const section of ["Company overview", "Financial health", "Valuation", "Earnings", "Thesis", "Catalysts & risks", "Market & technical data", "Ownership & sentiment", "Portfolio relevance", "Decision summary", "Data freshness & sources"]) assert.ok(research.includes(section), section);
   assert.match(research, /Add to watchlist/);
-  assert.match(research, /Ask EagleEyes/);
+  assert.match(research, /Explain this valuation/);
+  assert.match(research, /Challenge bull case/);
+  assert.match(research, /Show portfolio impact/);
   assert.doesNotMatch(research, /Record WATCH decision/);
   assert.doesNotMatch(research, /Test portfolio scenario/);
 });

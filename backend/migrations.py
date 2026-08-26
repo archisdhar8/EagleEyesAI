@@ -100,6 +100,9 @@ EXPECTED_TABLES = {
     "decision_preferences",
     "validation_folds",
     "validation_runs",
+    "fundamental_dimensional_facts",
+    "research_source_observations",
+    "research_read_models",
 }
 
 

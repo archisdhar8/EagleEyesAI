@@ -29,6 +29,10 @@ def test_consolidated_overview_is_portfolio_scoped_cached_and_ai_free(monkeypatc
     monkeypatch.setattr("backend.main.earnings_intelligence_view", lambda ticker, user: {"status": "AVAILABLE"})
     monkeypatch.setattr("backend.main.forecasting.build_intelligence", lambda *args, **kwargs: {"markets": []})
     monkeypatch.setattr("backend.main.evidence.get_changes", lambda *args, **kwargs: {"changes": []})
+    monkeypatch.setattr("backend.main.security_snapshot_overview", lambda ticker: {
+        "market": {"price": 201.5, "as_of": "2026-08-18", "price_history": [{"date": "2026-08-18", "close": 201.5}]},
+        "fundamentals": {"revenue_growth": .12}, "fundamental_periods": [], "sentiment_summary": {},
+    })
     calls = []
     monkeypatch.setattr("backend.main.theses.evidence_draft", lambda ticker, research, allow_ai=True: (
         calls.append(allow_ai) or {"draft": {
@@ -46,6 +50,9 @@ def test_consolidated_overview_is_portfolio_scoped_cached_and_ai_free(monkeypatc
     assert first["portfolio"]["id"] == "selected"
     assert first["membership"] == {"holding": True, "watchlist": True, "holding_detail": {"ticker": "AAPL", "weight": .2}}
     assert first["cases"]["bear"]["full_text"].startswith("Bear paragraph")
+    assert first["intelligence"]["version"] == "research-intelligence-v1"
+    assert first["intelligence"]["market"]["price"] == 201.5
+    assert first["intelligence"]["valuation"]["fair_value"] is None
     assert calls == [False]
     assert first["cache"]["status"] == "miss"
     assert second["cache"]["status"] == "hit"

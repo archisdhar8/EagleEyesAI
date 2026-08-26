@@ -39,6 +39,106 @@ THEMES: dict[str, dict[str, Any]] = {
 }
 
 
+RESEARCH_INTELLIGENCE_VERSION = "research-intelligence-v1"
+
+
+def build_research_intelligence(
+    security: dict[str, Any], *, earnings: dict[str, Any] | None = None,
+    forecasts: dict[str, Any] | None = None, cases: dict[str, Any] | None = None,
+    market_snapshot: dict[str, Any] | None = None,
+    portfolio: dict[str, Any] | None = None, membership: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize the shared, bounded research read model used by Research and Ask.
+
+    The function deliberately exposes missing fields as ``None``/UNAVAILABLE.
+    It never backfills a display slot with an estimate or neutral default.
+    """
+    earnings = earnings or {}; forecasts = forecasts or {}; cases = cases or {}
+    snapshot = market_snapshot or {}; membership = membership or {}
+    stats = security.get("market_statistics") or {}
+    fundamentals = security.get("fundamental_statistics") or security.get("fundamentals") or {}
+    trend = security.get("fundamental_trend") or {}
+    valuation = security.get("valuation_evidence") or security.get("valuation_methodology") or {}
+    market = snapshot.get("market") or {}
+    snap_fundamentals = snapshot.get("fundamentals") or {}
+    metrics = {**snap_fundamentals, **fundamentals}
+    catalysts = list(security.get("catalysts") or [])
+    risks = list(security.get("thesis_risks") or [])
+    forecast_markets = list(forecasts.get("markets") or [])
+    if forecast_markets:
+        catalysts += [{"title": item.get("title"), "published_at": item.get("resolution_date") or item.get("closes_at"),
+                       "type": item.get("category") or "market expectation", "probability": (item.get("probability") or {}).get("probability") if isinstance(item.get("probability"), dict) else item.get("probability")}
+                      for item in forecast_markets[:3]]
+    provenance = {
+        "evidence_type": "VERIFIED_FACT", "source": security.get("source") or "EagleEyes stored research",
+        "provider": security.get("data_source") or "stored providers", "as_of": security.get("price_as_of") or security.get("fundamentals_as_of"),
+        "last_updated": security.get("freshness", {}).get("price_as_of") or security.get("freshness", {}).get("fundamentals_as_of"),
+        "freshness_status": (security.get("freshness") or {}).get("status") or "unknown",
+        "coverage_status": "PARTIAL" if security.get("missing_data") else "SUCCESS",
+        "confidence": (security.get("freshness") or {}).get("coverage") or security.get("confidence"),
+        "methodology": "stored evidence; deterministic calculations", "model_version": RESEARCH_INTELLIGENCE_VERSION,
+    }
+    return {
+        "version": RESEARCH_INTELLIGENCE_VERSION,
+        "identity": {
+            "ticker": security.get("ticker"), "company": security.get("company"), "exchange": security.get("exchange"),
+            "sector": security.get("sector"), "industry": security.get("industry"),
+            "description": security.get("business_description") or security.get("description"),
+            "market_cap": metrics.get("market_cap"), "employees": security.get("employees"),
+            "founded": security.get("founded"), "headquarters": security.get("headquarters"),
+        },
+        "market": {
+            "price": market.get("price", security.get("price")), "daily_change": market.get("daily_change") or stats.get("return_1d"),
+            "after_hours_change": stats.get("after_hours_change"), "as_of": market.get("as_of") or security.get("price_as_of"),
+            "delay": security.get("market_delay"), "history": market.get("price_history") or [],
+            "returns": market.get("returns") or {}, "moving_averages": market.get("moving_averages") or {},
+            "support_resistance": market.get("support_resistance") or {}, "rsi_14": market.get("rsi_14"),
+            "beta": market.get("beta"), "maximum_drawdown": market.get("maximum_drawdown"),
+            "volatility": market.get("volatility"), "trend": (market.get("moving_averages") or {}).get("trend_bucket"),
+            "calculation": market.get("calculation") or {}, "lineage": market.get("lineage") or [],
+        },
+        "overview": {
+            "business_description": security.get("business_description") or security.get("description"),
+            "segments": security.get("revenue_segments") or [], "geographies": security.get("geographic_exposure") or [],
+            "customers": security.get("customers") or [], "competitors": security.get("competitors") or [],
+            "peer_methodology": (security.get("comparable_valuation") or {}).get("basis"),
+        },
+        "financial_health": {
+            "revenue_growth": trend.get("revenue_growth", security.get("revenue_growth")),
+            "eps_growth": metrics.get("eps_growth"), "gross_margin": metrics.get("gross_margin"),
+            "operating_margin": metrics.get("operating_margin"), "net_margin": trend.get("net_margin", security.get("net_margin")),
+            "free_cash_flow": metrics.get("free_cash_flow"), "cash": metrics.get("cash"), "debt": metrics.get("total_debt"),
+            "share_count_change": metrics.get("share_count_change"), "roic": metrics.get("roic"),
+            "periods": snapshot.get("fundamental_periods") or [], "trend_label": trend.get("label"),
+        },
+        "valuation": {
+            "status": valuation.get("status") or "unavailable", "metrics": valuation.get("raw_metrics") or {},
+            "components": valuation.get("components") or [], "peer": security.get("comparable_valuation") or {},
+            "methodology": valuation.get("method") or valuation.get("formula"), "limitations": valuation.get("limitations") or [],
+            "fair_value": None, "implied_expectations": None,
+        },
+        "earnings": earnings,
+        "thesis": {"bull": cases.get("bull"), "base": cases.get("base"), "bear": cases.get("bear")},
+        "catalysts": catalysts, "risks": risks,
+        "ownership_sentiment": {"sentiment": snapshot.get("sentiment_summary") or {}, "ownership": security.get("ownership")},
+        "portfolio_fit": {
+            "portfolio": portfolio, "holding": membership.get("holding"), "holding_detail": membership.get("holding_detail"),
+            "summary": security.get("portfolio_fit"), "analytics": security.get("portfolio_analytics"),
+        },
+        "decision": {
+            "rating": None, "confidence": (security.get("freshness") or {}).get("coverage"), "attractive_entry": None,
+            "invalidation": ((cases.get("bull") or {}).get("invalidation_conditions") or [None])[0],
+            "next_review": None, "bull_thesis": (cases.get("bull") or {}).get("outcome"),
+            "bear_thesis": (cases.get("bear") or {}).get("outcome"),
+            "key_catalyst": (catalysts[0].get("title") if catalysts else None),
+            "primary_risk": (risks[0] if risks else None),
+        },
+        "sources": {"verified": provenance, "forecast": forecasts.get("source"),
+                    "opinion": {"methodology": "Evidence-linked deterministic cases", "model_version": RESEARCH_INTELLIGENCE_VERSION}},
+        "missing_data": security.get("missing_data") or [],
+    }
+
+
 def _number(value: Any, default: float = 0.0) -> float:
     try:
         return float(value) if value is not None else default

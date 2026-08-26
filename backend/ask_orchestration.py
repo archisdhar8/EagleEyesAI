@@ -21,12 +21,34 @@ class AskPlan:
     requires_portfolio: bool
     rationale: str
     limits: dict[str, int]
+    research_section: str | None = None
+    research_capabilities: tuple[str, ...] = ()
 
     def payload(self) -> dict[str, Any]:
         return {**asdict(self), "tools": list(self.tools), "tickers": list(self.tickers)}
 
 
 _INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Broad owner questions have explicit routes.  Letting these fall through
+    # to the generic compositional planner previously produced execution-status
+    # prose ("portfolio risk returned SUCCESS") instead of a user answer.
+    ("PORTFOLIO_PERFORMANCE", ("portfolio performed", "portfolio performance versus", "portfolio performance against", "performed versus the s&p", "performed versus the nasdaq")),
+    ("GAIN_LOSS_ATTRIBUTION", ("contributed most to my gains", "contributed most to my losses", "gains and losses", "gain and loss contributors")),
+    ("RISK_EFFICIENCY", ("more risk than necessary", "risk than necessary for my expected return", "risk for my expected return")),
+    ("DIVERSIFICATION", ("how diversified is my portfolio", "diversified across companies", "diversified across sectors", "diversified across strategies")),
+    ("OVERLAP_RISK", ("effectively the same bet", "holdings the same bet", "duplicate bets", "overlapping bets")),
+    ("DOWNSIDE_CAPACITY", ("percentage of my portfolio could i lose", "major market decline", "portfolio could i lose")),
+    ("POSITION_SIZING", ("positions are too large", "too large relative to my risk tolerance", "position size relative to my risk")),
+    ("CASH_RESERVE", ("how much cash should i keep", "cash should i keep available", "cash reserve")),
+    ("SECTOR_SHOCK", ("technology stocks fell", "technology stocks fall", "tech stocks fell", "tech stocks fall", "sector fell 20%")),
+    ("DECISION_VS_INDEX", ("investment decisions outperforming", "simple index fund after taxes and fees", "decisions outperform an index")),
+    ("THESIS_STRENGTH", ("holdings still have a strong investment thesis", "strong investment thesis", "strongest theses")),
+    ("POSITION_ACTION_REVIEW", ("positions should i buy, hold, reduce, or exit", "buy, hold, reduce, or exit", "buy hold reduce or exit")),
+    ("AVERAGING_DOWN_REVIEW", ("averaging down without justification", "add to a losing position", "average down")),
+    ("TARGET_PRICE_REVIEW", ("price would make a stock attractive", "fairly valued, or overvalued", "attractive, fairly valued", "target price")),
+    ("OPTIONS_COSTS", ("option premiums, spreads, commissions", "time decay", "option premiums")),
+    ("OPTIONS_EXPIRY", ("options positioned with enough time", "time to expiration", "expected move")),
+    ("TRADE_PLAN_METRICS", ("expected return, maximum loss, breakeven", "maximum loss, breakeven", "exit plan for each trade")),
     ("MACRO_STATE", ("macro environment", "economic conditions", "recession risks", "rates and inflation", "macro risks", "macro factors")),
     ("MARKET_STATE", ("kind of market", "market risk-on", "market risk off", "risk-on or risk-off", "sectors are leading", "sector leadership", "market environment", "current market regime", "market regime")),
     ("PREDICTION_MARKETS", ("prediction markets matter", "probabilities changed", "market-implied risks", "prediction-market risks", "prediction market odds")),
@@ -43,13 +65,13 @@ _INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     )),
     ("MULTI_SCENARIO", ("what would happen to my portfolio", "interest rates rose", "ai spending slowed", "economy entered a recession")),
     ("WATCHLIST_COMPARISON", ("watchlist stocks", "watchlist names", "stronger risk-adjusted case")),
-    ("PORTFOLIO_EVENTS", ("upcoming earnings reports", "economic events", "company catalysts", "upcoming catalysts")),
+    ("PORTFOLIO_EVENTS", ("upcoming earnings reports", "upcoming earnings", "economic events", "economic releases", "company catalysts", "company events", "upcoming catalysts")),
     ("DATA_QUALITY", ("missing reliable data", "trust their rankings", "data coverage", "missing data")),
     ("SCORE_ATTRIBUTION", ("score change", "score changed", "inputs contributed", "why did this company")),
     ("THESIS_INVALIDATION", ("invalidate the thesis", "would invalidate", "largest positions")),
     ("MULTIFACTOR_SCREEN", ("improving fundamentals", "reasonable valuation", "positive momentum")),
     ("RECOMMENDATION_COUNTERCASE", ("arguments against", "top recommendation", "bear case against")),
-    ("CASH_ALLOCATION", ("invested new cash", "new cash today", "better than holding cash", "where should it go")),
+    ("CASH_ALLOCATION", ("invested new cash", "new cash today", "better than holding cash", "where should it go", "where should my next")),
     ("BACKTEST", ("backtest", "historical test against", "five-year test against")),
     ("RETROSPECTIVE", ("why did i", "original decision", "decision journal", "retrospective", "mistakes repeat", "forecast calibration", "my decisions", "saved decisions", "decision history")),
     ("EARNINGS", ("earnings", "guidance", "estimate revision", "reported quarter", "beat estimates", "missed estimates")),
@@ -86,7 +108,10 @@ def _intent(question: str) -> str:
 
 
 def _tickers(question: str, page_context: dict[str, Any] | None, previous: dict[str, Any] | None) -> tuple[str, ...]:
-    stop = {"I", "A", "AN", "AI", "ETF", "ETFS", "SEC", "CPI", "GDP", "FED", "USD", "CEO", "THE", "WHAT", "WHEN", "WHY", "HOW"}
+    stop = {"I", "A", "AN", "AI", "ETF", "ETFS", "SEC", "CPI", "GDP", "FED", "USD", "CEO", "THE", "WHAT", "WHEN", "WHY", "HOW",
+            # Benchmark names are entities, not one-letter securities.  In
+            # particular, the old regex turned "S&P 500" into tickers S and P.
+            "S", "P", "NASDAQ", "DOW", "RUSSELL"}
     found = [value for value in re.findall(r"\b[A-Z]{1,5}\b", question) if value not in stop]
     context_ticker = str((page_context or {}).get("ticker") or "").upper().strip()
     if context_ticker and context_ticker not in found:
@@ -116,6 +141,23 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
         # generic company route would otherwise collapse to the first ticker.
         intent = "COMPARISON"
     mappings = {
+        "PORTFOLIO_PERFORMANCE": ("portfolio_backtest",),
+        "GAIN_LOSS_ATTRIBUTION": ("portfolio_risk",),
+        "RISK_EFFICIENCY": ("portfolio_risk", "portfolio_backtest"),
+        "DIVERSIFICATION": ("portfolio_intelligence",),
+        "OVERLAP_RISK": ("portfolio_intelligence",),
+        "DOWNSIDE_CAPACITY": ("portfolio_scenario",),
+        "POSITION_SIZING": ("portfolio_risk",),
+        "CASH_RESERVE": ("portfolio_risk",),
+        "SECTOR_SHOCK": ("portfolio_intelligence",),
+        "DECISION_VS_INDEX": ("decision_journal", "portfolio_backtest"),
+        "THESIS_STRENGTH": ("thesis_invalidation",),
+        "POSITION_ACTION_REVIEW": ("portfolio_overview",),
+        "AVERAGING_DOWN_REVIEW": ("portfolio_risk",),
+        "TARGET_PRICE_REVIEW": ("company_analysis", "portfolio_overview"),
+        "OPTIONS_COSTS": ("portfolio_risk",),
+        "OPTIONS_EXPIRY": ("portfolio_risk",),
+        "TRADE_PLAN_METRICS": ("portfolio_risk",),
         "OPPORTUNITY_RANKING": ("portfolio_overview",),
         "THESIS_REPLACEMENT": ("thesis_replacement",),
         "PORTFOLIO_CHANGE": ("portfolio_change",),
@@ -125,7 +167,7 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
         "WATCHLIST_COMPARISON": ("watchlist_comparison",),
         "PORTFOLIO_EVENTS": ("portfolio_events",),
         "DATA_QUALITY": ("data_quality",),
-        "SCORE_ATTRIBUTION": ("score_attribution",),
+        "SCORE_ATTRIBUTION": ("score_attribution", "portfolio_overview"),
         "THESIS_INVALIDATION": ("thesis_invalidation",),
         "MULTIFACTOR_SCREEN": ("multifactor_screen",),
         "RECOMMENDATION_COUNTERCASE": ("recommendation_countercase",),
@@ -157,7 +199,39 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
     }
     enabled = set((page_context or {}).get("enabled_context") or ("evidence", "thesis", "portfolio"))
     tools = list(mappings[intent])
+    research_section = str((page_context or {}).get("research_section") or "").strip().lower() or None
+    research_capabilities = tuple(dict.fromkeys(str(value) for value in (page_context or {}).get("research_capabilities") or () if value))[:12]
+    if research_section and research_capabilities:
+        if research_section == "portfolio_fit":
+            intent, tools = "RESEARCH_PORTFOLIO_CONTEXT", ["research_portfolio_fit"]
+        elif research_section == "overview" and "overview.competitor" in research_capabilities and len(tickers) < 2:
+            intent, tools = "RESEARCH_PEER_SELECTION", ["research_peer_selection"]
+        else:
+            intent, tools = "RESEARCH_CONTEXT", ["research_context"]
+    if intent == "AVERAGING_DOWN_REVIEW" and tickers:
+        tools = ["company_analysis"]
     previous_structured = (previous_analysis or {}).get("analytical_context") if isinstance((previous_analysis or {}).get("analytical_context"), dict) else (previous_analysis or {})
+    # Short data replies (a ticker, trade ticket, valuation method, or add
+    # amount) should complete the prior analytical question instead of being
+    # mistaken for a brand-new generic company lookup.
+    contextual_followups = {
+        "SCORE_ATTRIBUTION": ("score_attribution", "portfolio_overview"),
+        "THESIS_INVALIDATION": ("thesis_invalidation",),
+        "THESIS_STRENGTH": ("thesis_invalidation",),
+        "AVERAGING_DOWN_REVIEW": ("company_analysis", "portfolio_risk"),
+        "TARGET_PRICE_REVIEW": ("company_analysis", "portfolio_overview"),
+        "OPTIONS_COSTS": ("portfolio_risk",),
+        "OPTIONS_EXPIRY": ("portfolio_risk",),
+        "TRADE_PLAN_METRICS": ("portfolio_risk",),
+    }
+    prior_intent = str((previous_analysis or {}).get("intent") or "").upper()
+    looks_like_context_reply = bool(
+        re.search(r"\b[A-Z]{1,5}\b", question)
+        or re.search(r"\b(?:dcf|multiple|cash flow|contracts?|expiry|expiration|strike|fill|bid|ask|theta|commission|catalyst|long|short)\b", question, re.I)
+        or re.search(r"\$\s*\d|\b\d+(?:\.\d+)?%", question)
+    )
+    if intent in {"GENERAL", "COMPANY_RESEARCH"} and prior_intent in contextual_followups and looks_like_context_reply:
+        intent, tools = prior_intent, list(contextual_followups[prior_intent])
     # A status follow-up resolves against the durable job reference retained in
     # the conversation.  This selects an existing capability; it does not add
     # a planner capability or require the user to paste a job id.
@@ -191,6 +265,7 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
         "portfolio_intelligence", "portfolio_scenario", "watchlist_comparison", "portfolio_events",
         "data_quality", "score_attribution", "multifactor_screen", "recommendation_countercase",
         "cash_allocation", "thesis_invalidation", "portfolio_analysis", "portfolio_risk", "security_ranking", "benchmark_outlook", "portfolio_backtest",
+        "research_portfolio_fit",
     }
     if "portfolio" not in enabled:
         tools = [tool for tool in tools if tool not in portfolio_tools]
@@ -213,6 +288,8 @@ def build_plan(question: str, workspace: str, page_context: dict[str, Any] | Non
         rationale=f"Selected the smallest approved tool set for {intent.lower().replace('_', ' ')}.",
         limits={"max_tool_calls": MAX_TOOL_CALLS, "max_retries": MAX_RETRIES,
                 "max_replans": MAX_REPLANS, "overall_seconds": OVERALL_BUDGET_SECONDS},
+        research_section=research_section,
+        research_capabilities=research_capabilities,
     )
 
 

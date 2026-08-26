@@ -925,7 +925,7 @@ def execute_task(context: dict[str, Any], task: dict[str, Any], deps: dict[str, 
             as_of=portfolio.get("updated_at"), quality=_quality("high", ["Saved authenticated portfolio snapshot"]), assumptions=[], warnings=[],
             how="Loaded the authenticated user's saved portfolio and holdings without using an LLM calculation.")
     if task_type == "price_history":
-        rows = database.price_history(tickers)
+        rows = database.price_history(tickers, _trading_sessions(str(task.get("query", {}).get("time_range", "1y"))) + 20)
         providers = sorted({row["provider"] for row in rows})
         as_of = max((row["date"] for row in rows), default=now)
         covered = sorted({row["ticker"] for row in rows})
@@ -1013,13 +1013,28 @@ def execute_task(context: dict[str, Any], task: dict[str, Any], deps: dict[str, 
             total=sum(raw.values()) or len(raw); weights=pd.Series({key:(value/total if sum(raw.values()) else 1/total) for key,value in raw.items()})
             series=(returns[weights.index]*weights).sum(axis=1); cumulative=(1+series).cumprod()-1
             data={"total_return":float(cumulative.iloc[-1]),"annualized_volatility":float(series.std()*np.sqrt(252)),"series":[{"date":idx.date().isoformat(),"value":round(float(value),6)} for idx,value in cumulative.items()]}
-            benchmark = str(task.get("query", {}).get("filters", {}).get("benchmark") or "").upper()
-            if benchmark and benchmark in frame.columns:
+            query_filters = task.get("query", {}).get("filters", {})
+            requested_benchmarks = list(dict.fromkeys([
+                *list(query_filters.get("benchmarks") or []),
+                *([query_filters.get("benchmark")] if query_filters.get("benchmark") else []),
+            ]))
+            benchmark_results: list[dict[str, Any]] = []
+            for raw_benchmark in requested_benchmarks:
+                benchmark = str(raw_benchmark or "").upper()
+                if benchmark not in frame.columns:
+                    continue
                 benchmark_series = frame[benchmark].dropna()
                 benchmark_series = benchmark_series / benchmark_series.iloc[0] - 1
-                data["benchmark"] = benchmark
-                data["benchmark_return"] = float(benchmark_series.iloc[-1])
-                data["benchmark_series"] = [{"date": idx.date().isoformat(), "value": round(float(value), 6)} for idx, value in benchmark_series.items()]
+                benchmark_results.append({
+                    "ticker": benchmark, "total_return": float(benchmark_series.iloc[-1]),
+                    "series": [{"date": idx.date().isoformat(), "value": round(float(value), 6)} for idx, value in benchmark_series.items()],
+                })
+            if benchmark_results:
+                primary = benchmark_results[0]
+                data["benchmark"] = primary["ticker"]
+                data["benchmark_return"] = primary["total_return"]
+                data["benchmark_series"] = primary["series"]
+                data["benchmarks"] = benchmark_results
             how="Calculated daily weighted portfolio returns from adjusted closes using normalized current weights, then compounded them. Historical holdings reconstruction is not available."
         elif task_type == "security_performance":
             normalized=frame/frame.iloc[0]-1; data={"series":{col:[{"date":idx.date().isoformat(),"value":round(float(value),6)} for idx,value in normalized[col].items()] for col in normalized}}
@@ -1205,13 +1220,26 @@ def execute_task(context: dict[str, Any], task: dict[str, Any], deps: dict[str, 
     raise ValueError(f"Unsupported dashboard task type: {task_type}")
 
 
-def portfolio_performance_widget(portfolio: dict[str, Any], years: int = 1) -> dict[str, Any]:
+def portfolio_performance_widget(
+    portfolio: dict[str, Any], years: int = 1, benchmarks: list[str] | None = None,
+) -> dict[str, Any]:
     """Build the manual terminal's historical portfolio-return widget.
 
     This deliberately reuses the same deterministic adjusted-price calculation,
     lineage, assumptions, and verification contract as AI-compiled dashboards.
     """
-    query = {"tickers": [], "time_range": f"{max(1, min(20, years))}y", "filters": {}}
+    requested_benchmarks = list(dict.fromkeys(
+        str(value).upper() for value in (benchmarks or []) if value
+    ))
+    holding_tickers = [
+        str(row.get("ticker") or "").upper() for row in portfolio.get("holdings", [])
+        if row.get("ticker") and str(row.get("ticker")).upper() != "CASH"
+    ]
+    query = {
+        "tickers": list(dict.fromkeys([*holding_tickers, *requested_benchmarks])),
+        "time_range": f"{max(1, min(20, years))}y",
+        "filters": {"benchmarks": requested_benchmarks},
+    }
     context = {"user_id": str(portfolio.get("user_id") or ""), "portfolio": portfolio}
     prices_task = {"id": "prices", "task_type": "price_history", "depends_on": [], "required_for_narrative": False,
                    "query": query, "calculation_version": CALCULATION_VERSION}
@@ -1731,11 +1759,13 @@ def create_empty_dashboard_draft(user_id: str, portfolio_id: str | None, convers
 
 def _binding_query(binding: DashboardDataBinding) -> dict[str, Any]:
     years = binding.period.lower()
+    benchmarks = list(dict.fromkeys([*binding.benchmarks, *([binding.benchmark] if binding.benchmark else [])]))
     filters = {
         "benchmark": binding.benchmark,
+        "benchmarks": benchmarks,
         "widget_filters": [item.model_dump(mode="json") for item in binding.filters],
     }
-    return {"tickers": [*binding.tickers, *([binding.benchmark] if binding.benchmark else [])], "time_range": years, "filters": filters}
+    return {"tickers": list(dict.fromkeys([*binding.tickers, *benchmarks])), "time_range": years, "filters": filters}
 
 
 def _apply_binding_filters(result: dict[str, Any], binding: DashboardDataBinding) -> dict[str, Any]:

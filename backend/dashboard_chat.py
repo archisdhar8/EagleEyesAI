@@ -106,8 +106,12 @@ def _widget_kind(question: str) -> tuple[str | None, str | None, str | None]:
         return "sector_exposure", visualization or "bar_chart", "Sector Exposure"
     if "risk contributor" in lower:
         return "portfolio_risk", visualization or "bar_chart", "Largest Risk Contributors"
-    if any(term in lower for term in ("performance", "return")) and any(term in lower for term in ("portfolio", "my ", "against", "benchmark")):
-        return "portfolio_performance", visualization or "line_chart", "Portfolio Performance"
+    if any(term in lower for term in ("performance", "performed", "return")) and any(term in lower for term in ("portfolio", "my ", "against", "versus", "benchmark")):
+        # A performance request that says both "table and chart" still needs a
+        # supported primary visualization.  The widget itself exposes summary
+        # values alongside the line series; `table` is not an allowed
+        # portfolio-performance visualization.
+        return "portfolio_performance", "line_chart" if visualization == "table" and "chart" in lower else visualization or "line_chart", "Portfolio Performance"
     if "allocation" in lower:
         return "allocation", visualization or "bar_chart", "Current Allocation"
     if "correlation" in lower or "heatmap" in lower or "heat map" in lower:
@@ -203,14 +207,24 @@ def _binding_for(question: str, metric: str, prior: dict[str, Any] | None = None
     lower = question.lower()
     prior_binding = (prior or {}).get("binding") if isinstance((prior or {}).get("binding"), dict) else {}
     period = _period(question) or str(prior_binding.get("period") or "1Y")
-    benchmark_match = re.search(r"(?:against|versus|vs\.?|benchmark(?:ed)?\s+(?:against|to)?)\s+([A-Z]{1,10})\b", question, re.I)
-    benchmark = benchmark_match.group(1).upper() if benchmark_match else prior_binding.get("benchmark")
+    lower = question.lower()
+    benchmark_aliases: list[str] = []
+    if "s&p 500" in lower or "s&p" in lower or re.search(r"\bspy\b", lower):
+        benchmark_aliases.append("SPY")
+    if "nasdaq" in lower or re.search(r"\bqqq\b", lower):
+        benchmark_aliases.append("QQQ")
+    if benchmark_aliases:
+        benchmark = benchmark_aliases[0]
+    else:
+        benchmark_match = re.search(r"(?:against|versus|vs\.?|benchmark(?:ed)?\s+(?:against|to)?)\s+([A-Z]{1,10})\b", question, re.I)
+        benchmark = benchmark_match.group(1).upper() if benchmark_match else prior_binding.get("benchmark")
     filters = list(prior_binding.get("filters") or [])
     only_match = re.search(r"show\s+only\s+(.+?)(?:\s+in\s+that|\s+in\s+the|$)", lower)
     if only_match:
         value = re.sub(r"\s+(?:holdings|stocks|securities)$", "", only_match.group(1).strip(" ."))
         filters = [{"field": "classification", "operator": "contains", "value": value}]
-    return DashboardDataBinding(metric=metric, period=period, benchmark=benchmark, filters=filters)
+    return DashboardDataBinding(metric=metric, period=period, benchmark=benchmark,
+                                benchmarks=benchmark_aliases or list(prior_binding.get("benchmarks") or []), filters=filters)
 
 
 def interpret_dashboard_request(

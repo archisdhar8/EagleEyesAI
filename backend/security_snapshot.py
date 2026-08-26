@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from . import database
+from . import research_metrics as canonical
 
 
 VERSION = "security-research-snapshot-v1.0.0"
@@ -40,33 +41,21 @@ def _return(frame: pd.DataFrame, sessions: int) -> float | None:
 
 
 def _max_drawdown(values: pd.Series) -> float | None:
-    if values.empty:
-        return None
-    return float((values / values.cummax() - 1).min())
+    rows = [{"date": index, "close": value} for index, value in values.items()]
+    return canonical.technical_metrics(rows).get("maximum_drawdown")
 
 
 def _rsi(values: pd.Series, window: int = 14) -> float | None:
-    if len(values) <= window:
-        return None
-    changes = values.diff().dropna()
-    gain = changes.clip(lower=0).tail(window).mean()
-    loss = -changes.clip(upper=0).tail(window).mean()
-    if loss == 0:
-        return 100.0
-    return float(100 - 100 / (1 + gain / loss))
+    if window != 14:
+        raise ValueError("The canonical Research contract defines RSI over 14 sessions")
+    rows = [{"date": index, "close": value} for index, value in values.items()]
+    return canonical.technical_metrics(rows).get("rsi_14")
 
 
 def _support_resistance(values: pd.Series) -> dict[str, Any]:
-    recent = values.tail(126)
-    if len(recent) < 20:
-        return {"support": [], "resistance": [], "method": "insufficient history"}
-    current = float(recent.iloc[-1])
-    lows = [float(recent.quantile(.10)), float(recent.quantile(.25))]
-    highs = [float(recent.quantile(.75)), float(recent.quantile(.90))]
-    return {
-        "support": sorted({round(value, 2) for value in lows if value < current}, reverse=True),
-        "resistance": sorted({round(value, 2) for value in highs if value > current}),
-        "method": "10th/25th and 75th/90th percentiles of the latest 126 adjusted closes",
+    rows = [{"date": index, "close": value} for index, value in values.items()]
+    return canonical.technical_metrics(rows).get("support_resistance") or {
+        "support": [], "resistance": [], "method": "insufficient history",
     }
 
 
@@ -77,18 +66,18 @@ def technicals(ticker: str, data: dict[str, Any] | None = None) -> dict[str, Any
     benchmark = _series(payload.get("prices", []), "SPY")
     if frame.empty:
         return {"ticker": normalized, "status": "unavailable", "warnings": ["No validated adjusted-price history is stored."], "method_version": VERSION}
+    canonical_market = canonical.technical_metrics(
+        [{"date": index, "close": row["close"]} for index, row in frame.iterrows()],
+        [{"date": index, "close": row["close"]} for index, row in benchmark.iterrows()],
+    )
     returns = frame["close"].pct_change().dropna()
     annual_return = float((frame["close"].iloc[-1] / frame["close"].iloc[0]) ** (252 / max(1, len(frame) - 1)) - 1) if len(frame) > 1 else None
-    volatility = float(returns.std(ddof=1) * math.sqrt(252)) if len(returns) > 1 else None
+    volatility = canonical_market.get("volatility")
     sharpe = ((annual_return - .04) / volatility) if annual_return is not None and volatility and volatility > 0 else None
-    beta = None
-    if not benchmark.empty:
-        pair = pd.concat([returns.rename("asset"), benchmark["close"].pct_change().rename("market")], axis=1).dropna()
-        if len(pair) >= 30 and pair["market"].var() > 0:
-            beta = float(pair.cov().loc["asset", "market"] / pair["market"].var())
-    rsi = _rsi(frame["close"])
-    sma50 = float(frame["close"].tail(50).mean()) if len(frame) >= 50 else None
-    sma200 = float(frame["close"].tail(200).mean()) if len(frame) >= 200 else None
+    beta = canonical_market.get("beta")
+    rsi = canonical_market.get("rsi_14")
+    sma50 = canonical_market.get("moving_averages", {}).get("sma_50")
+    sma200 = canonical_market.get("moving_averages", {}).get("sma_200")
     current = float(frame["close"].iloc[-1])
     trend = "Unavailable"
     if sma50 is not None:
@@ -97,13 +86,17 @@ def technicals(ticker: str, data: dict[str, Any] | None = None) -> dict[str, Any
     return {
         "ticker": normalized, "status": "ready", "as_of": frame.index[-1].isoformat(),
         "price": current, "daily_change": _return(frame, 1),
+        "price_history": [
+            {"date": index.isoformat(), "close": float(row["close"])}
+            for index, row in frame.tail(1260).iterrows()
+        ],
         "returns": {"1_week": _return(frame, 5), "1_month": _return(frame, 21), "3_month": _return(frame, 63), "1_year": _return(frame, 252), "3_year": _return(frame, 756)},
         "range_52_week": {"low": round(float(frame["close"].tail(252).min()), 2), "high": round(float(frame["close"].tail(252).max()), 2)},
         "liquidity": {"average_daily_volume_30d": float(frame["volume"].tail(30).mean()) if frame["volume"].notna().any() else None},
         "volatility": volatility, "beta": beta, "sharpe_ratio": sharpe,
-        "maximum_drawdown": _max_drawdown(frame["close"]), "rsi_14": rsi,
+        "maximum_drawdown": canonical_market.get("maximum_drawdown"), "rsi_14": rsi,
         "moving_averages": {"sma_50": sma50, "sma_200": sma200, "trend_bucket": trend},
-        "support_resistance": _support_resistance(frame["close"]),
+        "support_resistance": canonical_market.get("support_resistance") or _support_resistance(frame["close"]),
         "buckets": {
             "risk": bucket(volatility, (.15, .25, .40, .60), higher_is_better=False),
             "risk_adjusted_return": bucket(sharpe, (0, .5, 1, 1.5)),
@@ -111,7 +104,7 @@ def technicals(ticker: str, data: dict[str, Any] | None = None) -> dict[str, Any
             "price_behavior": trend,
         },
         "lineage": [{"provider": provider, "dataset": "daily corporate-action-adjusted prices", "effective_through": frame.index[-1].isoformat()}],
-        "calculation": {"method": "descriptive price statistics", "version": VERSION, "sample_count": len(frame), "risk_free_rate": .04},
+        "calculation": {"method": "descriptive price statistics", "version": canonical.VERSION, "sample_count": len(frame), "risk_free_rate": .04},
         "assumptions": ["Adjusted closes are used.", "Sharpe ratio uses a disclosed 4% annual risk-free assumption."],
         "warnings": [] if len(frame) >= 252 else ["Less than one trading year is available; long-horizon statistics are weakened."],
     }
@@ -161,27 +154,15 @@ def overview(ticker: str) -> dict[str, Any]:
     tech = technicals(normalized, data)
     sent = sentiment(normalized, data)
     periods = [row for row in data.get("fundamentals", []) if row.get("ticker") == normalized]
+    derived = canonical.financial_metrics(periods)
     latest = (periods[0].get("metrics") or {}) if periods else {}
-    previous = (periods[1].get("metrics") or {}) if len(periods) > 1 else {}
-    def first(metrics: dict[str, Any], *keys: str) -> float | None:
-        for key in keys:
-            value = metrics.get(key)
-            if isinstance(value, (int, float)):
-                return float(value)
-        return None
-    revenue = first(latest, "revenue", "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax")
-    prior_revenue = first(previous, "revenue", "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax")
-    net_income = first(latest, "net_income", "NetIncomeLoss")
-    equity = first(latest, "equity", "StockholdersEquity")
-    assets = first(latest, "assets", "Assets")
-    liabilities = first(latest, "liabilities", "Liabilities")
-    fcf = first(latest, "free_cash_flow", "FreeCashFlow")
+    assets = canonical.metric(latest, "total_assets")
+    liabilities = canonical.metric(latest, "total_liabilities")
     fundamentals = {
-        "revenue": revenue,
-        "revenue_growth": (revenue / prior_revenue - 1) if revenue is not None and prior_revenue else None,
-        "net_margin": (net_income / revenue) if net_income is not None and revenue else None,
-        "free_cash_flow": fcf,
-        "roe": (net_income / equity) if net_income is not None and equity else None,
+        **derived,
+        "revenue": canonical.metric(latest, "revenue"),
+        "revenue_growth": derived.get("revenue_growth_yoy"),
+        "roe": canonical.safe_ratio(canonical.metric(latest, "net_income"), canonical.metric(latest, "equity")),
         "debt_to_assets": (liabilities / assets) if liabilities is not None and assets else None,
         "periods_available": len(periods),
     }
@@ -190,6 +171,12 @@ def overview(ticker: str) -> dict[str, Any]:
         "ticker": normalized, "company": security.get("company_name") or normalized,
         "sector": security.get("sector"), "industry": security.get("industry"),
         "market": tech, "fundamentals": fundamentals, "sentiment_summary": {key: sent[key] for key in ("article_count", "distribution", "coverage", "agreement", "freshness")},
+        "fundamental_periods": [
+            {"period_end": row.get("period_end"), "fiscal_period": row.get("fiscal_period"),
+             "fiscal_year": row.get("fiscal_year"), "metrics": row.get("metrics") or {},
+             "provider": row.get("provider"), "source_url": row.get("source_url")}
+            for row in periods[:8]
+        ],
         "conclusions": {
             "company_quality": bucket(fundamentals["net_margin"], (0, .05, .12, .22)),
             "fundamental_trend": bucket(fundamentals["revenue_growth"], (-.10, 0, .08, .20)),
