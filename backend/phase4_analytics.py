@@ -3,9 +3,10 @@ from __future__ import annotations
 import math
 import statistics
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from enum import StrEnum
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field
 
@@ -146,6 +147,38 @@ def _parse_date(value: Any) -> datetime | None:
         return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
     except ValueError:
         return None
+
+
+def _event_time(event: dict[str, Any]) -> datetime | None:
+    """Normalize precise events to UTC and date-only events to local end-of-day.
+
+    A date-only calendar row remains upcoming through the end of that date in
+    its declared timezone. Precise timestamps always use a strict instant.
+    """
+    raw = event.get("starts_at") or event.get("event_time") or event.get("date")
+    if not raw:
+        return None
+    text = str(raw).strip()
+    if len(text) == 10:
+        try:
+            zone_name = str(event.get("timezone_name") or "UTC")
+            try:
+                zone = ZoneInfo(zone_name)
+            except ZoneInfoNotFoundError:
+                zone = timezone.utc
+            local_date = datetime.fromisoformat(text).date()
+            return datetime.combine(local_date, time.max, tzinfo=zone).astimezone(timezone.utc)
+        except ValueError:
+            return None
+    return _parse_date(text)
+
+
+def _event_is_open(event: dict[str, Any]) -> bool:
+    state = str(
+        event.get("event_status") or event.get("market_status")
+        or event.get("resolution_status") or event.get("status") or ""
+    ).strip().upper()
+    return state not in {"CLOSED", "RESOLVED", "SETTLED", "CANCELLED", "CANCELED", "EXPIRED", "ENDED"}
 
 
 def _by_ticker(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -732,13 +765,16 @@ def build_scenario_support(simulation: dict[str, Any] | None, intelligence: dict
     return output
 
 
-def build_portfolio_events(events: list[dict[str, Any]], holdings: list[dict[str, Any]]) -> dict[str, Any]:
+def build_portfolio_events(
+    events: list[dict[str, Any]], holdings: list[dict[str, Any]], *, now: datetime | None = None,
+) -> dict[str, Any]:
+    current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     weights = {str(row.get("ticker") or "").upper(): _number(row.get("weight")) or 0 for row in holdings}
     normalized = []
     covered_categories = set()
     for event in events:
-        event_date = _parse_date(event.get("starts_at") or event.get("date"))
-        if event_date and event_date < datetime.now(timezone.utc):
+        event_date = _event_time(event)
+        if not _event_is_open(event) or (event_date is not None and event_date <= current_time):
             continue
         raw_type = str(event.get("event_type") or event.get("type") or event.get("category") or "").upper()
         title = str(event.get("title") or event.get("name") or "")

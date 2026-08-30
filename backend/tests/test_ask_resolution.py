@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
-from backend.ask_resolution import DependencyClass, SupportedAnswer, compose_supported_answer, DEPENDENCY_MATRIX
+from backend.ask_resolution import (
+    DEPENDENCY_MATRIX,
+    DependencyClass,
+    SupportedAnswer,
+    compose_supported_answer,
+    deterministic_capability_fallback,
+    validate_user_visible_answer,
+)
 from backend.ask_runtime import PortfolioContext, enforce_output_symbol_boundary, verify_results
 from backend.ask_portfolio import _coverage_for, compose
 
@@ -24,6 +32,74 @@ def tool(summary: dict, *, status: str = "partial", prerequisites: list[dict] | 
             "prerequisites": prerequisites or [],
         },
     }]
+
+
+def test_user_answer_contract_rejects_internal_status_only_answers():
+    for value in ("SUCCESS", "PARTIAL", "UNAVAILABLE", "Status: SUCCESS"):
+        validation = validate_user_visible_answer(
+            value, intent="PORTFOLIO_CHANGE", tool_results=tool({"changes": [{"ticker": "MSFT"}]})
+        )
+        assert validation.status_only is True
+        assert validation.substantive is False
+
+
+def test_user_answer_contract_accepts_typed_substantive_content():
+    answer = "MSFT ranks first with a 12.4% return; evidence coverage is 88%, with valuation data missing."
+    validation = validate_user_visible_answer(
+        answer, intent="OPPORTUNITY_RANKING", tool_results=tool({"candidates": [{"ticker": "MSFT"}]})
+    )
+    assert validation.substantive is True
+    assert validation.status_only is False
+
+
+def test_bounded_fallback_preserves_successful_component_and_names_failure():
+    rows = [
+        {"tool_name": "portfolio_risk", "status": "success", "summary": {
+            "risk_contributors": [{"ticker": "NVDA", "risk_contribution": .31}],
+        }},
+        {"tool_name": "valuation_ranking", "status": "failed", "summary": {}},
+    ]
+    rendered = deterministic_capability_fallback("COMPOSED_ANALYSIS", rows)
+    assert "NVDA" in rendered
+    assert "valuation ranking" in rendered
+    assert "could not be produced" in rendered
+
+
+def test_downside_renderer_distinguishes_terminal_loss_from_path_drawdown():
+    summary = {"outcomes": [{
+        "strategy_key": "current", "terminal_loss_probability": 0.0,
+        "terminal_return_percentiles": {"p05": .04}, "simulated_max_drawdown_p95": -.403,
+    }]}
+    _, answer = compose_supported_answer(
+        intent="DOWNSIDE_CAPACITY", question="How much could I lose?", context=context(),
+        tool_results=[{"tool_name": "portfolio_scenario", "status": "success", "summary": summary}],
+        deterministic_answer=None,
+    )
+    assert "ending the modeled horizon below the starting value" in answer.direct_answer
+    assert "maximum peak-to-trough drawdown" in answer.direct_answer
+    assert "40.3%" in answer.direct_answer
+    validation = validate_user_visible_answer(
+        answer.direct_answer, intent="DOWNSIDE_CAPACITY", tool_results=[]
+    )
+    assert validation.contradictory_labels == []
+
+
+def test_answer_validator_uses_same_date_only_timezone_policy_as_event_capability():
+    rows = [{"tool_name": "portfolio_events", "status": "partial", "summary": {"events": [{
+        "title": "Chicago date-only event", "date": "2026-08-28",
+        "timezone_name": "America/Chicago", "event_status": "OPEN",
+    }]}}]
+    answer = "The upcoming event calendar includes the Chicago date-only event with its local-day cutoff."
+    before = validate_user_visible_answer(
+        answer, intent="PORTFOLIO_EVENTS", tool_results=rows,
+        now=datetime(2026, 8, 29, 4, 59, tzinfo=timezone.utc),
+    )
+    after = validate_user_visible_answer(
+        answer, intent="PORTFOLIO_EVENTS", tool_results=rows,
+        now=datetime(2026, 8, 29, 5, 1, tzinfo=timezone.utc),
+    )
+    assert before.expired_items == []
+    assert after.expired_items == ["Chicago date-only event"]
 
 
 def test_dependency_matrix_separates_system_jobs_and_user_context():

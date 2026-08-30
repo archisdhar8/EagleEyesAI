@@ -534,6 +534,11 @@ class SimulationOutcome(BaseModel):
     wealth_percentiles: dict[str, float]
     real_wealth_percentiles: dict[str, float]
     probability_of_loss: float
+    terminal_loss_probability: float | None = None
+    terminal_return_percentiles: dict[str, float] = Field(default_factory=dict)
+    simulated_max_drawdown_p95: float | None = None
+    historical_max_drawdown: float | None = None
+    drawdown_breach_probability: float | None = None
     drawdown_percentiles: dict[str, float]
     recovery_months: dict[str, float | None]
     goal_results: list[dict[str, Any]] = Field(default_factory=list)

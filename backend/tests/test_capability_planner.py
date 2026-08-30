@@ -160,6 +160,25 @@ def test_partial_failure_preserves_successful_evidence() -> None:
     assert "prediction_markets: UNAVAILABLE" in rendered
 
 
+def test_required_failure_with_another_success_keeps_narrow_partial_answer() -> None:
+    rows = entities()
+    plan = planner.CapabilityPlan(
+        goal="rank valuation and show risk", entities=rows, portfolio_context_required=True,
+        steps=[
+            planner._step("valuation_ranking", rows, planner.ReasonCode.PRIMARY_QUESTION),
+            planner._step("portfolio_risk", rows, planner.ReasonCode.PRIMARY_QUESTION),
+        ],
+    )
+    composed = planner.compose_results("question", plan, [
+        result("valuation_ranking", AnalysisStatus.FAILED, message="valuation failed"),
+        result("portfolio_risk", AnalysisStatus.SUCCESS, message="NVDA is the largest risk contributor."),
+    ])
+    assert composed.overall_status == AnalysisStatus.PARTIAL
+    rendered = planner.render_composed(composed)
+    assert "NVDA is the largest risk contributor" in rendered
+    assert "valuation_ranking: FAILED" in rendered
+
+
 def test_composed_answer_hides_internal_adapter_and_registry_diagnostics() -> None:
     rows = entities()
     plan = planner.CapabilityPlan(

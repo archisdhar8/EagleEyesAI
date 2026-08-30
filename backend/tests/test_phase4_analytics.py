@@ -174,6 +174,35 @@ def test_event_result_tracks_materiality_and_category_completeness_separately():
     assert result["complete"] is False
 
 
+def test_upcoming_events_use_strict_time_and_open_state_boundaries():
+    now = datetime(2026, 8, 28, 17, 0, tzinfo=timezone.utc)
+    events = [
+        {"title": "earlier today", "event_type": "EARNINGS", "tickers": ["AAA"],
+         "starts_at": "2026-08-28T16:59:59Z", "event_status": "OPEN"},
+        {"title": "later today", "event_type": "EARNINGS", "tickers": ["AAA"],
+         "starts_at": "2026-08-28T17:00:01Z", "event_status": "OPEN"},
+        {"title": "yesterday", "event_type": "MACRO", "tickers": ["AAA"],
+         "starts_at": "2026-08-27T20:00:00Z", "event_status": "OPEN"},
+        {"title": "tomorrow", "event_type": "MACRO", "tickers": ["AAA"],
+         "starts_at": "2026-08-29T20:00:00Z", "event_status": "OPEN"},
+        {"title": "closed future market", "event_type": "PREDICTION_MARKET", "tickers": ["AAA"],
+         "starts_at": "2026-08-30T20:00:00Z", "event_status": "RESOLVED"},
+        {"title": "past unresolved row", "event_type": "PREDICTION_MARKET", "tickers": ["AAA"],
+         "starts_at": "2026-08-26T20:00:00Z", "event_status": "UNRESOLVED"},
+    ]
+    result = build_portfolio_events(events, holdings(), now=now)
+    assert [row["title"] for row in result["events"]] == ["later today", "tomorrow"]
+
+
+def test_date_only_event_uses_declared_timezone_end_of_day_policy():
+    event = {"title": "Chicago date-only", "event_type": "MACRO", "tickers": ["AAA"],
+             "starts_at": "2026-08-28", "timezone_name": "America/Chicago", "event_status": "OPEN"}
+    before_local_midnight = datetime(2026, 8, 29, 4, 59, tzinfo=timezone.utc)
+    after_local_midnight = datetime(2026, 8, 29, 5, 1, tzinfo=timezone.utc)
+    assert build_portfolio_events([event], holdings(), now=before_local_midnight)["events"]
+    assert build_portfolio_events([event], holdings(), now=after_local_midnight)["events"] == []
+
+
 def test_data_quality_uses_eligibility_not_symbol_presence():
     incomplete_bundle = bundle()
     incomplete_bundle["fundamentals"] = [row for row in incomplete_bundle["fundamentals"] if row["ticker"] != "BBB"]

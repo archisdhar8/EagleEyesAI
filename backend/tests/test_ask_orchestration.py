@@ -1,8 +1,56 @@
 from backend import capability_planner
+from backend.ask_runtime import parse_scenario_factors
 from backend.ask_orchestration import (
     MAX_REPLANS, MAX_RETRIES, MAX_TOOL_CALLS, actions_for, build_plan,
     execution_state, previous_analysis_context,
 )
+
+
+def test_correctness_repair_routes_use_smallest_existing_capabilities():
+    cases = {
+        "What are the best investment opportunities?": ("OPPORTUNITY_RANKING", ("portfolio_overview",)),
+        "What happens if rates stay high, recession hits, and AI capex declines?": ("MULTI_SCENARIO", ("portfolio_scenario",)),
+        "How reliable is the data?": ("DATA_QUALITY", ("data_quality",)),
+        "What is the strongest counterargument to the current recommendation?": (
+            "RECOMMENDATION_COUNTERCASE", ("recommendation_countercase",),
+        ),
+        "Which positions are most expensive relative to growth and quality?": (
+            "VALUATION_RANKING", ("valuation_ranking",),
+        ),
+    }
+    for question, expected in cases.items():
+        plan = build_plan(question, "portfolio", {"portfolio_id": "portfolio-61"})
+        assert (plan.intent, plan.tools) == expected
+
+
+def test_correctness_repair_semantic_paraphrases_keep_route_precedence():
+    families = {
+        "OPPORTUNITY_RANKING": [
+            "strongest opportunities", "best ideas", "most attractive holdings", "best current setups",
+        ],
+        "MULTI_SCENARIO": [
+            "AI spending slows", "hyperscaler spending weakens", "recession + higher rates",
+        ],
+        "DATA_QUALITY": [
+            "what data is missing", "can I trust these rankings", "how complete is the evidence",
+        ],
+        "RECOMMENDATION_COUNTERCASE": [
+            "strongest argument against the recommendation", "bear case for this recommendation",
+            "what could make this recommendation wrong", "challenge this recommendation",
+        ],
+    }
+    for expected_intent, questions in families.items():
+        for question in questions:
+            plan = build_plan(question, "portfolio", {"portfolio_id": "portfolio-61"})
+            assert plan.intent == expected_intent, (question, plan.intent)
+
+
+def test_multi_scenario_preserves_every_requested_supported_factor():
+    question = "What if rates stay high, recession hits, AI capex declines, and hyperscaler spending weakens?"
+    plan = build_plan(question, "portfolio", {"portfolio_id": "portfolio-61"})
+    factors = {row.factor for row in parse_scenario_factors(question)}
+    assert plan.tools == ("portfolio_scenario",)
+    assert {"interest_rates", "economic_growth", "ai_capex"} <= factors
 
 
 def test_intent_routing_uses_smallest_approved_tool_set():

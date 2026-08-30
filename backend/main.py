@@ -30,7 +30,7 @@ from .ask_runtime import (
     enforce_output_symbol_boundary, parse_scenario_factors, scenario_payload, verify_results,
 )
 from .analytical_contract import (
-    AnalysisResult, AnalysisStatus, Coverage, DependencyResult, VerificationResult,
+    ANALYSIS_SCHEMA_VERSION, AnalysisResult, AnalysisStatus, Coverage, DependencyResult, VerificationResult,
     adapt_legacy_tool_result, apply_request_verification, build_freshness,
     with_canonical_result, stable_fingerprint,
 )
@@ -4647,6 +4647,17 @@ def _execute_chat_plan_tools(
             evidence_rows.extend(outcome.value.evidence_rows)
         if outcome.required and not (outcome.value and outcome.value.tool_results) and outcome.dependency_name != "portfolio_context":
             failed = outcome.status == ask_execution.NodeStatus.FAILED
+            trace = {
+                "failing_node": outcome.node_id,
+                "exception_class": outcome.error_class,
+                "failure_stage": "capability_execution",
+                "input_fingerprint": context.version if context else None,
+                "read_model_type": read_models.TOOL_READ_MODEL.get(outcome.dependency_name),
+                "read_model_state": ((outcome.value.metadata if outcome.value else {}) or {}).get("read_model_state"),
+                "schema_version": ANALYSIS_SCHEMA_VERSION,
+                "calculation_version": ask_portfolio._CALCULATION_VERSIONS.get(outcome.dependency_name),
+                "query_or_calculation_stage": "read_model_load_or_deterministic_calculation",
+            }
             tool_results.append({
                 "tool_name": outcome.dependency_name,
                 "status": "failed" if failed else "unavailable",
@@ -4655,10 +4666,18 @@ def _execute_chat_plan_tools(
                 "summary": {"message": (
                     "The required dependency failed unexpectedly; no result was invented."
                     if failed else "The required dependency did not complete within the request deadline."
-                )},
+                )}, "execution_trace": trace,
             })
         payload = outcome.payload(started)
-        execution_steps.append({"tool_name": outcome.dependency_name, "state": outcome.status.value, **payload})
+        execution_steps.append({
+            "tool_name": outcome.dependency_name, "state": outcome.status.value,
+            "input_fingerprint": context.version if context else None,
+            "read_model_type": read_models.TOOL_READ_MODEL.get(outcome.dependency_name),
+            "schema_version": ANALYSIS_SCHEMA_VERSION,
+            "calculation_version": ask_portfolio._CALCULATION_VERSIONS.get(outcome.dependency_name),
+            "query_or_calculation_stage": "read_model_load_or_deterministic_calculation",
+            **payload,
+        })
         record_capability_dependency(
             request_id=request_id, capability=capability, node_id=outcome.node_id,
             dependency=outcome.dependency_name, required=outcome.required,
@@ -5233,6 +5252,17 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
             model = "deterministic-timeout-fallback-v1"
         finally:
             clear_gemini_deadline()
+    answer_validation = ask_resolution.validate_user_visible_answer(
+        answer, intent=plan.intent, tool_results=tool_results,
+    )
+    bounded_composition_fallback_used = False
+    if not answer_validation.substantive:
+        answer = ask_resolution.deterministic_capability_fallback(plan.intent, tool_results)
+        bounded_composition_fallback_used = True
+        model = "deterministic-capability-fallback-v1"
+        answer_validation = ask_resolution.validate_user_visible_answer(
+            answer, intent=plan.intent, tool_results=tool_results,
+        )
     if dashboard_execution and dashboard_execution.response:
         answer = answer.rstrip() + f"\n\n**Canvas:** {dashboard_execution.response}"
     narration_elapsed = time.monotonic() - narration_started
@@ -5242,6 +5272,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
         "sources": sources, "tool_results": compact_tool_results,
         "requirement_resolution": requirement_resolution.model_dump(mode="json", exclude_none=True),
         "supported_answer": supported_answer.model_dump(mode="json", exclude_none=True),
+        "answer_validation": answer_validation.model_dump(mode="json", exclude_none=True),
         "data_health": [state.model_dump(mode="json", exclude_none=True) for state in health_states],
         "execution_plan": {**plan.payload(), "steps": execution_steps,
                            "capability_plan": compositional_plan.model_dump(mode="json") if compositional_plan else None,
@@ -5273,7 +5304,8 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
                              "recommendation_allowed": analysis_result.verification.recommendation_allowed,
                              "gemini_started": interpret_with_gemini,
                              "gemini_completed": not str(model).startswith("deterministic"),
-                             "fallback_used": model == "deterministic-timeout-fallback-v1",
+                             "fallback_used": model == "deterministic-timeout-fallback-v1" or bounded_composition_fallback_used,
+                             "bounded_composition_fallback_used": bounded_composition_fallback_used,
                              "persistence_status": "STAGED",
                              "answer_complete": "answer is incomplete" not in answer.lower(),
                              "router_version": "v2" if ASK_ROUTER_V2_ENABLED else "v1"},

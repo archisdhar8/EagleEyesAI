@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from . import database, read_models, theses
+from . import database, phase4_analytics, read_models, theses
 from .analytical_contract import (
     AnalysisResult, AnalysisStatus, Coverage, DependencyResult, LineageItem, Prerequisite,
     VerificationCheck, VerificationResult, VerificationSeverity, build_entity_coverage,
@@ -622,7 +622,12 @@ def run(tool: str, user_id: str, portfolio_id: str | None, question: str,
         return _covered_evidence(tool, portfolio, summary, as_of, context, read_model_info)
 
     if tool == "portfolio_events":
-        typed = ask_cache.get("typed_events") or {}
+        # Read models intentionally retain raw provider rows for provenance.
+        # Re-apply the strict time/status boundary at request time so a cached
+        # event cannot remain "upcoming" merely because the row is still stored.
+        typed = phase4_analytics.build_portfolio_events(
+            list(ask_cache.get("events") or []), holdings,
+        )
         summary = {"title": "Upcoming material portfolio events", "events": list(typed.get("events") or [])[:20],
                    "event_completeness": typed,
                    "provider_limitations": typed.get("provider_limitations") or {},
@@ -994,10 +999,19 @@ def compose(intent: str, tool_results: list[dict[str, Any]]) -> str | None:
         current = next((row for row in simulation.get("outcomes") or [] if row.get("strategy_key") in {"current", "current_portfolio"}), None) or next(iter(simulation.get("outcomes") or []), {})
         real_wealth = current.get("real_wealth_percentiles") or current.get("wealth_percentiles") or {}
         drawdown = current.get("drawdown_percentiles") or {}
+        terminal_loss_probability = current.get("terminal_loss_probability")
+        if terminal_loss_probability is None:
+            terminal_loss_probability = current.get("probability_of_loss")
+        adverse_drawdown = current.get("simulated_max_drawdown_p95")
+        adverse_label = "95th-percentile maximum peak-to-trough drawdown severity"
+        if adverse_drawdown is None:
+            adverse_drawdown = drawdown.get("p10")
+            adverse_label = "10th percentile of the signed maximum-drawdown distribution"
         ai_support = next((row for row in summary.get("supported_scenario_factors") or [] if row.get("factor") == "ai_capex"), {})
         outcome_text = (
             f"For the current-portfolio path, cached median real terminal wealth is **{_number(real_wealth.get('p50')):,.0f}**, "
-            f"probability of loss is **{_number(current.get('probability_of_loss')):.1%}**, and the disclosed adverse drawdown percentile is **{_number(drawdown.get('p10')):.1%}** [S1]. "
+            f"probability of ending the horizon below the starting value is **{_number(terminal_loss_probability):.1%}**, "
+            f"and the {adverse_label} is **{_number(adverse_drawdown):.1%}** [S1]. "
             if current else "No current-portfolio outcome row is stored. "
         )
         ai_text = (f"The separate AI-capex slowdown mapping touches **{_number(ai_support.get('mapped_portfolio_weight')):.1%}** of portfolio weight across {', '.join(ai_support.get('affected_holdings') or [])}; it is exposure mapping, not a loss estimate [S1]. " if ai_support else "")

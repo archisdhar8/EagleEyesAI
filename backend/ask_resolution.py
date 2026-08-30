@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, time, timezone
 from enum import StrEnum
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field
 
@@ -62,6 +64,134 @@ class SupportedAnswer(BaseModel):
     user_input_needed: list[str] = Field(default_factory=list)
     confidence: str = "LOW"
     coverage: dict[str, Any] = Field(default_factory=dict)
+
+
+class AnswerValidation(BaseModel):
+    substantive: bool
+    status_only: bool = False
+    contradictory_labels: list[str] = Field(default_factory=list)
+    expired_items: list[str] = Field(default_factory=list)
+    missing_required_claims: list[str] = Field(default_factory=list)
+
+
+_STATUS_WORDS = {"SUCCESS", "PARTIAL", "UNAVAILABLE"}
+
+
+def _event_expired(row: dict[str, Any], now: datetime) -> bool:
+    state = str(row.get("event_status") or row.get("status") or "").upper()
+    if state in {"CLOSED", "RESOLVED", "SETTLED", "CANCELLED", "CANCELED", "EXPIRED", "ENDED"}:
+        return True
+    raw = row.get("date") or row.get("starts_at") or row.get("event_time")
+    if not raw:
+        return False
+    try:
+        text = str(raw)
+        if len(text) == 10 and text[4] == "-" and text[7] == "-":
+            try:
+                local_zone = ZoneInfo(str(row.get("timezone_name") or "UTC"))
+            except ZoneInfoNotFoundError:
+                local_zone = timezone.utc
+            parsed = datetime.combine(datetime.fromisoformat(text).date(), time.max, local_zone)
+        else:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+        return parsed <= now
+    except (TypeError, ValueError):
+        return False
+
+
+def validate_user_visible_answer(
+    answer: str | None, *, intent: str, tool_results: list[dict[str, Any]],
+    now: datetime | None = None,
+) -> AnswerValidation:
+    text = str(answer or "").strip()
+    plain = re.sub(r"[`*_>#|\[\]()]", " ", text)
+    lines = [" ".join(line.split()).strip(" .:-") for line in plain.splitlines() if line.strip()]
+    meaningful = [line for line in lines if line.upper() not in _STATUS_WORDS and not re.fullmatch(
+        r"(?:ANSWER|KEY EVIDENCE|CONFIDENCE / COVERAGE|EVIDENCE USED(?: \d+)?|MODEL OUTPUT|VERIFIED FACT)", line.upper()
+    )]
+    status_lines = [line for line in lines if re.fullmatch(
+        r"(?:(?:STATUS|RESULT|COMPONENT STATUS)\s*:?\s*)?(?:RETURNED\s*)?(?:SUCCESS|PARTIAL|UNAVAILABLE)", line.upper()
+    )]
+    status_only = bool(status_lines) and not any(
+        re.search(r"\$|\d+(?:\.\d+)?%|\b(?:because|cannot|missing|requires|ranked|holding|event|metric|evidence is|risk is|result is)\b", line, re.I)
+        for line in meaningful
+        if not re.search(r"overall status|usable components|decision support|returned (?:success|partial|unavailable)", line, re.I)
+    )
+    contradictory: list[str] = []
+    if re.search(r"\bprobability of loss\b", text, re.I) and re.search(r"\bdrawdown\b", text, re.I) and not re.search(
+        r"ending (?:the modeled )?horizon below|terminal.*(?:return|loss)|path drawdown|peak-to-trough", text, re.I
+    ):
+        contradictory.append("terminal_loss_probability_and_path_drawdown_are_not_distinguished")
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    expired: list[str] = []
+    for summary in _summaries(tool_results):
+        for row in summary.get("events") or []:
+            if isinstance(row, dict) and _event_expired(row, current):
+                expired.append(str(row.get("title") or row.get("date") or "expired event"))
+    required_markers = {
+        "OPPORTUNITY_RANKING": ("opportun", "setup", "eligible", "rank"),
+        "PORTFOLIO_CHANGE": ("change", "baseline", "snapshot"),
+        "VALUATION_RANKING": ("valuation", "multiple", "relative"),
+        "MULTI_SCENARIO": ("scenario", "rates", "drawdown", "exposure"),
+        "PORTFOLIO_EVENTS": ("event", "earnings", "catalyst", "calendar"),
+        "DATA_QUALITY": ("coverage", "freshness", "provider", "rankab", "missing"),
+        "RECOMMENDATION_COUNTERCASE": ("counter", "bear", "recommendation", "ticker"),
+        "PORTFOLIO_ANALYSIS": ("risk", "weight", "portfolio", "rebalance", "optimizer"),
+    }
+    markers = required_markers.get(intent, ())
+    missing_claims = [intent.lower()] if markers and not any(marker in text.lower() for marker in markers) else []
+    substantive = bool(text and len(text) >= 40 and not status_only and not contradictory and not expired and not missing_claims)
+    return AnswerValidation(
+        substantive=substantive, status_only=status_only, contradictory_labels=contradictory,
+        expired_items=list(dict.fromkeys(expired)), missing_required_claims=missing_claims,
+    )
+
+
+def deterministic_capability_fallback(intent: str, tool_results: list[dict[str, Any]]) -> str:
+    """One bounded, non-recursive pass over successful typed capability data."""
+    findings: list[str] = []
+    limitations: list[str] = []
+    for row in tool_results:
+        capability = str(row.get("tool_name") or "analysis").replace("_", " ")
+        status = str(row.get("status") or "").upper()
+        summary = canonical_data(row)
+        if not isinstance(summary, dict) or not summary:
+            summary = row.get("summary") if isinstance(row.get("summary"), dict) else {}
+        if status in {"FAILED", "UNAVAILABLE"}:
+            limitations.append(f"{capability} could not be produced ({status.lower()}).")
+            continue
+        message = str(summary.get("message") or "").strip()
+        if message and message.upper() not in _STATUS_WORDS and not re.fullmatch(
+            rf"{re.escape(capability)} returned (?:SUCCESS|PARTIAL|UNAVAILABLE)\.?", message, re.I
+        ):
+            findings.append(f"**{capability.title()}:** {message}")
+        for key in ("candidates", "positions", "events", "material_changes", "risk_contributors", "all_holdings"):
+            values = summary.get(key)
+            if not isinstance(values, list) or not values:
+                continue
+            for item in values[:5]:
+                if not isinstance(item, dict):
+                    continue
+                label = item.get("ticker") or item.get("title") or item.get("name") or item.get("domain")
+                details = []
+                for field in ("weight", "health_score", "valuation_score", "relative_value_gap", "date", "reason"):
+                    value = item.get(field)
+                    if value is not None:
+                        details.append(f"{field.replace('_', ' ')} {value}")
+                if label:
+                    findings.append(f"- **{label}**" + (f" — {', '.join(details)}" if details else ""))
+            break
+        for warning in summary.get("warnings") or []:
+            limitations.append(str(warning))
+    if findings:
+        answer = "The available verified components support this narrower answer:\n\n" + "\n".join(findings[:10])
+    else:
+        answer = "No successful capability returned substantive typed result data for this request."
+    if limitations:
+        answer += "\n\n**Unavailable portion:** " + " ".join(dict.fromkeys(limitations))
+    answer += f"\n\nThe requested intent was **{intent.replace('_', ' ').lower()}**; no recursive replanning or unsupported inference was used."
+    return answer
 
 
 DEPENDENCY_MATRIX: dict[str, DependencyClass] = {
@@ -396,12 +526,24 @@ def compose_supported_answer(
         current = next((row for row in outcomes if row.get("strategy_key") in {"current", "current_portfolio"} or row.get("key") == "current_portfolio"), None)
         if current:
             drawdowns = current.get("drawdown_percentiles") or {}
+            terminal_loss_probability = current.get("terminal_loss_probability")
+            if terminal_loss_probability is None:
+                terminal_loss_probability = current.get("probability_of_loss")
+            adverse_drawdown = current.get("simulated_max_drawdown_p95")
+            adverse_label = "95th-percentile maximum peak-to-trough drawdown severity"
+            if adverse_drawdown is None:
+                adverse_drawdown = drawdowns.get("p10") if drawdowns else current.get("modeled_drawdown")
+                adverse_label = "10th percentile of the signed maximum-drawdown distribution"
+            terminal_p05 = (current.get("terminal_return_percentiles") or {}).get("p05")
             answer = (
                 "The latest compatible model does not produce one certain loss percentage; it produces a distribution. "
-                f"For the current portfolio, probability of finishing below the starting value is **{_pct(current.get('probability_of_loss'))}** and the disclosed adverse drawdown estimate is **{_pct(drawdowns.get('p10') if drawdowns else current.get('modeled_drawdown'))}**.\n\n"
-                "This is a modeled historical/simulation result, not a guarantee or a worst-case bound. A crisis can exceed the modeled range."
+                f"**Probability of ending the modeled horizon below the starting value: {_pct(terminal_loss_probability)}.**\n\n"
+                + (f"**5th-percentile terminal return: {_pct(terminal_p05)}.**\n\n" if terminal_p05 is not None else "")
+                + f"**{adverse_label.capitalize()}: {_pct(adverse_drawdown)}.**\n\n"
+                "Terminal return and path drawdown are different concepts: a path can fall materially before recovering and still finish above its starting value. "
+                "These are simulation outputs, not guarantees or worst-case bounds; a crisis can exceed the modeled range."
             )
-            supported.append(SupportedClaim(claim="Latest compatible modeled loss probability and adverse drawdown"))
+            supported.append(SupportedClaim(claim="Explicit terminal-loss probability and simulated path-drawdown distribution"))
         else:
             answer = "No compatible loss-distribution result is available yet, so EagleEyes will not invent a percentage. A canonical scenario simulation has been queued. Until it completes, current weights and historical drawdowns can identify exposure but cannot establish a major-decline loss estimate."
             pending.append("portfolio loss-distribution simulation")

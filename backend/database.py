@@ -1713,7 +1713,9 @@ def upcoming_market_events(tickers: list[str], days: int = 45) -> list[dict[str,
                 tickers, source_url, metadata, fetched_at, event_status, timing_status,
                 verified_at, timezone_name, dedupe_key
                 FROM public.market_events
-                WHERE starts_at >= now() AND starts_at <= now() + (%s * interval '1 day')
+                WHERE starts_at > now() AND starts_at <= now() + (%s * interval '1 day')
+                  AND upper(coalesce(event_status, 'OPEN')) NOT IN
+                      ('CLOSED','RESOLVED','SETTLED','CANCELLED','CANCELED','EXPIRED','ENDED')
                   AND (%s = '{}'::text[] OR tickers = '{}'::text[] OR tickers && %s)
                 ORDER BY starts_at, title LIMIT 100""",
                 (max(1, min(days, 180)), normalized, normalized),

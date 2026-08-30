@@ -122,11 +122,11 @@ def build_portfolio_context(portfolio: dict[str, Any]) -> PortfolioContext:
 
 
 _SCENARIO_ALIASES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("interest_rates", "increase", ("rates rise", "interest rates rose", "higher rates", "higher yields", "yields increase", "fed stays higher", "higher-for-longer", "rate hike", "tightening")),
+    ("interest_rates", "increase", ("rates rise", "interest rates rose", "rates stay high", "interest rates stay high", "higher rates", "higher yields", "yields increase", "fed stays higher", "higher-for-longer", "rate hike", "tightening")),
     ("interest_rates", "decrease", ("rates fall", "interest rates fall", "lower rates", "lower yields", "rate cut", "easing")),
-    ("ai_capex", "decrease", ("ai spending slows", "ai spending slowed", "ai capex declines", "ai capex declined", "ai capex falls", "hyperscaler capex cuts", "ai investment weakens", "slowing ai spending")),
+    ("ai_capex", "decrease", ("ai spending slows", "ai spending slowed", "ai capex declines", "ai capex declined", "ai capex falls", "hyperscaler capex cuts", "hyperscaler spending weakens", "ai investment weakens", "slowing ai spending")),
     ("ai_capex", "increase", ("ai spending accelerates", "ai capex rises", "ai investment strengthens")),
-    ("economic_growth", "decrease", ("recession", "economy entered a recession", "economic slowdown", "growth slows", "weaker consumer demand")),
+    ("economic_growth", "decrease", ("recession", "economy entered a recession", "economic slowdown", "growth slows", "growth weakens", "weaker growth", "weaker consumer demand")),
     ("economic_growth", "increase", ("expansion", "growth accelerates", "stronger consumer demand")),
     ("inflation", "increase", ("inflation rises", "accelerating inflation", "higher inflation")),
     ("inflation", "decrease", ("inflation falls", "cooling inflation", "lower inflation")),

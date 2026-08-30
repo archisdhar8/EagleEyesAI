@@ -369,12 +369,24 @@ def run_simulation(
         terminal = values
         inflation_factor = (1 + payload.profile.inflation_rate) ** horizon_years
         real_terminal = terminal / inflation_factor
+        terminal_returns = terminal / initial_value - 1
+        drawdown_magnitudes = -np.asarray(drawdowns)
         outcome = {
             "strategy_key": strategy.key,
             "label": strategy.label,
             "wealth_percentiles": {key: round(float(np.percentile(terminal, value)), 2) for key, value in (("p10", 10), ("p25", 25), ("p50", 50), ("p75", 75), ("p90", 90))},
             "real_wealth_percentiles": {key: round(float(np.percentile(real_terminal, value)), 2) for key, value in (("p10", 10), ("p25", 25), ("p50", 50), ("p75", 75), ("p90", 90))},
             "probability_of_loss": round(float(np.mean(terminal < initial_value)), 4),
+            # Explicit downside names prevent terminal-return probability from
+            # being confused with an intra-horizon peak-to-trough drawdown.
+            "terminal_loss_probability": round(float(np.mean(terminal < initial_value)), 4),
+            "terminal_return_percentiles": {
+                key: round(float(np.percentile(terminal_returns, value)), 4)
+                for key, value in (("p05", 5), ("p50", 50), ("p95", 95))
+            },
+            "simulated_max_drawdown_p95": round(-float(np.percentile(drawdown_magnitudes, 95)), 4),
+            "historical_max_drawdown": None,
+            "drawdown_breach_probability": None,
             "drawdown_percentiles": {key: round(float(np.percentile(drawdowns, value)), 4) for key, value in (("p10", 10), ("p50", 50), ("p90", 90))},
             "recovery_months": {
                 "median": round(float(np.median([value for value in recoveries if value is not None])), 1) if any(value is not None for value in recoveries) else None,

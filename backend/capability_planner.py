@@ -360,7 +360,7 @@ def deterministic_capability_plan(question: str, entities: list[ResolvedEntity],
     securities = [entity for entity in entities if entity.kind == EntityKind.SECURITY]
     has_portfolio = bool(portfolio_id or re.search(r"\b(my|the|current) portfolio\b|\bholdings\b", lower))
     factors: list[str] = []
-    for phrases, factor in ((('rates rise', 'rates increase', 'higher rates'), 'rates_up'), (('rates fall', 'rates decline', 'lower rates'), 'rates_down'),
+    for phrases, factor in ((('rates rise', 'rates increase', 'rates stay high', 'higher rates'), 'rates_up'), (('rates fall', 'rates decline', 'lower rates'), 'rates_down'),
                             (('recession',), 'recession'), (('ai spending slows', 'ai capex slows'), 'ai_spending_down'),
                             (('oil rises', 'oil shock'), 'oil_up'), (('inflation rises',), 'inflation_up')):
         if any(phrase in lower for phrase in phrases): factors.append(factor)
@@ -404,7 +404,7 @@ def deterministic_capability_plan(question: str, entities: list[ResolvedEntity],
                 steps.append(_step("historical_change", securities[:1], ReasonCode.CHANGE_CONTEXT))
         if any(word in lower for word in ("opportunity", "strongest current")):
             steps.append(_step("portfolio_overview", entities, ReasonCode.PRIMARY_QUESTION))
-        if any(word in lower for word in ("argument against", "countercase", "counter case")):
+        if any(word in lower for word in ("argument against", "counterargument", "countercase", "counter case", "bear case", "challenge this recommendation")):
             steps.append(_step("recommendation_countercase", entities, ReasonCode.SUPPORTING_CONTEXT))
         if any(word in lower for word in ("new cash", "invest new cash")):
             steps.append(_step("cash_allocation", entities, ReasonCode.PRIMARY_QUESTION))
@@ -414,7 +414,7 @@ def deterministic_capability_plan(question: str, entities: list[ResolvedEntity],
             steps.append(_step("portfolio_analysis", entities, ReasonCode.PRIMARY_QUESTION))
         if any(word in lower for word in ("deep research", "research dossier", "full company research")) and securities:
             steps.append(_step("company_research", securities, ReasonCode.PRIMARY_QUESTION))
-        if any(word in lower for word in ("data quality", "missing reliable data", "data coverage")):
+        if any(word in lower for word in ("data quality", "missing reliable data", "data coverage", "reliable is the data", "trust these rankings", "complete is the evidence")):
             steps.append(_step("data_quality", entities, ReasonCode.PRIMARY_QUESTION))
         if any(word in lower for word in ("upcoming events", "upcoming catalysts", "earnings calendar")):
             steps.append(_step("portfolio_events", entities, ReasonCode.PRIMARY_QUESTION))
@@ -530,12 +530,18 @@ class ComposedAnalysisResult(BaseModel):
 
 def _component_summary(result: AnalysisResult) -> str:
     if result.summary:
-        for key in ("message", "conclusion", "regime", "status"):
+        for key in ("message", "conclusion", "regime"):
             if result.summary.get(key): return str(result.summary[key])
     if isinstance(result.data, dict):
         for key in ("headline", "summary", "regime", "state", "message"):
-            if result.data.get(key): return str(result.data[key])
-    return f"{result.capability.replace('_', ' ')} returned {result.status.value}."
+            value = result.data.get(key)
+            if value and str(value).upper() not in {"SUCCESS", "PARTIAL", "UNAVAILABLE"}:
+                return str(value)
+        for key in ("positions", "candidates", "events", "findings", "results", "material_changes"):
+            value = result.data.get(key)
+            if isinstance(value, list):
+                return f"{result.capability.replace('_', ' ').title()} produced {len(value)} typed {key.replace('_', ' ')} row{'s' if len(value) != 1 else ''}."
+    return f"{result.capability.replace('_', ' ').title()} did not expose a substantive deterministic summary."
 
 
 def compose_results(question: str, plan: CapabilityPlan, results: list[AnalysisResult]) -> ComposedAnalysisResult:
@@ -545,7 +551,9 @@ def compose_results(question: str, plan: CapabilityPlan, results: list[AnalysisR
     pending = [result.job for result in results if result.job and result.status == AnalysisStatus.PENDING]
     usable = [result for result in results if result.status in {AnalysisStatus.SUCCESS, AnalysisStatus.PARTIAL}]
     if any(result and result.status == AnalysisStatus.FAILED for result in required_results):
-        status = AnalysisStatus.FAILED
+        # One bounded fallback composition pass preserves independently
+        # verified components instead of discarding them with the failed node.
+        status = AnalysisStatus.PARTIAL if usable else AnalysisStatus.FAILED
     elif pending and not usable:
         status = AnalysisStatus.PENDING
     elif any(result is None or result.status == AnalysisStatus.UNAVAILABLE for result in required_results):
