@@ -952,7 +952,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       const response = await apiRequest("/chat/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ request_id:requestId,question: cleanQuestion, conversation_id: researchConversationId, workspace: "research", page_context:{route:`${currentUrl.pathname}${currentUrl.search}`,workspace:tab==="ask"?"ask":"research",entity_type:contextTicker?"security":undefined,ticker:contextTicker,portfolio_id:portfolioId?String(portfolioId):undefined,research_section:researchSection,research_capabilities:researchCapabilities,dashboard_resource_type:dashboardResourceType,dashboard_resource_id:dashboardResourceId,enabled_context:askEnabledContext} }),
+        body: JSON.stringify({ request_id:requestId,question: cleanQuestion, conversation_id: researchConversationId, workspace: "research", page_context:{route:currentUrl.pathname,workspace:tab==="ask"?"ask":"research",entity_type:contextTicker?"security":undefined,ticker:contextTicker,portfolio_id:portfolioId?String(portfolioId):undefined,research_section:researchSection,research_capabilities:researchCapabilities,dashboard_resource_type:dashboardResourceType,dashboard_resource_id:dashboardResourceId,enabled_context:askEnabledContext} }),
       });
       const responseReceived=performance.now();
       if (!response.ok) throw new Error(await apiError(response, "Unable to answer the research question"));

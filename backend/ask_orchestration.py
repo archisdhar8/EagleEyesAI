@@ -54,6 +54,10 @@ _INTENTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("PREDICTION_MARKETS", ("prediction markets matter", "probabilities changed", "market-implied risks", "prediction-market risks", "prediction market odds")),
     ("HISTORICAL_CHANGE", ("changed for", "since i last looked", "changed in macro since", "company score change")),
     ("DEEP_RESEARCH", ("deep research", "broad research", "research dossier", "full company research")),
+    ("COMPANY_RESEARCH", (
+        "company overview", "business model", "what does the company do",
+        "how it makes money", "how does it make money", "make money",
+    )),
     ("OPPORTUNITY_RANKING", (
         "strongest opportunities", "strongest investment opportunities", "opportunities in my portfolio",
         "best opportunities in my portfolio", "best investment opportunities", "best opportunities",

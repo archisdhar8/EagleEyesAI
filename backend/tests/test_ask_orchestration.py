@@ -320,3 +320,11 @@ def test_research_context_hints_enforce_bounded_tools() -> None:
         "ticker": "MSFT", "research_section": "overview", "research_capabilities": ["overview.competitor"],
     })
     assert peer.tools == ("research_peer_selection",)
+
+
+def test_company_business_model_language_routes_to_existing_company_capability() -> None:
+    plan = build_plan("What does Apple do and how does it make money?", "research")
+    assert plan.intent == "COMPANY_RESEARCH"
+    # Entity resolution appends the validated ticker before the final plan.
+    resolved = build_plan("What does Apple do and how does it make money? AAPL", "research")
+    assert resolved.tools == ("company_analysis",)

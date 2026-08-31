@@ -4223,6 +4223,12 @@ def _phase6_chat_tools(tool: str, user_id: str, question: str,
                 "summary": {"message": "Name one supported company or ticker."}}, capability=tool)
         else:
             canonical = phase6_domains.company_analysis_result(user_id, tickers[0])
+            if canonical.status == AnalysisStatus.UNAVAILABLE:
+                stored = database.research_core_data(tickers[0], peer_tickers=[])
+                research_rows = security_research([tickers[0]], stored=stored)
+                canonical = phase6_domains.company_analysis_from_stored(
+                    tickers[0], stored, research_rows[0] if research_rows else None,
+                )
     elif tool == "macro_state":
         canonical = phase6_domains.macro_state_result(user_id)
         if canonical.data and context:
@@ -4950,6 +4956,8 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
             mentions = database.resolve_security_mentions(payload.question, 5)
         except Exception:
             mentions = []
+        if not mentions:
+            mentions = [{"ticker": ticker, "name": ticker} for ticker in _resolve_chat_tickers(payload.question)]
         resolved = tuple(dict.fromkeys(row["ticker"] for row in mentions))
         if len(resolved) == 1:
             plan = ask_orchestration.build_plan(

@@ -365,6 +365,15 @@ def test_renderers_are_useful_without_gemini():
     assert "market-implied evidence" in phase6_domains.render_prediction(prediction)
 
 
+def test_company_analysis_falls_back_to_bounded_stored_evidence():
+    stored, research = company_fixture("AAPL")
+    result = phase6_domains.company_analysis_from_stored("AAPL", stored, research)
+    assert result.status in {AnalysisStatus.SUCCESS, AnalysisStatus.PARTIAL}
+    assert result.data["ticker"] == "AAPL"
+    assert result.data["research_capabilities"]["fields"]
+    assert result.verification.answer_allowed is True
+
+
 def test_normal_phase6_ask_loaders_never_rebuild_domains(monkeypatch):
     stored, research = company_fixture()
     phase6_domains.materialize_company("user-a", "MSFT", stored=stored, research_row=research)

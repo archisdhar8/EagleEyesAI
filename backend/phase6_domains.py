@@ -755,6 +755,46 @@ def company_analysis_result(user_id: str, ticker: str) -> AnalysisResult:
                                   input_fingerprint("company_analysis", ticker=normalized), [normalized])
 
 
+def company_analysis_from_stored(ticker: str, stored: dict[str, Any],
+                                 research_row: dict[str, Any] | None) -> AnalysisResult:
+    """Build a bounded company answer when the scheduled read model is absent."""
+    normalized = ticker.upper()
+    model = build_company_analysis(normalized, stored, research_row or {})
+    evaluated = model.evidence_quality.level != "INSUFFICIENT_DATA"
+    status = (
+        AnalysisStatus.SUCCESS if model.evidence_quality.level == "HIGH"
+        else AnalysisStatus.PARTIAL if evaluated
+        else AnalysisStatus.UNAVAILABLE
+    )
+    effective_dates = [value for value in model.freshness.values() if value]
+    return AnalysisResult(
+        capability="company_analysis", calculation_version=COMPANY_CALCULATION_VERSION,
+        input_fingerprint=stable_fingerprint({
+            "ticker": normalized,
+            "stored": read_models.dataset_descriptor(stored),
+        }),
+        status=status, data=model.model_dump(mode="json"),
+        coverage=Coverage(
+            requested_entities=[normalized],
+            evaluated_entities=[normalized] if evaluated else [],
+        ),
+        freshness=build_freshness([("stored_company_evidence", value) for value in effective_dates]),
+        dependencies=[DependencyResult(
+            name=f"stored_company_evidence:{normalized}", required=True,
+            status=AnalysisStatus.SUCCESS if evaluated else AnalysisStatus.UNAVAILABLE,
+            cache_state="STORED_EVIDENCE",
+        )],
+        limitations=[] if status == AnalysisStatus.SUCCESS else [
+            "The scheduled company read model was unavailable; this answer uses bounded stored evidence."
+        ],
+        verification=VerificationResult(
+            passed=status != AnalysisStatus.UNAVAILABLE,
+            answer_allowed=status != AnalysisStatus.FAILED,
+            recommendation_allowed=False,
+        ),
+    )
+
+
 def company_comparison_from_stored(tickers: list[str], stored: dict[str, Any],
                                    research_rows: list[dict[str, Any]],
                                    holdings: list[dict[str, Any]] | None = None) -> AnalysisResult:
