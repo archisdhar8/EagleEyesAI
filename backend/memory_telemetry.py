@@ -11,6 +11,7 @@ from typing import Any, Mapping
 
 
 LOGGER = logging.getLogger("eagleeyes.memory")
+LOGGER.setLevel(logging.INFO)
 
 
 def rss_bytes() -> int | None:
