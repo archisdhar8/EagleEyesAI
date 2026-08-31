@@ -8,7 +8,6 @@ services:
     buildCommand: pip install -r backend/requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health/readiness
-    maxShutdownDelaySeconds: 60
     envVars:
       - key: DATABASE_URL
         sync: false
