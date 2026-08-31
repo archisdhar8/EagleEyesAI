@@ -3055,6 +3055,21 @@ _CHAT_SECURITY_STOPWORDS = {
 
 _CHAT_RESEARCH_CACHE = TTLCache(max_entries=128)
 
+# Natural-language company references that are otherwise ambiguous in the
+# security master (for example, Apple Inc. versus Apple Hospitality REIT).
+# These aliases only nominate a ticker; the normal supported-security
+# validation below still decides whether the ticker may be used.
+_CHAT_COMPANY_ALIASES = {
+    "apple": "AAPL",
+    "microsoft": "MSFT",
+    "nvidia": "NVDA",
+    "amazon": "AMZN",
+    "alphabet": "GOOGL",
+    "google": "GOOGL",
+    "meta": "META",
+    "tesla": "TSLA",
+}
+
 
 def _resolve_chat_tickers(question: str) -> list[str]:
     """Resolve explicit symbols and unambiguous company-name tokens against the supported master."""
@@ -3070,6 +3085,13 @@ def _resolve_chat_tickers(question: str) -> list[str]:
             resolved.append(token)
     if resolved:
         return list(dict.fromkeys(resolved))[:3]
+    lowered = question.lower()
+    aliases = [
+        ticker for company, ticker in _CHAT_COMPANY_ALIASES.items()
+        if re.search(rf"(?<![a-z0-9]){re.escape(company)}(?![a-z0-9])", lowered)
+    ]
+    if aliases:
+        return list(dict.fromkeys(aliases))[:3]
     candidate_words = [
         word for word in re.findall(r"\b[A-Za-z][A-Za-z.&-]{3,}\b", question)
         if word.upper() not in _CHAT_SECURITY_STOPWORDS
@@ -4704,10 +4726,15 @@ def _execute_chat_plan_tools(
             )).depends_on
             if parent in planned_steps and planned_steps[parent].capability in node_ids
         )
+        node_timeout_ms = float(
+            os.getenv("ASK_RESEARCH_NODE_TIMEOUT_MS", "18000")
+            if tool in {"research_context", "research_portfolio_fit"}
+            else os.getenv("ASK_TOOL_NODE_TIMEOUT_MS", "5000")
+        )
         nodes.append(ask_execution.ExecutionNode(
             node_id=f"tool:{tool}:{index}", dependency_name=tool, required=tool in required_names,
             depends_on=tuple(dict.fromkeys((*parent, *planned_dependencies))), expected_latency_class=ask_execution.ExpectedLatencyClass.DATABASE,
-            configured_timeout_ms=float(os.getenv("ASK_TOOL_NODE_TIMEOUT_MS", "5000")), executor=tool_executor(tool),
+            configured_timeout_ms=node_timeout_ms, executor=tool_executor(tool),
         ))
 
     # Background reconciliation owns optional-model freshness. Synchronous

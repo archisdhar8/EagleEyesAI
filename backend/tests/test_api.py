@@ -10,7 +10,7 @@ from backend.main import (
     _benchmark_outlook_chat_tools, _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
     _interactive_performance_chat_tool,
     _cors_allowed_origins, _cors_allow_origin_regex, _decision_workspace_inputs, _execute_chat_plan_tools, _portfolio_chat_tools, _portfolio_risk_chat_tools,
-    _security_ranking_chat_tools, app,
+    _resolve_chat_tickers, _security_ranking_chat_tools, app,
 )
 
 
@@ -805,6 +805,28 @@ def test_chat_analysis_tools_execute_independent_nodes_concurrently(monkeypatch)
     assert [item["label"] for item in evidence] == ["first", "second"]
     assert [step["state"] for step in steps] == ["SUCCESS", "SUCCESS"]
     assert all(outcome.status.value == "SUCCESS" for outcome in outcomes if outcome.required)
+
+
+def test_common_company_alias_resolves_before_ambiguous_name_search(monkeypatch) -> None:
+    monkeypatch.setattr("backend.main.database.search_security_master", lambda *args, **kwargs: {"results": []})
+    assert _resolve_chat_tickers("What does Apple do and how does it make money?") == ["AAPL"]
+    assert _resolve_chat_tickers("Compare Microsoft with Nvidia") == ["MSFT", "NVDA"]
+
+
+def test_research_context_node_uses_bounded_research_timeout(monkeypatch) -> None:
+    monkeypatch.setenv("ASK_TOOL_NODE_TIMEOUT_MS", "5000")
+    monkeypatch.setenv("ASK_RESEARCH_NODE_TIMEOUT_MS", "18000")
+    monkeypatch.setattr("backend.main._instrumented_ask_tool", lambda tool, *args, **kwargs: (
+        [{"tool_name": tool, "status": "complete", "title": tool}], [],
+    ))
+    _, _, _, outcomes = _execute_chat_plan_tools(
+        ("research_context",), "user-1", "Explain this valuation", time.monotonic(),
+        tickers=("AAPL",), capability="RESEARCH_CONTEXT",
+        research_capabilities=("valuation.pe_ttm",),
+    )
+    research = next(outcome for outcome in outcomes if outcome.dependency_name == "research_context")
+    assert research.configured_timeout_ms == 18000
+    assert research.status.value == "SUCCESS"
 
 
 def test_portfolio_chat_queues_simulation_as_visible_tool(monkeypatch) -> None:
