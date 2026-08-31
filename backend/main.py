@@ -4728,7 +4728,7 @@ def _execute_chat_plan_tools(
         )
         node_timeout_ms = float(
             os.getenv("ASK_RESEARCH_NODE_TIMEOUT_MS", "18000")
-            if tool in {"research_context", "research_portfolio_fit"}
+            if tool in {"company_analysis", "research_context", "research_portfolio_fit"}
             else os.getenv("ASK_TOOL_NODE_TIMEOUT_MS", "5000")
         )
         nodes.append(ask_execution.ExecutionNode(

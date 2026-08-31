@@ -828,6 +828,14 @@ def test_research_context_node_uses_bounded_research_timeout(monkeypatch) -> Non
     assert research.configured_timeout_ms == 18000
     assert research.status.value == "SUCCESS"
 
+    _, _, _, company_outcomes = _execute_chat_plan_tools(
+        ("company_analysis",), "user-1", "What does Apple do?", time.monotonic(),
+        tickers=("AAPL",), capability="COMPANY_RESEARCH",
+    )
+    company = next(outcome for outcome in company_outcomes if outcome.dependency_name == "company_analysis")
+    assert company.configured_timeout_ms == 18000
+    assert company.status.value == "SUCCESS"
+
 
 def test_portfolio_chat_queues_simulation_as_visible_tool(monkeypatch) -> None:
     monkeypatch.setattr("backend.main.database.list_portfolios", lambda user_id: [{"id": "portfolio-1", "holdings": [{"ticker": "SPY", "weight": 1.0}]}])
