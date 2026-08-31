@@ -12,6 +12,11 @@ from typing import Any, Mapping
 
 LOGGER = logging.getLogger("eagleeyes.memory")
 LOGGER.setLevel(logging.INFO)
+if not LOGGER.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    LOGGER.addHandler(_handler)
+LOGGER.propagate = False
 
 
 def rss_bytes() -> int | None:
