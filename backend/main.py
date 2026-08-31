@@ -1756,14 +1756,25 @@ _RESEARCH_DETAIL_CACHE_LOCK = threading.Lock()
 _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS = max(15, min(300, int(os.getenv("RESEARCH_OVERVIEW_CACHE_TTL_SECONDS", "60"))))
 _RESEARCH_OVERVIEW_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _RESEARCH_OVERVIEW_CACHE_LOCK = threading.Lock()
-_RESEARCH_OVERVIEW_CACHE_MAX_ENTRIES = max(4, min(24, int(os.getenv("RESEARCH_OVERVIEW_CACHE_MAX_ENTRIES", "8"))))
+_RESEARCH_OVERVIEW_CACHE_MAX_ENTRIES = max(1, min(24, int(os.getenv("RESEARCH_OVERVIEW_CACHE_MAX_ENTRIES", "2"))))
 _RESEARCH_CORE_CACHE_TTL_SECONDS = max(30, min(900, int(os.getenv("RESEARCH_CORE_CACHE_TTL_SECONDS", "300"))))
-_RESEARCH_CORE_CACHE_MAX_ENTRIES = max(2, min(16, int(os.getenv("RESEARCH_CORE_CACHE_MAX_ENTRIES", "8"))))
+_RESEARCH_CORE_CACHE_MAX_ENTRIES = max(1, min(16, int(os.getenv("RESEARCH_CORE_CACHE_MAX_ENTRIES", "2"))))
 _RESEARCH_CORE_CACHE: dict[str, tuple[float, str, dict[str, Any]]] = {}
 _RESEARCH_CORE_CACHE_LOCK = threading.Lock()
 _RESEARCH_CORE_CONCURRENCY = max(1, min(2, int(os.getenv("RESEARCH_CORE_CONCURRENCY", "1"))))
 _RESEARCH_CORE_SEMAPHORE = threading.BoundedSemaphore(_RESEARCH_CORE_CONCURRENCY)
+_RESEARCH_OVERVIEW_CONCURRENCY = max(1, min(2, int(os.getenv("RESEARCH_OVERVIEW_CONCURRENCY", "1"))))
+_RESEARCH_OVERVIEW_SEMAPHORE = threading.BoundedSemaphore(_RESEARCH_OVERVIEW_CONCURRENCY)
 _RESEARCH_CORE_MEMORY_BUDGET_BYTES = max(64, int(os.getenv("RESEARCH_CORE_MEMORY_BUDGET_MB", "192"))) * 1024 * 1024
+
+
+def _serialized_research_overview(function):
+    """Bound full dossier composition without serializing unrelated Ask traffic."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with _RESEARCH_OVERVIEW_SEMAPHORE:
+            return function(*args, **kwargs)
+    return wrapped
 
 
 def _cached_research_detail(ticker: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -2041,6 +2052,7 @@ def research_security(ticker: str, user: AuthenticatedUser = Depends(require_use
 
 @app.get("/api/research/security/{ticker}/overview")
 @_memory_profiled_route("research_overview")
+@_serialized_research_overview
 def consolidated_research_security_overview(
     ticker: str, portfolio_id: str | None = Query(default=None),
     user: AuthenticatedUser = Depends(require_user),

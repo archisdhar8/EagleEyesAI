@@ -30,7 +30,11 @@ services:
       - key: RESEARCH_CORE_CONCURRENCY
         value: "1"
       - key: RESEARCH_CORE_CACHE_MAX_ENTRIES
-        value: "8"
+        value: "2"
+      - key: RESEARCH_OVERVIEW_CACHE_MAX_ENTRIES
+        value: "2"
+      - key: RESEARCH_OVERVIEW_CONCURRENCY
+        value: "1"
       - key: RESEARCH_CORE_CACHE_TTL_SECONDS
         value: "300"
       - key: RESEARCH_CORE_MEMORY_BUDGET_MB

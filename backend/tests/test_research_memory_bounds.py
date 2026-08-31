@@ -90,6 +90,7 @@ def test_core_read_model_does_not_echo_raw_document_content() -> None:
 
 def test_research_core_cache_reuses_projection_and_serializes_heavy_builds(monkeypatch) -> None:
     main._RESEARCH_CORE_CACHE.clear()
+    monkeypatch.setattr(main, "_RESEARCH_CORE_CACHE_MAX_ENTRIES", 3)
     active = 0
     maximum_active = 0
     calls = 0
@@ -190,3 +191,28 @@ def test_normal_ask_work_is_not_blocked_by_research_single_flight(monkeypatch) -
         release_research.set()
         research.result(timeout=1)
         second_research.result(timeout=1)
+
+
+def test_full_research_overviews_are_serialized_without_blocking_other_work() -> None:
+    active = 0
+    maximum_active = 0
+    lock = threading.Lock()
+
+    @main._serialized_research_overview
+    def slow_overview(ticker: str) -> str:
+        nonlocal active, maximum_active
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(.03)
+        with lock:
+            active -= 1
+        return ticker
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        first = executor.submit(slow_overview, "AAPL")
+        second = executor.submit(slow_overview, "MSFT")
+        unrelated = executor.submit(lambda: "ask-ready")
+        assert unrelated.result(timeout=.1) == "ask-ready"
+        assert {first.result(timeout=1), second.result(timeout=1)} == {"AAPL", "MSFT"}
+    assert maximum_active == 1
