@@ -2,7 +2,9 @@ services:
   - type: web
     name: eagleeyes-api
     runtime: python
-    plan: starter
+    # Keep the live validation on Free (512 MB). The application-level
+    # Research budget and single-flight bound remain mandatory.
+    plan: free
     buildCommand: pip install -r backend/requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health/readiness
@@ -22,6 +24,16 @@ services:
         sync: false
       - key: ASK_DAG_CONCURRENCY
         value: "3"
+      # Research is single-flight until the bounded path is verified against
+      # real Render RSS. This does not serialize Ask.
+      - key: RESEARCH_CORE_CONCURRENCY
+        value: "1"
+      - key: RESEARCH_CORE_CACHE_MAX_ENTRIES
+        value: "8"
+      - key: RESEARCH_CORE_CACHE_TTL_SECONDS
+        value: "300"
+      - key: RESEARCH_CORE_MEMORY_BUDGET_MB
+        value: "192"
       - key: ASK_ROUTER_V2
         value: "1"
       - key: ASK_CAPABILITY_PLANNER_GEMINI

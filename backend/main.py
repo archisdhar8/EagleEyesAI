@@ -15,6 +15,7 @@ from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from functools import wraps
 from typing import Any, Literal
 
 import pandas as pd
@@ -75,7 +76,9 @@ from .research_workspace import comparisons as research_comparison_payload
 from .research_workspace import ideas as research_ideas_payload
 from .research_workspace import search as research_search_payload
 from .research_workspace import build_research_intelligence, sector_summaries, theme_summaries
-from .research_read_model import build_shared_research_model
+from .research_read_model import VERSION as RESEARCH_READ_MODEL_VERSION, build_shared_research_model
+from .research_metrics import VERSION as RESEARCH_METRIC_VERSION
+from . import memory_telemetry
 from .scenarios import refresh as refresh_scenarios
 from .today_briefing import INDEXES, MARKET_SERIES, SECTORS, build_today_briefing
 from .error_monitoring import configure_error_monitoring
@@ -95,6 +98,25 @@ LOGGER = logging.getLogger("eagleeyes.startup")
 _STORAGE_INITIALIZATION: dict[str, str] = {"status": "pending"}
 _HOME_REFRESH_LOCK = threading.Lock()
 ASK_ROUTER_V2_ENABLED = os.getenv("ASK_ROUTER_V2", "1").strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _memory_profiled_route(route: str):
+    """Record dimensions-only memory telemetry around read-heavy routes."""
+    def decorator(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            started_rss = memory_telemetry.rss_bytes()
+            started_at = time.perf_counter()
+            memory_telemetry.emit(route, "start", started_rss=started_rss)
+            try:
+                return function(*args, **kwargs)
+            finally:
+                memory_telemetry.emit(
+                    route, "complete", started_rss=started_rss,
+                    details={"duration_ms": round((time.perf_counter() - started_at) * 1000, 2)},
+                )
+        return wrapped
+    return decorator
 
 
 def _initialize_remote_storage() -> None:
@@ -1366,6 +1388,7 @@ def refresh_named_provider(
 
 
 @app.get("/api/scenarios")
+@_memory_profiled_route("scenarios")
 def scenarios(_: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     return refresh_scenarios(force=False)
 
@@ -1727,12 +1750,20 @@ def mark_security_research_reviewed(
 
 
 _RESEARCH_DETAIL_CACHE_TTL_SECONDS = max(30, min(900, int(os.getenv("RESEARCH_DETAIL_CACHE_TTL_SECONDS", "300"))))
-_RESEARCH_DETAIL_CACHE_MAX_ENTRIES = max(8, min(128, int(os.getenv("RESEARCH_DETAIL_CACHE_MAX_ENTRIES", "48"))))
+_RESEARCH_DETAIL_CACHE_MAX_ENTRIES = max(4, min(32, int(os.getenv("RESEARCH_DETAIL_CACHE_MAX_ENTRIES", "12"))))
 _RESEARCH_DETAIL_CACHE: dict[str, tuple[float, list[dict[str, Any]], dict[str, Any]]] = {}
 _RESEARCH_DETAIL_CACHE_LOCK = threading.Lock()
 _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS = max(15, min(300, int(os.getenv("RESEARCH_OVERVIEW_CACHE_TTL_SECONDS", "60"))))
 _RESEARCH_OVERVIEW_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _RESEARCH_OVERVIEW_CACHE_LOCK = threading.Lock()
+_RESEARCH_OVERVIEW_CACHE_MAX_ENTRIES = max(4, min(24, int(os.getenv("RESEARCH_OVERVIEW_CACHE_MAX_ENTRIES", "8"))))
+_RESEARCH_CORE_CACHE_TTL_SECONDS = max(30, min(900, int(os.getenv("RESEARCH_CORE_CACHE_TTL_SECONDS", "300"))))
+_RESEARCH_CORE_CACHE_MAX_ENTRIES = max(2, min(16, int(os.getenv("RESEARCH_CORE_CACHE_MAX_ENTRIES", "8"))))
+_RESEARCH_CORE_CACHE: dict[str, tuple[float, str, dict[str, Any]]] = {}
+_RESEARCH_CORE_CACHE_LOCK = threading.Lock()
+_RESEARCH_CORE_CONCURRENCY = max(1, min(2, int(os.getenv("RESEARCH_CORE_CONCURRENCY", "1"))))
+_RESEARCH_CORE_SEMAPHORE = threading.BoundedSemaphore(_RESEARCH_CORE_CONCURRENCY)
+_RESEARCH_CORE_MEMORY_BUDGET_BYTES = max(64, int(os.getenv("RESEARCH_CORE_MEMORY_BUDGET_MB", "192"))) * 1024 * 1024
 
 
 def _cached_research_detail(ticker: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1757,6 +1788,59 @@ def _cached_research_detail(ticker: str) -> tuple[list[dict[str, Any]], dict[str
             oldest = min(_RESEARCH_DETAIL_CACHE, key=lambda key: _RESEARCH_DETAIL_CACHE[key][0])
             _RESEARCH_DETAIL_CACHE.pop(oldest, None)
     return rows, reference
+
+
+def _cached_research_core(ticker: str) -> tuple[dict[str, Any], str]:
+    """Single-flight, source-versioned Research core projection."""
+    peers = database.research_peer_tickers(ticker, database.RESEARCH_CORE_MAX_PEERS)
+    input_version = database.research_core_input_version(ticker, peers)
+    cache_version = f"{RESEARCH_READ_MODEL_VERSION}:{RESEARCH_METRIC_VERSION}:{input_version}"
+    now = time.monotonic()
+    with _RESEARCH_CORE_CACHE_LOCK:
+        cached = _RESEARCH_CORE_CACHE.get(ticker)
+        if cached and cached[1] == cache_version and now - cached[0] < _RESEARCH_CORE_CACHE_TTL_SECONDS:
+            memory_telemetry.emit("research_core", "cache_hit", details={"ticker": ticker, "cache_hit": True})
+            return cached[2], "hit"
+    with _RESEARCH_CORE_SEMAPHORE:
+        now = time.monotonic()
+        with _RESEARCH_CORE_CACHE_LOCK:
+            cached = _RESEARCH_CORE_CACHE.get(ticker)
+            if cached and cached[1] == cache_version and now - cached[0] < _RESEARCH_CORE_CACHE_TTL_SECONDS:
+                memory_telemetry.emit("research_core", "single_flight_hit", details={"ticker": ticker, "cache_hit": True})
+                return cached[2], "hit"
+        started_rss = memory_telemetry.rss_bytes()
+        started_at = time.perf_counter()
+        memory_telemetry.emit("research_core", "start", started_rss=started_rss,
+                              details={"ticker": ticker, "cache_hit": False, "peer_count": len(peers)})
+        bundle = database.research_core_data(ticker, peer_tickers=peers)
+        bundle_profile = dict(bundle.get("_telemetry") or {})
+        memory_telemetry.emit("research_core", "bundle_loaded", started_rss=started_rss,
+                              details={"ticker": ticker, **bundle_profile})
+        model = build_shared_research_model(ticker, bundle=bundle)
+        response_bytes = memory_telemetry.json_size_bytes(model)
+        ended_rss = memory_telemetry.rss_bytes()
+        rss_delta = ended_rss - started_rss if ended_rss is not None and started_rss is not None else None
+        details = {"ticker": ticker, "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                   "response_bytes": response_bytes, "cache_hit": False, **bundle_profile,
+                   "memory_budget_bytes": _RESEARCH_CORE_MEMORY_BUDGET_BYTES,
+                   "memory_budget_exceeded": rss_delta is not None and rss_delta > _RESEARCH_CORE_MEMORY_BUDGET_BYTES}
+        memory_telemetry.emit("research_core", "complete", started_rss=started_rss, details=details)
+        with _RESEARCH_CORE_CACHE_LOCK:
+            _RESEARCH_CORE_CACHE[ticker] = (now, cache_version, model)
+            expired = [key for key, value in _RESEARCH_CORE_CACHE.items()
+                       if now - value[0] >= _RESEARCH_CORE_CACHE_TTL_SECONDS]
+            for key in expired:
+                _RESEARCH_CORE_CACHE.pop(key, None)
+            while len(_RESEARCH_CORE_CACHE) > _RESEARCH_CORE_CACHE_MAX_ENTRIES:
+                oldest = min(_RESEARCH_CORE_CACHE, key=lambda key: _RESEARCH_CORE_CACHE[key][0])
+                _RESEARCH_CORE_CACHE.pop(oldest, None)
+        return model, "miss"
+
+
+def _bounded_portfolio_research(ticker: str, portfolio: dict[str, Any]) -> dict[str, Any]:
+    """Serialize the remaining portfolio overlay with Research core builds."""
+    with _RESEARCH_CORE_SEMAPHORE:
+        return build_shared_research_model(ticker, portfolio=portfolio)
 
 
 def _invalidate_research_overview_cache(user_id: str) -> None:
@@ -1956,6 +2040,7 @@ def research_security(ticker: str, user: AuthenticatedUser = Depends(require_use
 
 
 @app.get("/api/research/security/{ticker}/overview")
+@_memory_profiled_route("research_overview")
 def consolidated_research_security_overview(
     ticker: str, portfolio_id: str | None = Query(default=None),
     user: AuthenticatedUser = Depends(require_user),
@@ -1975,9 +2060,7 @@ def consolidated_research_security_overview(
     with _RESEARCH_OVERVIEW_CACHE_LOCK:
         cached = _RESEARCH_OVERVIEW_CACHE.get(cache_key)
         if cached and now - cached[0] < _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS:
-            response = deepcopy(cached[1])
-            response["cache"] = {"status": "hit", "ttl_seconds": _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS}
-            return response
+            return {**cached[1], "cache": {"status": "hit", "ttl_seconds": _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS}}
 
     profile = get_profile(user)
     watchlist = [str(item).strip().upper() for item in profile.get("watchlist", [])]
@@ -2021,11 +2104,10 @@ def consolidated_research_security_overview(
         membership=membership,
     )
     shared_intelligence = _safe_research_part(
-        lambda: build_shared_research_model(
-            normalized,
-            portfolio={"portfolio": {"id": portfolio.get("id"), "name": portfolio.get("name")} if portfolio else None,
-                       "membership": membership, "holdings": portfolio_holdings},
-        ),
+        lambda: (_bounded_portfolio_research(
+            normalized, {"portfolio": {"id": portfolio.get("id"), "name": portfolio.get("name")} if portfolio else None,
+                         "membership": membership, "holdings": portfolio_holdings},
+        ) if portfolio_holdings else _cached_research_core(normalized)[0]),
         {"status": "DEPENDENCY_FAILED", "coverage": 0.0, "sections": {}, "fields": {},
          "warnings": ["Shared Research capability model is unavailable."]},
     )
@@ -2060,8 +2142,8 @@ def consolidated_research_security_overview(
         "cache": {"status": "miss", "ttl_seconds": _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS},
     }
     with _RESEARCH_OVERVIEW_CACHE_LOCK:
-        _RESEARCH_OVERVIEW_CACHE[cache_key] = (now, deepcopy(response))
-        if len(_RESEARCH_OVERVIEW_CACHE) > _RESEARCH_DETAIL_CACHE_MAX_ENTRIES * 4:
+        _RESEARCH_OVERVIEW_CACHE[cache_key] = (now, response)
+        if len(_RESEARCH_OVERVIEW_CACHE) > _RESEARCH_OVERVIEW_CACHE_MAX_ENTRIES:
             oldest = min(_RESEARCH_OVERVIEW_CACHE, key=lambda key: _RESEARCH_OVERVIEW_CACHE[key][0])
             _RESEARCH_OVERVIEW_CACHE.pop(oldest, None)
     return response
@@ -2082,10 +2164,8 @@ def research_security_header(
     with _RESEARCH_OVERVIEW_CACHE_LOCK:
         cached = _RESEARCH_OVERVIEW_CACHE.get(cache_key)
         if cached and time.monotonic() - cached[0] < _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS:
-            response = deepcopy(cached[1])
-            response["stage"] = "full"
-            response["cache"] = {"status": "hit", "ttl_seconds": _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS}
-            return response
+            return {**cached[1], "stage": "full",
+                    "cache": {"status": "hit", "ttl_seconds": _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS}}
     bundle = database.research_header_data(normalized)
     model = _safe_research_part(
         lambda: build_shared_research_model(normalized, bundle=bundle),
@@ -2119,16 +2199,22 @@ def research_security_core(
     holding_symbols = [str(item.get("ticker") or "").strip().upper() for item in holdings]
     membership = {"holding": normalized in holding_symbols, "watchlist": normalized in watchlist,
                   "holding_detail": next((item for item in holdings if str(item.get("ticker") or "").upper() == normalized), None)}
-    model = _safe_research_part(
-        lambda: build_shared_research_model(normalized),
+    core_result = _safe_research_part(
+        lambda: _cached_research_core(normalized),
         {"ticker": normalized, "status": "DEPENDENCY_FAILED", "coverage": 0.0, "sections": {}, "fields": {},
          "warnings": ["Core Research evidence dependency failed."]},
     )
+    cache_status = "miss"
+    if isinstance(core_result, tuple):
+        model, cache_status = core_result
+    else:
+        model = core_result
     if not model.get("fields") or not model.get("fields", {}).get("header.ticker", {}).get("value"):
         raise HTTPException(404, "Security research is not available")
     return {"ticker": normalized, "membership": membership, "research_capabilities": model,
             "portfolio": {"id": portfolio.get("id"), "name": portfolio.get("name")} if portfolio else None,
-            "partial": model.get("status") != "SUCCESS", "stage": "core", "cache": {"status": "miss"}}
+            "partial": model.get("status") != "SUCCESS", "stage": "core",
+            "cache": {"status": cache_status, "ttl_seconds": _RESEARCH_CORE_CACHE_TTL_SECONDS}}
 
 
 @app.get("/api/research/securities/{ticker}/overview")
@@ -2237,6 +2323,7 @@ def research_etf_refresh(ticker: str, _: AuthenticatedUser = Depends(require_use
 
 
 @app.get("/api/research/comparisons")
+@_memory_profiled_route("research_comparison")
 def research_comparisons(
     tickers: str = Query(default="", max_length=200), user: AuthenticatedUser = Depends(require_user),
 ) -> dict[str, Any]:
@@ -2468,6 +2555,7 @@ def approved_forecast(target: str, horizon: str = Query(default="next 12 months"
 
 
 @app.post("/api/forecasting/portfolio-scenarios")
+@_memory_profiled_route("portfolio_scenario")
 def portfolio_forecast_scenario(payload: PortfolioForecastScenarioRequest,
                                 user: AuthenticatedUser = Depends(require_user)) -> dict[str, Any]:
     intelligence = forecasting.build_intelligence(user.id, limit=200)
@@ -4291,8 +4379,8 @@ def _execute_ask_tool(tool: str, user_id: str, question: str,
             return [{"tool_name": tool, "status": "unavailable", "title": "Research context",
                      "summary": {"message": "Name one supported company or ticker."}}], []
         if tool == "research_peer_selection":
-            peers = database.research_peer_tickers(ticker)
-            payload = {"ticker": ticker, "eligible_peers": peers[:8],
+            peers = database.research_peer_tickers(ticker, database.RESEARCH_CORE_MAX_PEERS)
+            payload = {"ticker": ticker, "eligible_peers": peers,
                        "message": "Choose one of these existing-universe peers to compare." if peers else "No qualifying peer is available."}
             return [{"tool_name": tool, "status": "complete" if peers else "unavailable", "title": f"Choose a {ticker} peer",
                      "summary": payload}], [{"label": f"{ticker} validated peer universe", "as_of": datetime.now(timezone.utc).isoformat(),
@@ -4303,7 +4391,10 @@ def _execute_ask_tool(tool: str, user_id: str, question: str,
                 return [{"tool_name": tool, "status": "unavailable", "title": f"{ticker} portfolio fit",
                          "summary": {"message": "Select an authenticated portfolio first."}}], []
             portfolio_payload = {"portfolio": {"id": context.portfolio_id}, "holdings": list(context.positions)}
-        model = build_shared_research_model(ticker, portfolio=portfolio_payload)
+        if portfolio_payload is None:
+            model, _ = _cached_research_core(ticker)
+        else:
+            model = _bounded_portfolio_research(ticker, portfolio_payload)
         requested = tuple(key for key in research_capabilities if key in model.get("fields", {}))
         allowed = requested or tuple(key for key in model.get("fields", {}) if key.startswith("portfolio." if tool == "research_portfolio_fit" else "header."))
         selected = {key: model["fields"][key] for key in allowed}

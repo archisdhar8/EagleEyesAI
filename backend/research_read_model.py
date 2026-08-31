@@ -571,9 +571,11 @@ def build_shared_research_model(ticker: str, *, bundle: Mapping[str, Any] | None
                                 peer_valuations: Sequence[Mapping[str, Any]] = (), portfolio: Mapping[str, Any] | None = None) -> dict[str, Any]:
     ticker = ticker.upper()
     if bundle is None:
-        peer_tickers = database.research_peer_tickers(ticker)
+        # Research core is deliberately company-scoped. Portfolio history is
+        # loaded by its own capability; it must not expand a company request
+        # into full filing builds for every holding.
         holding_tickers = [str(row.get("ticker") or "").upper() for row in (portfolio or {}).get("holdings", [])]
-        bundle = database.research_capability_data([ticker, *peer_tickers, *holding_tickers, "SPY", "QQQ", "XLK", "SOXX"])
+        bundle = database.research_core_data(ticker, portfolio_tickers=holding_tickers)
     securities = _ticker_rows(bundle, "securities", ticker)
     masters = _ticker_rows(bundle, "security_master", ticker)
     security, master = (securities[0] if securities else {}), (masters[0] if masters else {})
@@ -603,7 +605,7 @@ def build_shared_research_model(ticker: str, *, bundle: Mapping[str, Any] | None
         # unavailable, the honest result is an unavailable peer comparison.
         preferred = [row for row in candidates if target_industry and row.get("industry") == target_industry]
         calculated_peers = []
-        for peer in preferred[:8]:
+        for peer in preferred[:database.RESEARCH_CORE_MAX_PEERS]:
             peer_ticker = str(peer.get("ticker") or "").upper()
             peer_periods = _periods(bundle, peer_ticker)
             peer_financials = financial_metrics(peer_periods)
@@ -854,7 +856,14 @@ def build_shared_research_model(ticker: str, *, bundle: Mapping[str, Any] | None
         "financial_health": financials if business_type == "OPERATING_COMPANY" else {"status": "NOT_APPLICABLE", "business_type": business_type},
         "valuation": {**valuation, "history": valuation_history, "peer_medians": peer_values, "peer_quality": peer_quality},
         "ownership_sentiment": {"ownership": ownership, "news_sentiment": dict(sentiment_counts)},
-        "documents": docs, "portfolio_fit": {**dict(portfolio or {}), **portfolio_fit}, "model_outputs": model_outputs,
+        # The read model exposes compact lineage references, not raw filing
+        # excerpts. The derived description/risk fields above retain the
+        # bounded text required by the UI; full evidence is fetched lazily.
+        "documents": [
+            {key: row.get(key) for key in ("provider", "document_type", "external_id", "title", "source_url", "published_at", "fetched_at")}
+            for row in docs
+        ],
+        "portfolio_fit": {**dict(portfolio or {}), **portfolio_fit}, "model_outputs": model_outputs,
         "fields": fields, "sections": statuses, "status": statuses["page"]["status"], "coverage": statuses["page"]["coverage"],
         "plan_gated_fields": statuses["page"]["plan_gated_fields"],
         "lineage": {"fundamentals": [row.get("source_url") for row in periods[:8]], "market_as_of": as_of_market,

@@ -605,7 +605,7 @@ def materialize_company(user_id: str, ticker: str, *, stored: dict[str, Any] | N
     from .analysis import security_research
     from .earnings_intelligence import build_earnings_intelligence
     ticker = ticker.upper()
-    stored = stored if stored is not None else database.research_capability_data([ticker, "SPY", "QQQ", "XLK", "SOXX"], price_limit=1400)
+    stored = stored if stored is not None else database.research_core_data(ticker, peer_tickers=[])
     research_row = research_row or security_research([ticker], stored=stored)[0]
     if not research_row.get("earnings_state"):
         research_row = {**research_row, "earnings_state": build_earnings_intelligence(

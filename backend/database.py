@@ -1871,7 +1871,10 @@ def macro_point_in_time_history(series_ids: list[str], limit_per_series: int = 3
     ]
 
 
-def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
+def security_data(
+    tickers: list[str], price_limit: int = 756, *, include_news: bool = True,
+    include_company_markets: bool = True,
+) -> dict[str, Any]:
     normalized = sorted({ticker.strip().upper() for ticker in tickers if ticker.strip() and ticker.upper() != "CASH"})
     if not DATABASE_URL or not normalized:
         return {"securities": [], "fundamentals": [], "prices": [], "news": [], "company_markets": []}
@@ -1933,7 +1936,7 @@ def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
               WHERE s.ticker = ANY(%s) AND d.document_type='news'
             ) items WHERE position <= 25 ORDER BY ticker, published_at DESC NULLS LAST""",
             (normalized,),
-        ).fetchall()
+        ).fetchall() if include_news else []
         company_markets = conn.execute(
             """SELECT ticker, provider, external_market_id, title, source_url,
             evidence_type, closes_at, probability, confidence, volume, observed_at
@@ -1953,7 +1956,7 @@ def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
             ) latest WHERE snapshot_position=1
             ORDER BY ticker, confidence DESC NULLS LAST, volume DESC NULLS LAST""",
             (normalized,),
-        ).fetchall()
+        ).fetchall() if include_company_markets else []
     return {
         "securities": [
             {**dict(row), "id": str(row["id"]), "updated_at": _iso(row["updated_at"])}
@@ -1992,6 +1995,159 @@ def security_data(tickers: list[str], price_limit: int = 756) -> dict[str, Any]:
             for row in company_markets
         ],
     }
+
+
+RESEARCH_CORE_XBRL_CONCEPTS: tuple[str, ...] = (
+    "RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet",
+    "GrossProfit", "OperatingIncomeLoss", "NetIncomeLoss", "ProfitLoss", "EarningsPerShareDiluted",
+    "NetCashProvidedByUsedInOperatingActivities", "PaymentsToAcquirePropertyPlantAndEquipment",
+    "PaymentsToAcquireProductiveAssets", "CashAndCashEquivalentsAtCarryingValue", "LongTermDebt",
+    "LongTermDebtAndFinanceLeaseObligations", "StockholdersEquity",
+    "WeightedAverageNumberOfDilutedSharesOutstanding", "EntityCommonStockSharesOutstanding",
+    "DepreciationDepletionAndAmortization", "DepreciationDepletionAndAmortizationPropertyPlantAndEquipment",
+    "DepreciationAmortizationAndOther", "IncomeTaxExpenseBenefit",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+)
+RESEARCH_CORE_PRIMARY_PRICE_SESSIONS = 1260
+RESEARCH_CORE_BENCHMARK_PRICE_SESSIONS = 756
+RESEARCH_CORE_PEER_PRICE_SESSIONS = 2
+RESEARCH_CORE_MAX_PEERS = 4
+# Five years of issuer history requires up to twenty 10-Q/10-K accessions.
+# The query still selects only calculation concepts from those filings.
+RESEARCH_CORE_MAX_FILINGS = 20
+RESEARCH_CORE_MAX_DOCUMENTS = 8
+
+
+def _normalized_research_rows(rows: Any) -> list[dict[str, Any]]:
+    output = []
+    for row in rows:
+        item = dict(row)
+        for key, value in list(item.items()):
+            if isinstance(value, (datetime, date)):
+                item[key] = _iso(value)
+            elif isinstance(value, Decimal):
+                item[key] = _number(value)
+            elif key in {"id", "security_id"} and value is not None:
+                item[key] = str(value)
+        output.append(item)
+    return output
+
+
+def _merge_research_bundles(*bundles: dict[str, Any]) -> dict[str, Any]:
+    keys = ("securities", "fundamentals", "prices", "news", "company_markets")
+    return {key: [row for bundle in bundles for row in bundle.get(key, [])] for key in keys}
+
+
+def research_core_data(
+    ticker: str, *, peer_tickers: list[str] | None = None,
+    benchmark_tickers: tuple[str, ...] = ("SPY", "QQQ", "XLK", "SOXX"),
+    portfolio_tickers: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return a memory-bounded Research bundle.
+
+    Only the primary issuer receives filing facts, source history, news, and
+    filing excerpts. Peers are current-comparison projections; ETFs only carry
+    the price history required by the documented technical calculations.
+    """
+    normalized = ticker.strip().upper()
+    peers = [value for value in (peer_tickers if peer_tickers is not None else research_peer_tickers(normalized, RESEARCH_CORE_MAX_PEERS))
+             if value and value.upper() not in {normalized, "CASH"}][:RESEARCH_CORE_MAX_PEERS]
+    peers = list(dict.fromkeys(value.strip().upper() for value in peers))
+    benchmarks = list(dict.fromkeys(value.strip().upper() for value in benchmark_tickers if value.strip().upper() != normalized))
+    portfolio_symbols = list(dict.fromkeys(
+        value.strip().upper() for value in (portfolio_tickers or [])
+        if value.strip().upper() not in {normalized, "CASH", *peers, *benchmarks}
+    ))
+    primary = security_data([normalized], price_limit=RESEARCH_CORE_PRIMARY_PRICE_SESSIONS,
+                            include_news=True, include_company_markets=False)
+    peer_bundle = security_data(peers, price_limit=RESEARCH_CORE_PEER_PRICE_SESSIONS,
+                                include_news=False, include_company_markets=False) if peers else {}
+    benchmark_bundle = security_data(benchmarks, price_limit=RESEARCH_CORE_BENCHMARK_PRICE_SESSIONS,
+                                     include_news=False, include_company_markets=False) if benchmarks else {}
+    portfolio_bundle = security_data(portfolio_symbols, price_limit=RESEARCH_CORE_BENCHMARK_PRICE_SESSIONS,
+                                     include_news=False, include_company_markets=False) if portfolio_symbols else {}
+    base = _merge_research_bundles(primary, peer_bundle, benchmark_bundle, portfolio_bundle)
+    base.update({"security_master": [], "source_observations": [], "filing_facts": [],
+                 "fundamental_observations": [], "filing_documents": []})
+    if not DATABASE_URL or not normalized:
+        base["_telemetry"] = {"primary_ticker": normalized, "peer_tickers": peers, "benchmark_tickers": benchmarks,
+                              "portfolio_tickers": portfolio_symbols,
+                              "row_counts": {key: len(value) for key, value in base.items() if isinstance(value, list)}}
+        return base
+    all_symbols = [normalized, *peers, *benchmarks, *portfolio_symbols]
+    with postgres_connection() as conn:
+        tables = conn.execute(
+            """SELECT to_regclass('public.research_source_observations') AS source_table,
+            to_regclass('public.fundamental_dimensional_facts') AS fact_table"""
+        ).fetchone()
+        master = conn.execute("SELECT * FROM public.security_master WHERE ticker=ANY(%s)", (all_symbols,)).fetchall()
+        observations = conn.execute(
+            """SELECT ticker,provider,dataset,metric,effective_at,retrieved_at,value_numeric,
+            value_text,value_json,source_url,entitlement,metadata FROM (
+              SELECT *,row_number() OVER(PARTITION BY ticker,dataset,metric ORDER BY effective_at DESC,retrieved_at DESC) AS position
+              FROM public.research_source_observations
+              WHERE (ticker=%s) OR (ticker=ANY(%s) AND metric=ANY(%s))
+            ) ranked
+            WHERE (ticker=%s AND position<=CASE WHEN dataset='form_4' THEN 20 ELSE 4 END)
+               OR (ticker=ANY(%s) AND position=1)
+            ORDER BY ticker,effective_at DESC""",
+            (normalized, peers, ["shares_outstanding", "market_cap", "exchange"], normalized, peers),
+        ).fetchall() if tables["source_table"] else []
+        facts = conn.execute(
+            """WITH recent_filings AS (
+              SELECT DISTINCT f.accession_number,f.filed_at
+              FROM public.fundamental_dimensional_facts f
+              JOIN public.securities s ON s.id=f.security_id
+              WHERE s.ticker=%s AND f.form_type IN ('10-K','10-Q','10-K/A','10-Q/A')
+              ORDER BY f.filed_at DESC,f.accession_number DESC LIMIT %s
+            )
+            SELECT s.ticker,f.*
+            FROM public.fundamental_dimensional_facts f
+            JOIN public.securities s ON s.id=f.security_id
+            JOIN recent_filings recent ON recent.accession_number=f.accession_number
+            WHERE s.ticker=%s AND (f.concept=ANY(%s) OR f.concept ILIKE %s)
+            ORDER BY f.filed_at DESC,f.period_end DESC,f.id DESC""",
+            (normalized, RESEARCH_CORE_MAX_FILINGS, normalized, list(RESEARCH_CORE_XBRL_CONCEPTS), "%ConcentrationRiskPercentage%"),
+        ).fetchall() if tables["fact_table"] else []
+        documents = conn.execute(
+            """SELECT s.ticker,d.provider,d.document_type,d.external_id,d.title,d.source_url,
+            d.published_at,d.fetched_at,d.metadata,left(c.content,4000) AS content,c.metadata AS chunk_metadata
+            FROM public.documents d JOIN public.securities s ON s.id=d.security_id
+            LEFT JOIN public.document_chunks c ON c.document_id=d.id AND c.chunk_index=0
+            WHERE s.ticker=%s AND d.document_type IN ('10_k_section','risk_factor')
+            ORDER BY d.published_at DESC NULLS LAST LIMIT %s""",
+            (normalized, RESEARCH_CORE_MAX_DOCUMENTS),
+        ).fetchall()
+    base["security_master"] = _normalized_research_rows(master)
+    base["source_observations"] = _normalized_research_rows(observations)
+    base["filing_facts"] = _normalized_research_rows(facts)
+    base["filing_documents"] = _normalized_research_rows(documents)
+    primary_observation_count = sum(1 for row in observations if str(row.get("ticker") or "").upper() == normalized)
+    peer_observation_count = len(observations) - primary_observation_count
+    base["_telemetry"] = {
+        "primary_ticker": normalized, "peer_tickers": peers, "benchmark_tickers": benchmarks,
+        "portfolio_tickers": portfolio_symbols,
+        "row_counts": {key: len(value) for key, value in base.items() if isinstance(value, list)},
+        "paths": {
+            "primary": {"price_sessions": len(primary.get("prices", [])), "fundamental_periods": len(primary.get("fundamentals", [])),
+                        "xbrl_facts": len(facts), "source_observations": primary_observation_count,
+                        "news": len(primary.get("news", [])), "documents": len(documents)},
+            "peers": {"ticker_count": len(peers), "price_sessions": len(peer_bundle.get("prices", [])),
+                      "fundamental_periods": len(peer_bundle.get("fundamentals", [])),
+                      "source_observations": peer_observation_count},
+            "benchmarks": {"ticker_count": len(benchmarks), "price_sessions": len(benchmark_bundle.get("prices", []))},
+            "portfolio": {"ticker_count": len(portfolio_symbols), "price_sessions": len(portfolio_bundle.get("prices", []))},
+        },
+        "bounds": {"max_peers": RESEARCH_CORE_MAX_PEERS, "max_filings": RESEARCH_CORE_MAX_FILINGS,
+                   "xbrl_concept_count": len(RESEARCH_CORE_XBRL_CONCEPTS), "max_documents": RESEARCH_CORE_MAX_DOCUMENTS,
+                   "primary_price_sessions": RESEARCH_CORE_PRIMARY_PRICE_SESSIONS,
+                   "benchmark_price_sessions": RESEARCH_CORE_BENCHMARK_PRICE_SESSIONS,
+                   "peer_price_sessions": RESEARCH_CORE_PEER_PRICE_SESSIONS},
+        "xbrl_query": {"requested_filing_limit": RESEARCH_CORE_MAX_FILINGS,
+                       "requested_concept_count": len(RESEARCH_CORE_XBRL_CONCEPTS),
+                       "returned_rows": len(facts), "dropped_in_python": 0},
+    }
+    return base
 
 
 def research_capability_data(tickers: list[str], price_limit: int = 1400) -> dict[str, Any]:
@@ -2034,24 +2190,11 @@ def research_capability_data(tickers: list[str], price_limit: int = 1400) -> dic
             WHERE s.ticker=ANY(%s) AND d.document_type IN ('10_k_section','risk_factor')
             ORDER BY s.ticker,d.published_at DESC NULLS LAST LIMIT 1000""", (normalized,),
         ).fetchall()
-    def normalized_rows(rows: Any) -> list[dict[str, Any]]:
-        output = []
-        for row in rows:
-            item = dict(row)
-            for key, value in list(item.items()):
-                if isinstance(value, (datetime, date)):
-                    item[key] = _iso(value)
-                elif isinstance(value, Decimal):
-                    item[key] = _number(value)
-                elif key in {"id", "security_id"} and value is not None:
-                    item[key] = str(value)
-            output.append(item)
-        return output
-    base["security_master"] = normalized_rows(master)
-    base["source_observations"] = normalized_rows(observations)
-    base["filing_facts"] = normalized_rows(facts)
-    base["fundamental_observations"] = normalized_rows(fundamentals)
-    base["filing_documents"] = normalized_rows(documents)
+    base["security_master"] = _normalized_research_rows(master)
+    base["source_observations"] = _normalized_research_rows(observations)
+    base["filing_facts"] = _normalized_research_rows(facts)
+    base["fundamental_observations"] = _normalized_research_rows(fundamentals)
+    base["filing_documents"] = _normalized_research_rows(documents)
     return base
 
 
@@ -2112,6 +2255,35 @@ def research_peer_tickers(ticker: str, limit: int = 8) -> list[str]:
             (normalized, target["industry"], target["industry"], target["sector"], target["sector"], target["industry"], max(1, min(limit, 20))),
         ).fetchall()
     return [row["ticker"] for row in rows]
+
+
+def research_core_input_version(
+    ticker: str, peer_tickers: list[str], benchmark_tickers: tuple[str, ...] = ("SPY", "QQQ", "XLK", "SOXX"),
+) -> str:
+    """Return a compact invalidation token for inputs consumed by core.
+
+    This query reads timestamps only; cache hits never reconstruct source
+    bundles. Classification changes invalidate through the security timestamp
+    and the deterministic peer list is included verbatim.
+    """
+    normalized = ticker.strip().upper()
+    symbols = list(dict.fromkeys([normalized, *peer_tickers, *benchmark_tickers]))
+    if not DATABASE_URL:
+        return f"local:{normalized}:{','.join(peer_tickers)}"
+    with postgres_connection() as conn:
+        row = conn.execute(
+            """SELECT concat_ws('|',
+              (SELECT max(updated_at)::text FROM public.securities WHERE ticker=ANY(%s)),
+              (SELECT max(verified_at)::text FROM public.security_master WHERE ticker=ANY(%s)),
+              (SELECT max(f.fetched_at)::text FROM public.fundamental_periods f JOIN public.securities s ON s.id=f.security_id WHERE s.ticker=ANY(%s)),
+              (SELECT max(p.fetched_at)::text FROM public.price_bars p JOIN public.securities s ON s.id=p.security_id WHERE s.ticker=ANY(%s)),
+              (SELECT max(f.fetched_at)::text FROM public.fundamental_dimensional_facts f JOIN public.securities s ON s.id=f.security_id WHERE s.ticker=%s),
+              (SELECT max(retrieved_at)::text FROM public.research_source_observations WHERE ticker=%s),
+              (SELECT max(d.fetched_at)::text FROM public.documents d JOIN public.securities s ON s.id=d.security_id WHERE s.ticker=%s AND d.document_type IN ('news','10_k_section','risk_factor'))
+            ) AS version""",
+            (symbols, symbols, symbols, symbols, normalized, normalized, normalized),
+        ).fetchone()
+    return f"{normalized}:{','.join(peer_tickers)}:{(row or {}).get('version') or 'empty'}"
 
 
 def save_research_read_model(payload: dict[str, Any], portfolio_id: str | None = None) -> None:
