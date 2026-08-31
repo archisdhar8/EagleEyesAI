@@ -1022,8 +1022,24 @@ def deterministic_changes(read_model_type: str, previous: dict[str, Any], curren
 
 
 def render_company(data: CompanyAnalysisResult) -> str:
+    overview = dict(data.research_capabilities.get("overview") or {})
+    description = " ".join(str(overview.get("business_description") or "").split())
+    if len(description) > 800:
+        description = description[:800].rsplit(" ", 1)[0] + "…"
+    segments = list(overview.get("segments") or [])
+
+    def segment_label(row: dict[str, Any]) -> str:
+        name = str(row.get("name") or "Unnamed segment")
+        share = _number(row.get("revenue_share"))
+        if share is None:
+            return name
+        normalized = share / 100 if abs(share) > 1 else share
+        return f"{name} ({normalized:.1%} of disclosed revenue)"
+
     missing = ", ".join(data.evidence_quality.missing_domains) or "none"
     return (f"{data.identity.get('name')} ({data.ticker})\n\n"
+            f"Business: {description or 'No sourced business description is currently available.'}\n"
+            f"How it makes money: {', '.join(segment_label(row) for row in segments[:6]) if segments else 'Revenue segments are not disclosed in a usable structured form.'}\n\n"
             f"Price: {data.price_state.get('price')} as of {data.price_state.get('as_of') or 'unavailable'}\n"
             f"EagleEyes score: {data.eagleeyes_score if data.eagleeyes_score is not None else 'unavailable'}\n"
             f"Fundamental trend: {data.fundamental_trend.get('direction', 'UNAVAILABLE')}\n"

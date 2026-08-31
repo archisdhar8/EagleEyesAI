@@ -356,10 +356,16 @@ def test_deep_job_running_does_not_hide_fast_company_model():
 
 def test_renderers_are_useful_without_gemini():
     company = phase6_domains.build_company_analysis("MSFT", *company_fixture())
+    company.research_capabilities["overview"] = {
+        "business_description": "Microsoft develops software and cloud services.",
+        "segments": [{"name": "Intelligent Cloud", "revenue_share": .43}],
+    }
     macro = phase6_domains.build_macro_state(macro_rows(), [])
     market = phase6_domains.build_market_state(market_rows())
     prediction = phase6_domains.build_prediction_market_state(prediction_payload(), None)
     assert "EagleEyes score" in phase6_domains.render_company(company)
+    assert "Business: Microsoft develops software and cloud services." in phase6_domains.render_company(company)
+    assert "Intelligent Cloud (43.0% of disclosed revenue)" in phase6_domains.render_company(company)
     assert "Forecasts are separate" in phase6_domains.render_macro(macro)
     assert "Risk state" in phase6_domains.render_market(market)
     assert "market-implied evidence" in phase6_domains.render_prediction(prediction)
