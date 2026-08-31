@@ -392,6 +392,31 @@ def _holding_line(row: dict[str, Any]) -> str:
     return f"**{row.get('ticker')}** — " + (", ".join(fields) or "limited stored factor evidence")
 
 
+def _research_field_value(key: str, value: Any) -> str:
+    if value is None:
+        return "Unavailable"
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, (int, float)):
+        if any(token in key for token in ("yield", "margin", "growth", "return", "drawdown", "change")):
+            return f"{float(value):.1%}"
+        if any(token in key for token in ("price", "fair_value", "entry")) and not any(
+            token in key for token in ("price_to", "price_sales", "price_history")
+        ):
+            return f"${float(value):,.2f}"
+        if any(token in key for token in ("pe_", "pe_ttm", "ev_ebitda", "price_to_sales", "peg")):
+            return f"{float(value):.2f}×"
+        return f"{float(value):,.2f}"
+    if isinstance(value, list):
+        return ", ".join(_research_field_value(key, item) for item in value[:6]) or "Unavailable"
+    if isinstance(value, dict):
+        return "; ".join(
+            f"{str(name).replace('_', ' ')}: {_research_field_value(key, item)}"
+            for name, item in list(value.items())[:6]
+        ) or "Unavailable"
+    return str(value)
+
+
 def compose_supported_answer(
     *, intent: str, question: str, context: PortfolioContext | None,
     tool_results: list[dict[str, Any]], deterministic_answer: str | None,
@@ -410,7 +435,44 @@ def compose_supported_answer(
     unsupported: list[str] = []
     pending = [str(row.get("capability") or "calculation") for row in jobs]
 
-    if intent == "PORTFOLIO_PERFORMANCE":
+    if intent in {"RESEARCH_CONTEXT", "RESEARCH_PORTFOLIO_CONTEXT"}:
+        research = _summary_for(tool_results, "research_context", "research_portfolio_fit")
+        fields = dict(research.get("fields") or {})
+        ticker = str(research.get("ticker") or "The requested company")
+        if fields:
+            rows = []
+            available_count = 0
+            for key, field in fields.items():
+                status = str(field.get("status") or "UNAVAILABLE")
+                if status in {"AVAILABLE", "STALE"}:
+                    available_count += 1
+                rows.append([
+                    str(field.get("label") or key), _research_field_value(key, field.get("value")),
+                    status.replace("_", " ").title(), str(field.get("evidence_type") or "UNAVAILABLE").replace("_", " ").title(),
+                    str(field.get("as_of") or "Unavailable"),
+                ])
+            answer = f"## {ticker} Research evidence\n\n" + _markdown_table(
+                ["Metric", "Value", "Status", "Evidence", "As of"], rows,
+            )
+            answer += f"\n\nMethodology version: **{research.get('capability_version') or 'Unavailable'}**. Missing or gated fields remain explicitly unavailable."
+            if available_count:
+                supported.append(SupportedClaim(claim=f"{ticker} bounded Research capability evidence"))
+            if available_count < len(fields):
+                partial.append(SupportedClaim(claim="Unavailable Research fields are labeled without substitutes"))
+        else:
+            answer = "No requested Research fields are present in the compatible shared capability model."
+            unsupported.append("Requested Research context")
+    elif intent == "RESEARCH_PEER_SELECTION":
+        peer = _summary_for(tool_results, "research_peer_selection")
+        ticker = str(peer.get("ticker") or "the requested company")
+        peers = list(peer.get("eligible_peers") or [])
+        answer = str(peer.get("message") or "No qualifying peer is available.")
+        if peers:
+            answer += "\n\nEligible existing-universe peers: " + ", ".join(f"`{value}`" for value in peers) + "."
+            supported.append(SupportedClaim(claim=f"Validated peer universe for {ticker}"))
+        else:
+            unsupported.append(f"Validated peer for {ticker}")
+    elif intent == "PORTFOLIO_PERFORMANCE":
         backtest = _summary_for(tool_results, "portfolio_backtest")
         results = list(backtest.get("results") or [])
         if results:

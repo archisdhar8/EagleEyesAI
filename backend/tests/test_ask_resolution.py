@@ -52,6 +52,26 @@ def test_user_answer_contract_accepts_typed_substantive_content():
     assert validation.status_only is False
 
 
+def test_research_context_renderer_uses_typed_fields_instead_of_status_prose():
+    rows = [{
+        "tool_name": "research_context", "status": "complete", "summary": {
+            "ticker": "AAPL", "capability_version": "research-read-model-v2",
+            "fields": {
+                "valuation.pe_ttm": {"label": "P/E TTM", "value": 37.46, "status": "AVAILABLE", "evidence_type": "VERIFIED_FACT", "as_of": "2026-08-27"},
+                "valuation.forward_pe": {"label": "Forward P/E", "value": None, "status": "PLAN_GATED", "evidence_type": "UNAVAILABLE", "as_of": None},
+            },
+        },
+    }]
+    _, answer = compose_supported_answer(
+        intent="RESEARCH_CONTEXT", question="Explain this valuation", context=None,
+        tool_results=rows, deterministic_answer=None,
+    )
+    assert "37.46×" in answer.direct_answer
+    assert "Plan Gated" in answer.direct_answer
+    assert "requested claim is not supported" not in answer.direct_answer
+    assert validate_user_visible_answer(answer.direct_answer, intent="RESEARCH_CONTEXT", tool_results=rows).substantive
+
+
 def test_bounded_fallback_preserves_successful_component_and_names_failure():
     rows = [
         {"tool_name": "portfolio_risk", "status": "success", "summary": {

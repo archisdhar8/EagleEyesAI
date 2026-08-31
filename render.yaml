@@ -25,6 +25,8 @@ services:
         sync: false
       - key: ASK_DAG_CONCURRENCY
         value: "3"
+      - key: ASK_TOOL_BUDGET_SECONDS
+        value: "20"
       # Research is single-flight until the bounded path is verified against
       # real Render RSS. This does not serialize Ask.
       - key: RESEARCH_CORE_CONCURRENCY
