@@ -6,7 +6,10 @@ from datetime import datetime, timezone
 from backend.ask_resolution import (
     DEPENDENCY_MATRIX,
     DependencyClass,
+    AnswerMode,
     SupportedAnswer,
+    answer_mode,
+    apply_answer_mode,
     compose_supported_answer,
     deterministic_capability_fallback,
     validate_user_visible_answer,
@@ -344,3 +347,34 @@ def test_target_price_without_ticker_shows_relative_valuation_then_asks_for_meth
     )
     assert "MSFT" in answer.direct_answer and "62.0" in answer.direct_answer
     assert "earnings multiple" in answer.direct_answer and "DCF" in answer.direct_answer
+
+
+def test_answer_mode_keeps_rich_capabilities_detailed_and_narrow_metrics_compact():
+    assert answer_mode("PORTFOLIO_RISK", "What is my portfolio risk?") == AnswerMode.DETAILED
+    assert answer_mode("COMPANY_ANALYSIS", "What is AAPL's P/E?") == AnswerMode.COMPACT
+    assert answer_mode("COMPANY_ANALYSIS", "Analyze AAPL's business and valuation") == AnswerMode.STANDARD
+
+
+def test_compact_pe_renderer_uses_typed_value_and_one_source_line():
+    rows = [{"tool_name": "research_context", "status": "complete", "summary": {
+        "ticker": "AAPL", "fields": {
+            "valuation.pe_ttm": {"value": 37.46, "status": "AVAILABLE", "as_of": "2026-08-27"},
+        },
+    }}]
+    answer, mode = apply_answer_mode(
+        "A very long company dossier", intent="COMPANY_ANALYSIS", question="What is AAPL's P/E?", tool_results=rows,
+    )
+    assert mode == AnswerMode.COMPACT
+    assert "37.46×" in answer and "as of 2026-08-27" in answer
+    assert "dossier" not in answer
+
+
+def test_compact_largest_holding_renderer_uses_current_weight():
+    rows = [{"tool_name": "portfolio_risk", "status": "complete", "summary": {"positions": [
+        {"ticker": "MSFT", "weight": .12}, {"ticker": "NVDA", "weight": .18},
+    ]}}]
+    answer, mode = apply_answer_mode(
+        "Broad portfolio answer", intent="POSITION_SIZING", question="What is my largest holding?", tool_results=rows,
+    )
+    assert mode == AnswerMode.COMPACT
+    assert "NVDA" in answer and "18.0%" in answer

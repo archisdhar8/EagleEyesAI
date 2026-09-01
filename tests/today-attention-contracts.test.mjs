@@ -12,7 +12,8 @@ test("Today is snapshot-first with a unified Action Center", async () => {
     read("app/Dashboard.tsx"),
   ]);
   assert.match(page, /Restoring the latest portfolio snapshot/);
-  assert.match(page, /Preparing the first portfolio snapshot/);
+  assert.match(page, /Portfolio snapshot unavailable/);
+  assert.match(page, /Retry portfolio snapshot/);
   assert.match(page, /Future visits load the saved result immediately/);
   assert.match(dashboard, /Your saved portfolio is loaded/);
   assert.match(dashboard, /eagleeyes-today-refresh/);

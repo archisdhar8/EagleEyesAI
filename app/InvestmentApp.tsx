@@ -2,8 +2,9 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
+import Link from "next/link";
 import Dashboard from "./Dashboard";
-import { LearnPublicPreview } from "./components/learn/LearnPage";
+import { LearnPublicPreview } from "./components/learn/LearnPublicPreview";
 import { supabase } from "./supabase";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000/api";
@@ -19,6 +20,8 @@ export default function InvestmentApp() {
   const [currentPath, setCurrentPath] = useState("/");
 
   useEffect(() => {
+    // The server renders the public root; synchronize the browser-only route after hydration.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setCurrentPath(window.location.pathname);
     const onPopState=()=>setCurrentPath(window.location.pathname);
     window.addEventListener("popstate",onPopState);
@@ -49,7 +52,7 @@ export default function InvestmentApp() {
   if(currentPath.startsWith("/learn"))return <LearnPublicPreview apiUrl={API} onSignIn={showAccess}/>;
 
   return <main className="landing-shell">
-    <header className="landing-nav"><a className="landing-brand" href="#top"><span>EA</span><b>EagleEyes AI</b></a><nav><a href="#method">Method</a><a href="#research">Research</a><a href="/learn">Learn</a><a href="#safety">Safety</a></nav><button onClick={() => document.getElementById("access")?.scrollIntoView({ behavior: "smooth" })}>Sign in</button></header>
+    <header className="landing-nav"><a className="landing-brand" href="#top"><span>EA</span><b>EagleEyes AI</b></a><nav><a href="#method">Method</a><a href="#research">Research</a><Link href="/learn">Learn</Link><a href="#safety">Safety</a></nav><button onClick={() => document.getElementById("access")?.scrollIntoView({ behavior: "smooth" })}>Sign in</button></header>
     <section className="landing-hero" id="top"><div className="landing-copy"><span className="landing-kicker">Portfolio research, grounded in evidence</span><h1>Understand what your portfolio is betting on.</h1><p>Connect macro conditions, prediction-market probabilities, company fundamentals, and historical regimes—then compare transparent allocation alternatives without handing over control.</p><div><button className="landing-primary" onClick={() => document.getElementById("access")?.scrollIntoView({ behavior: "smooth" })}>Open your workspace</button><a href="#method">See how it works</a></div><small>Decision support only · no brokerage connection · no trade execution</small></div><div className="landing-orbit"><div><span>Current lens</span><strong>Rates × Inflation</strong><b>Scenario-aware</b></div><i /><i /><i /></div></section>
     <section className="landing-factor-row" id="method"><article><b>01</b><h2>Macro expectations</h2><p>Rates, inflation, growth, labor, and credit—with dates, confidence, and an explicit distinction between change and surprise.</p></article><article><b>02</b><h2>Company evidence</h2><p>Prices, fundamentals, valuation, industry context, news, and relevant prediction markets for your own holdings and watchlist.</p></article><article><b>03</b><h2>Transparent alternatives</h2><p>Risk-Controlled, Balanced, and Goal-Tilted ranges with assumptions, backtests, taxes, turnover, and constraints beside every result.</p></article></section>
     <section className="landing-research" id="research"><div><span>Built around your questions</span><h2>A workbench, not a generic market homepage.</h2><p>Choose the stocks and factor widgets you care about. Your holdings, saved research settings, analysis history, and cited conversations live in your private workspace.</p><ul><li>Adjustable macro and research widgets</li><li>Point-in-time regime library and walk-forward tests</li><li>Gemini assistant grounded only in stored evidence</li></ul></div><div className="landing-stack"><span>Prediction markets</span><span>FRED macro history</span><span>Corporate-action-adjusted prices</span><span>SEC fundamentals</span><span>Portfolio constraints</span></div></section>

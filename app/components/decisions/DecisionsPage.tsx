@@ -1,11 +1,14 @@
 "use client";
 
+/* eslint-disable react-hooks/immutability, react-hooks/set-state-in-effect */
+
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DecisionLab } from "../portfolio/DecisionLab";
 import type { Goal, Holding, Profile } from "../workspaces";
 import type { DecisionJournalWorkspace, DecisionRetrospective, DecisionType, DecisionsWorkspace, InvestmentThesis, ThesisAssumption, ThesisFactor, ThesisMonitorResult, MonitoringEvidence } from "./contracts";
 import { EvidenceTrust } from "../shared/EvidenceTrust";
 import { GuidedThesisEditor, type ThesisRelationship } from "./GuidedThesisEditor";
+import {recordFrontendBudget} from "../../lib/frontend-budget-telemetry";
 
 const EMPTY: InvestmentThesis = {
   ticker: "", summary: "", base_case: "", bull_case: "", bear_case: "", investment_horizon: "long",
@@ -87,6 +90,10 @@ export function DecisionsPage({
   const [intelligenceLoading,setIntelligenceLoading]=useState(false);
   const [caseTab,setCaseTab]=useState<"base"|"bull"|"bear">("base");
   const autoDraftedTickers=useRef(new Set<string>());
+  const selectedTickerRef=useRef("");
+  const draftRequestVersion=useRef(0);
+
+  useEffect(()=>{selectedTickerRef.current=selectedTicker;},[selectedTicker]);
 
   const load = useCallback(async () => {
     setLoading(true); setError("");
@@ -184,30 +191,33 @@ export function DecisionsPage({
   const updateInference=async(item:DecisionPersonalization["inferred"][number],action:"accept"|"edit"|"dismiss")=>{if(!personalization)return;const accepted={...personalization.accepted};let dismissed=[...personalization.dismissed];if(action==="dismiss")dismissed=Array.from(new Set([...dismissed,item.key]));else{const edited=action==="edit"?window.prompt("Edit this preference before accepting it",item.label):item.label;if(!edited)return;accepted[item.key]={...item,label:edited};}setSaving(true);try{const next=await readJson<DecisionPersonalization>(await request("/personalization",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({explicit:personalization.explicit,accepted,dismissed})}));setPersonalization(next);setNotice("Decision preference updated. Accepted preferences may reorder related evidence, with the reason shown in Today.");}catch(reason){setError(reason instanceof Error?reason.message:"Could not update the preference.");}finally{setSaving(false);}};
 
   const draft = async () => {
-    if (!form.ticker.trim()) { setError("Enter a ticker before drafting from research."); return; }
+    const requestTicker=form.ticker.trim().toUpperCase();
+    if (!requestTicker) { setError("Enter a ticker before drafting from research."); return; }
+    const requestVersion=++draftRequestVersion.current;
     setDrafting(true); setError(""); setNotice("");
     try {
       const result = await readJson<{ draft: InvestmentThesis; saved: false; warning: string }>(
-        await request(`/theses/drafts/${form.ticker.trim().toUpperCase()}`, { method: "POST" }),
+        await request(`/theses/drafts/${requestTicker}`, { method: "POST" }),
       );
+      if(requestVersion!==draftRequestVersion.current||selectedTickerRef.current!==requestTicker)return;
       const suggestedAssumptions=(result.draft.assumptions||[]).map(item=>({...item,evidence_mapping:{...item.evidence_mapping,origin:"EAGLEEYES_SUGGESTION"}}));
       const suggestedFactors=(result.draft.factors||[]).map(item=>({...item,evidence_mapping:{...item.evidence_mapping,origin:"EAGLEEYES_SUGGESTION"}}));
-      setForm({ ...result.draft, ticker: form.ticker.trim().toUpperCase(),investment_horizon:form.investment_horizon,
+      setForm({ ...result.draft, ticker: requestTicker,investment_horizon:form.investment_horizon,
         assumptions:suggestedAssumptions,factors:suggestedFactors,source_context:{...result.draft.source_context,relationship,user_reason:personalReason,confirmation_state:"PENDING"} });
       setSelectedId(null);
       setGuidedStage("review");setReviewConfirmed(false);
       setNotice(result.warning);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "Draft unavailable."); }
-    finally { setDrafting(false); }
+    } catch (reason) { if(requestVersion===draftRequestVersion.current&&selectedTickerRef.current===requestTicker)setError(reason instanceof Error ? reason.message : "Draft unavailable."); }
+    finally { if(requestVersion===draftRequestVersion.current)setDrafting(false); }
   };
 
   useEffect(()=>{
-    if(!selectedTicker||intelligenceLoading||selectedId||form.summary||drafting||autoDraftedTickers.current.has(selectedTicker))return;
+    if(!selectedTicker||form.ticker.trim().toUpperCase()!==selectedTicker||intelligenceLoading||selectedId||form.summary||drafting||autoDraftedTickers.current.has(selectedTicker))return;
     autoDraftedTickers.current.add(selectedTicker);
     void draft();
   // The selected ticker is drafted once; draft intentionally reads the latest setup state.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[selectedTicker,intelligenceLoading,selectedId,form.summary,drafting]);
+  },[selectedTicker,form.ticker,intelligenceLoading,selectedId,form.summary,drafting]);
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
@@ -273,7 +283,7 @@ export function DecisionsPage({
     BREAKER: form.factors.map((item, index) => ({ item, index })).filter(({ item }) => item.factor_type === "BREAKER"),
   };
 
-  const chooseSecurity=(ticker:string)=>{const normalized=ticker.trim().toUpperCase();if(!/^[A-Z][A-Z0-9.-]{0,9}$/.test(normalized)){setError("Enter a valid stock or ETF ticker.");return;}setError("");setSelectedTicker(normalized);setSecuritySearch("");window.history.replaceState({},"",`/decisions?ticker=${encodeURIComponent(normalized)}`);};
+  const chooseSecurity=(ticker:string)=>{const normalized=ticker.trim().toUpperCase();if(!/^[A-Z][A-Z0-9.-]{0,9}$/.test(normalized)){setError("Enter a valid stock or ETF ticker.");return;}draftRequestVersion.current+=1;selectedTickerRef.current=normalized;setDrafting(false);setError("");setSelectedTicker(normalized);setSecuritySearch("");window.history.replaceState({},"",`/decisions?ticker=${encodeURIComponent(normalized)}`);};
   const research=intelligence.research;
   const statistics=research?.market_statistics||{};
   const fundamentals=research?.fundamental_statistics||{};
@@ -286,8 +296,9 @@ export function DecisionsPage({
       ? ([...factors.RISK,...factors.BREAKER].length?[...factors.RISK,...factors.BREAKER].map(({item})=>item.description):research?.thesis_risks||[])
       : form.assumptions.map(item=>item.description);
   const relationshipLabel:Record<ThesisRelationship,string>={OWN:"I own it",CONSIDER:"I’m considering it",WATCH:"I’m watching it",AVOID:"I’m avoiding it"};
+  useEffect(()=>{const frame=window.requestAnimationFrame(()=>{const root=document.querySelector('[data-route-budget="decisions"]');if(root)recordFrontendBudget({route:"decisions",mounted_decision_buttons:root.querySelectorAll("button").length,selected_security:selectedTicker?1:0});});return()=>window.cancelAnimationFrame(frame);},[selectedTicker,workspace]);
 
-  return <section className="workspace decisions-workspace">
+  return <section className="workspace decisions-workspace" data-route-budget="decisions">
     <div className="section-intro decisions-intro">
       <div><span className="kicker">Persistent investment memory</span><h2>Remember the decision, the thesis, and what would invalidate it.</h2><p>Company quality and portfolio fit remain separate. Watching—or doing nothing—is a valid recorded decision.</p></div>
       <div className="section-actions"><button className="secondary" onClick={onOpenPortfolio}>Review portfolio</button><button className="primary" onClick={() => startThesis()}>New thesis</button></div>
@@ -301,10 +312,10 @@ export function DecisionsPage({
       <aside className="panel security-picker">
         <header><span>Choose a security</span><h3>Holdings and watchlist</h3><p>Select a saved name or search any supported ticker.</p></header>
         <form onSubmit={event=>{event.preventDefault();chooseSecurity(securitySearch);}}><input aria-label="Search holdings or ticker" value={securitySearch} onChange={event=>setSecuritySearch(event.target.value.toUpperCase())} placeholder="Search AAPL or company ticker"/><button className="secondary">Open{securitySearch?` ${securitySearch}`:""}</button></form>
-        <div className="security-picker-list">{securityUniverse.length?securityUniverse.map(item=><button key={item.ticker} className={selectedTicker===item.ticker?"selected":""} onClick={()=>chooseSecurity(item.ticker)}><strong>{item.ticker}</strong><span>{item.source}</span><small>{workspace.contexts[item.ticker]?.has_open_thesis?"Saved thesis":workspace.contexts[item.ticker]?.latest_decision||"Needs review"}</small></button>):<p>No saved name matches. Press Open to research this ticker.</p>}</div>
+        <div className="security-picker-list">{securityUniverse.length?securityUniverse.slice(0,12).map(item=><button key={item.ticker} className={selectedTicker===item.ticker?"selected":""} onClick={()=>chooseSecurity(item.ticker)}><strong>{item.ticker}</strong><span>{item.source}</span><small>{workspace.contexts[item.ticker]?.has_open_thesis?"Saved thesis":workspace.contexts[item.ticker]?.latest_decision||"Needs review"}</small></button>):<p>No saved name matches. Press Open to research this ticker.</p>}</div>
       </aside>
 
-      <div className="security-report">
+      {selectedTicker&&<div className="security-report">
         <section className="panel security-report-hero"><div><span>{research?.sector||"Security decision report"}{research?.industry?` · ${research.industry}`:""}</span><h2>{selectedTicker||"Choose a security"} <small>{research?.company||""}</small></h2><p>{research?.bucket_explanation||"Stored evidence will appear here without creating an investment conclusion."}</p></div><div className="relationship-control"><span>How does it fit today?</span><div>{(["OWN","CONSIDER","WATCH","AVOID"] as ThesisRelationship[]).map(value=><button key={value} className={relationship===value?"active":""} onClick={()=>setRelationship(value)}>{relationshipLabel[value]}</button>)}</div></div></section>
 
         {intelligenceLoading?<section className="panel report-loading"><span/>Loading the stored evidence report…</section>:<>
@@ -326,10 +337,12 @@ export function DecisionsPage({
           <section className="panel unified-assistant-callout"><div><span>Questions live in one place</span><h3>Discuss {selectedTicker} in Ask EagleEyes.</h3><p>The main assistant receives the ticker, saved thesis, portfolio context, earnings, and prediction-market evidence through its routing layer.</p></div><a className="primary" href={`/ask?ticker=${encodeURIComponent(selectedTicker)}&prompt=${encodeURIComponent(`Review my ${selectedTicker} decision report. What evidence most strengthens or weakens the thesis?`)}`}>Ask about {selectedTicker} →</a></section>
           {!!intelligence.warnings.length&&<div className="validation-list">{intelligence.warnings.map(item=><span key={item}>{item}</span>)}</div>}
         </>}
-      </div>
+      </div>}
     </section>}
 
-    {!loading && workspace && <>
+    {!loading && workspace && !selectedTicker && <section className="decisions-progressive-entry"><div className="decision-memory-grid"><article className="panel"><span>Recent decisions</span><h3>{workspace.recent_decisions.length}</h3><p>{workspace.recent_decisions.slice(0,3).map(item=>`${item.ticker} ${item.decision_type}`).join(" · ")||"No recorded decisions"}</p></article><article className="panel"><span>Needs review</span><h3>{workspace.review_dates.length}</h3><p>{workspace.review_dates.slice(0,4).map(item=>item.ticker).join(" · ")||"No scheduled reviews"}</p></article><article className="panel"><span>Needs a thesis</span><h3>{workspace.needs_thesis.length}</h3><p>{workspace.needs_thesis.slice(0,4).map(item=>item.ticker).join(" · ")||"No shortlist items"}</p></article></div></section>}
+
+    {!loading && workspace && selectedTicker && <>
       <div className="decision-memory-grid">
         <article className="panel"><span>Active theses</span><h3>{workspace.active_theses.length}</h3><p>{workspace.active_theses.length ? "Draft, active, or under review" : "No saved thesis yet"}</p></article>
         <article className="panel"><span>Recent decisions</span><h3>{workspace.recent_decisions.length}</h3><p>Append-only decision observations</p></article>
@@ -399,6 +412,8 @@ export function DecisionsPage({
       <section className="panel decision-history"><header><div><span>Recent decisions</span><h3>What you decided at the time</h3></div></header>{workspace.recent_decisions.length === 0 ? <p>No decisions recorded yet.</p> : <div className="table-scroll"><table><thead><tr><th>Date</th><th>Security</th><th>Decision</th><th>Thesis version</th><th>Observed price</th><th>Confidence</th><th>Notes</th></tr></thead><tbody>{workspace.recent_decisions.map(item => <tr key={item.id}><td>{new Date(item.decision_date).toLocaleDateString()}</td><td>{item.ticker}</td><td><strong>{item.decision_type}</strong></td><td>{item.thesis_version ? `v${item.thesis_version}` : "No linked thesis"}</td><td>{money(item.price_at_decision)}{item.price_source && <small> · {item.price_source}</small>}</td><td>{item.user_confidence || "Not specified"}</td><td>{item.notes || "No note"}</td></tr>)}</tbody></table></div>}</section>
     </>}
 
-    <details className="panel legacy-decision-lab"><summary>Scenario comparison lab</summary>{holdings.length ? <DecisionLab request={request} holdings={holdings} profile={profile} goals={goals} /> : <div className="decisions-empty"><h3>Add portfolio holdings before comparing modeled alternatives.</h3><p>The lab does not invent positions or placeholder financial data.</p><button className="primary" onClick={onOpenPortfolio}>Add holdings</button></div>}</details>
+    {selectedTicker&&<LazyDecisionLab request={request} holdings={holdings} profile={profile} goals={goals} onOpenPortfolio={onOpenPortfolio}/>}
   </section>;
 }
+
+function LazyDecisionLab({request,holdings,profile,goals,onOpenPortfolio}:{request:(path:string,init?:RequestInit)=>Promise<Response>;holdings:Holding[];profile:Profile;goals:Goal[];onOpenPortfolio:()=>void}){const [open,setOpen]=useState(false);return <details className="panel legacy-decision-lab" onToggle={event=>setOpen(event.currentTarget.open)}><summary>Scenario comparison lab</summary>{open&&(holdings.length?<DecisionLab request={request} holdings={holdings} profile={profile} goals={goals}/>:<div className="decisions-empty"><h3>Add portfolio holdings before comparing modeled alternatives.</h3><p>The lab does not invent positions or placeholder financial data.</p><button className="primary" onClick={onOpenPortfolio}>Add holdings</button></div>)}</details>}

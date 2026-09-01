@@ -16,6 +16,7 @@ type AskProps = DashboardProps & {
   contextTicker?: string | null;
   enabledContext: string[];
   onToggleContext: (key: "evidence" | "thesis" | "portfolio") => void;
+  onCanvasClosed?: () => void;
 };
 
 export function shouldOpenCanvasForQuestion(question: string, hasAnalysis: boolean) {
@@ -29,7 +30,7 @@ export function shouldOpenCanvasForQuestion(question: string, hasAnalysis: boole
   return false;
 }
 
-export function AskPage({ messages, question, setQuestion, onSend, loading, controls, contextTicker, enabledContext, onToggleContext, ...dashboardProps }: AskProps) {
+export function AskPage({ messages, question, setQuestion, onSend, loading, controls, contextTicker, enabledContext, onToggleContext, onCanvasClosed, ...dashboardProps }: AskProps) {
   const pendingQuestionRef = useRef<string | null>(null);
   const [canvasState, setCanvasState] = useState<CanvasState>("closed");
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -59,6 +60,8 @@ export function AskPage({ messages, question, setQuestion, onSend, loading, cont
   function closeCanvas() {
     setCanvasState("closed");
     setMobilePane("chat");
+    onCanvasClosed?.();
+    window.dispatchEvent(new Event("eagleeyes:canvas-closed"));
   }
 
   function sendFromChat(value?: string) {

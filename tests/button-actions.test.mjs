@@ -30,7 +30,8 @@ test("stock research search starts ready instead of blocking on an empty univers
   assert.match(research, /AbortController/);
   assert.match(research, /Choose a holding or search a company/);
   assert.match(research, /\/research\/security\/\$\{encodeURIComponent\(ticker\)\}\/header/);
-  assert.match(research, /\/research\/security\/\$\{encodeURIComponent\(ticker\)\}\/overview/);
+  assert.match(research, /\/research\/security\/\$\{ticker\}\/core/);
+  assert.doesNotMatch(research, /await fetcher\(`\/research\/security\/\$\{encodeURIComponent\(ticker\)\}\/overview/);
   assert.match(research, /Identity and market data are ready/);
 });
 
@@ -113,7 +114,8 @@ test("planning, guidance, and flexible portfolio import are visible and actionab
 test("default research presentation avoids false precision", async () => {
   const source = await dashboardSurface();
   const today = await readFile(todayPath, "utf8");
-  assert.match(today, /Preparing the first portfolio snapshot/);
+  assert.match(today, /Portfolio snapshot unavailable/);
+  assert.match(today, /No score or zero-value substitute was inferred/);
   assert.match(source, /Revenue segments/);
   assert.match(source, /Historical analysis is shown only for P\/E/);
   assert.match(source, /One clear view of the evidence/);

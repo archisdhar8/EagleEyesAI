@@ -37,9 +37,10 @@ test("all legacy routes resolve through the centralized route contract", async (
 
 test("Dashboard remains an orchestration surface after workspace extraction", async () => {
   const dashboard = await read("app/Dashboard.tsx");
-  for (const component of ["PlanPage", "PortfolioPage", "ExplorePage", "DecisionsPage", "AskPage", "AdvancedPage"]) {
+  for (const component of ["PlanPage", "PortfolioPage", "ExplorePage", "AskPage", "AdvancedPage"]) {
     assert.match(dashboard, new RegExp(`import \\{ ${component}`));
   }
+  assert.match(dashboard, /LazyDecisionsPage=lazy\(\(\)=>import\("\.\/components\/decisions\/DecisionsPage"\)/);
   for (const oldDefinition of ["function PlanPage", "function PortfolioWorkspace", "function AIWorkspace", "function AdvancedWorkspace", "function ResearchTerminal"]) {
     assert.doesNotMatch(dashboard, new RegExp(oldDefinition));
   }

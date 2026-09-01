@@ -1767,6 +1767,64 @@ _RESEARCH_OVERVIEW_CONCURRENCY = max(1, min(2, int(os.getenv("RESEARCH_OVERVIEW_
 _RESEARCH_OVERVIEW_SEMAPHORE = threading.BoundedSemaphore(_RESEARCH_OVERVIEW_CONCURRENCY)
 _RESEARCH_CORE_MEMORY_BUDGET_BYTES = max(64, int(os.getenv("RESEARCH_CORE_MEMORY_BUDGET_MB", "192"))) * 1024 * 1024
 
+_RESEARCH_SECTION_PREFIXES = {
+    "overview": ("overview.",),
+    "financial_health": ("financial.",),
+    "valuation": ("valuation.",),
+    "earnings": ("earnings.",),
+    "thesis": ("thesis.",),
+    "catalysts_risks": ("catalyst.", "risk."),
+    "market_technical": ("technical.", "performance."),
+    "ownership_sentiment": ("ownership.", "sentiment.", "news."),
+    "portfolio_relevance": ("portfolio.",),
+    "decision_summary": ("decision.",),
+    "sources": (),
+}
+_RESEARCH_CORE_ONLY_SECTIONS = {
+    "overview", "financial_health", "valuation", "earnings", "market_technical", "ownership_sentiment", "sources",
+}
+
+
+def _project_research_model(model: dict[str, Any], sections: tuple[str, ...], prefixes: tuple[str, ...]) -> dict[str, Any]:
+    """Return one canonical, bounded capability projection without duplicating the dossier."""
+    fields = model.get("fields") or {}
+    selected_fields = {
+        key: value for key, value in fields.items()
+        if any(key.startswith(prefix) for prefix in prefixes)
+    }
+    selected_sections = {
+        key: value for key, value in (model.get("sections") or {}).items()
+        if key in {*sections, "page"}
+    }
+    return {
+        "ticker": model.get("ticker"), "version": model.get("version"),
+        "generated_at": model.get("generated_at"), "status": model.get("status"),
+        "coverage": model.get("coverage"), "fields": selected_fields,
+        "sections": selected_sections,
+    }
+
+
+def _research_header_projection(model: dict[str, Any]) -> dict[str, Any]:
+    projected = _project_research_model(
+        model, ("header", "summary", "decision", "catalysts_risks"),
+        ("header.", "summary.", "decision.rating", "decision.confidence", "decision.invalidation", "catalyst.event", "risk.explanation"),
+    )
+    price_history = projected.get("fields", {}).get("header.price_history")
+    if isinstance(price_history, dict) and isinstance(price_history.get("value"), list):
+        compact_history = [
+            {key: row.get(key) for key in ("date", "ts", "close", "adjusted_close") if row.get(key) is not None}
+            for row in price_history["value"][-253:] if isinstance(row, dict)
+        ]
+        projected["fields"]["header.price_history"] = {**price_history, "value": compact_history}
+    return projected
+
+
+def _research_core_projection(model: dict[str, Any]) -> dict[str, Any]:
+    return _project_research_model(
+        model, ("financial_health", "valuation", "earnings"),
+        ("financial.", "valuation.", "earnings."),
+    )
+
 
 def _serialized_research_overview(function):
     """Bound full dossier composition without serializing unrelated Ask traffic."""
@@ -2176,8 +2234,16 @@ def research_security_header(
     with _RESEARCH_OVERVIEW_CACHE_LOCK:
         cached = _RESEARCH_OVERVIEW_CACHE.get(cache_key)
         if cached and time.monotonic() - cached[0] < _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS:
-            return {**cached[1], "stage": "full",
-                    "cache": {"status": "hit", "ttl_seconds": _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS}}
+            cached_model = cached[1].get("research_capabilities") or {}
+            return {
+                "ticker": normalized,
+                "membership": cached[1].get("membership") or {},
+                "portfolio": cached[1].get("portfolio"),
+                "research_capabilities": _research_header_projection(cached_model),
+                "partial": cached_model.get("status") != "SUCCESS",
+                "stage": "header",
+                "cache": {"status": "hit", "ttl_seconds": _RESEARCH_OVERVIEW_CACHE_TTL_SECONDS},
+            }
     bundle = database.research_header_data(normalized)
     model = _safe_research_part(
         lambda: build_shared_research_model(normalized, bundle=bundle),
@@ -2191,7 +2257,7 @@ def research_security_header(
     holding_symbols = [str(item.get("ticker") or "").strip().upper() for item in holdings]
     membership = {"holding": normalized in holding_symbols, "watchlist": normalized in watchlist,
                   "holding_detail": next((item for item in holdings if str(item.get("ticker") or "").upper() == normalized), None)}
-    return {"ticker": normalized, "membership": membership, "research_capabilities": model,
+    return {"ticker": normalized, "membership": membership, "research_capabilities": _research_header_projection(model),
             "portfolio": {"id": portfolio.get("id"), "name": portfolio.get("name")} if portfolio else None,
             "partial": True, "stage": "header", "cache": {"status": "miss"}}
 
@@ -2223,10 +2289,76 @@ def research_security_core(
         model = core_result
     if not model.get("fields") or not model.get("fields", {}).get("header.ticker", {}).get("value"):
         raise HTTPException(404, "Security research is not available")
-    return {"ticker": normalized, "membership": membership, "research_capabilities": model,
+    return {"ticker": normalized, "membership": membership, "research_capabilities": _research_core_projection(model),
             "portfolio": {"id": portfolio.get("id"), "name": portfolio.get("name")} if portfolio else None,
             "partial": model.get("status") != "SUCCESS", "stage": "core",
             "cache": {"status": cache_status, "ttl_seconds": _RESEARCH_CORE_CACHE_TTL_SECONDS}}
+
+
+@app.get("/api/research/security/{ticker}/sections/{section}")
+def research_security_section(
+    ticker: str, section: str, portfolio_id: str | None = Query(default=None),
+    user: AuthenticatedUser = Depends(require_user),
+) -> dict[str, Any]:
+    """Return one bounded Research section only when the client opens it."""
+    request_started = time.perf_counter()
+    normalized = ticker.strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", normalized):
+        raise HTTPException(422, "Invalid ticker")
+    if section not in _RESEARCH_SECTION_PREFIXES:
+        raise HTTPException(404, "Unknown Research section")
+    read_started = time.perf_counter()
+    if section in _RESEARCH_CORE_ONLY_SECTIONS:
+        core_result = _cached_research_core(normalized)
+        model, cache_status = core_result
+        portfolio, holdings = _selected_research_portfolio(user.id, portfolio_id)
+        holding_symbols = [str(item.get("ticker") or "").strip().upper() for item in holdings]
+        profile = get_profile(user)
+        watchlist = [str(item).strip().upper() for item in profile.get("watchlist", [])]
+        membership = {
+            "holding": normalized in holding_symbols, "watchlist": normalized in watchlist,
+            "holding_detail": next((item for item in holdings if str(item.get("ticker") or "").upper() == normalized), None),
+        }
+        portfolio_payload = {"id": portfolio.get("id"), "name": portfolio.get("name")} if portfolio else None
+        source_path = "core_projection"
+    else:
+        full = consolidated_research_security_overview(normalized, portfolio_id=portfolio_id, user=user)
+        model = full.get("research_capabilities") or {}
+        membership = full.get("membership") or {}
+        portfolio_payload = full.get("portfolio")
+        cache_status = str((full.get("cache") or {}).get("status") or "miss")
+        source_path = "portfolio_overlay"
+    read_model_ms = round((time.perf_counter() - read_started) * 1000, 2)
+    projection_started = time.perf_counter()
+    if section == "sources":
+        source_fields: dict[str, Any] = {}
+        for key, field in (model.get("fields") or {}).items():
+            if not isinstance(field, dict) or not any(field.get(name) for name in ("provider", "source_url", "source_record")):
+                continue
+            source_fields[key] = {name: field.get(name) for name in (
+                "key", "label", "status", "evidence_type", "provider", "source_url", "source_record",
+                "as_of", "retrieved_at", "freshness_policy", "methodology", "stale", "reason",
+            )}
+        projected = _project_research_model(model, ("sources",), ())
+        projected["fields"] = source_fields
+    else:
+        projected = _project_research_model(model, (section,), _RESEARCH_SECTION_PREFIXES[section])
+    projection_ms = round((time.perf_counter() - projection_started) * 1000, 2)
+    total_ms = round((time.perf_counter() - request_started) * 1000, 2)
+    timing = {"total_ms": total_ms, "read_model_ms": read_model_ms, "projection_ms": projection_ms,
+              "source_path": source_path, "cache_status": cache_status}
+    record_metric("research.section.latency", value=total_ms,
+                  tags={"section": section, "source_path": source_path, "cache_status": cache_status})
+    return {
+        "ticker": normalized,
+        "membership": membership,
+        "portfolio": portfolio_payload,
+        "research_capabilities": projected,
+        "partial": (projected.get("sections") or {}).get(section, {}).get("status") != "SUCCESS",
+        "stage": "section", "section": section,
+        "cache": {"status": cache_status, "ttl_seconds": _RESEARCH_CORE_CACHE_TTL_SECONDS},
+        "timing": timing,
+    }
 
 
 @app.get("/api/research/securities/{ticker}/overview")
@@ -5390,6 +5522,10 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
             model = "deterministic-timeout-fallback-v1"
         finally:
             clear_gemini_deadline()
+    answer, answer_mode = ask_resolution.apply_answer_mode(
+        answer, intent=plan.intent, question=payload.question, tool_results=tool_results,
+    )
+    supported_answer.direct_answer = answer
     answer_validation = ask_resolution.validate_user_visible_answer(
         answer, intent=plan.intent, tool_results=tool_results,
     )
@@ -5408,6 +5544,7 @@ def chat_message(payload: ChatRequest, http_request: Request = None,
     compact_tool_results = [_compact_chat_tool_result(result) for result in tool_results]
     structured_content = {
         "sources": sources, "tool_results": compact_tool_results,
+        "answer_mode": answer_mode.value,
         "requirement_resolution": requirement_resolution.model_dump(mode="json", exclude_none=True),
         "supported_answer": supported_answer.model_dump(mode="json", exclude_none=True),
         "answer_validation": answer_validation.model_dump(mode="json", exclude_none=True),

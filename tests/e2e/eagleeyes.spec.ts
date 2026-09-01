@@ -116,6 +116,7 @@ test("portfolio import flows to Research and analysis", async ({ page }) => {
   await installApiMock(page, { portfolio: false });
   await signIn(page);
   await page.goto("/portfolio?view=holdings");
+  await page.getByRole("button", { name: "Edit holdings" }).click();
   await page.getByLabel("Import portfolio CSV").setInputFiles({
     name: "portfolio.csv", mimeType: "text/csv", buffer: Buffer.from("symbol,weight\nAAPL,50%\nSPY,50%\n"),
   });
@@ -134,6 +135,7 @@ test("transaction ledger previews separately and saves only after review", async
   await installApiMock(page);
   await signIn(page);
   await page.goto("/portfolio?view=holdings");
+  await page.getByRole("button", { name: "Edit holdings" }).click();
   await page.getByText("Actual-performance ledger (optional)").click();
   await page.getByText("Import transaction CSV").locator("input").setInputFiles({
     name: "transactions.csv", mimeType: "text/csv",
@@ -153,7 +155,7 @@ test("legacy routes canonicalize without losing the requested subview", async ({
     ["/overview", "/today"], ["/scenarios", "/research?view=scenarios"],
     ["/research", "/research"], ["/optimize", "/portfolio?view=analysis"],
     ["/ai-workspace", "/ask"], ["/research-terminal", "/advanced?view=terminal"],
-    ["/decision-lab", "/research"], ["/portfolio?view=lab", "/research"],
+    ["/decision-lab", "/decisions"], ["/portfolio?view=lab", "/research"],
   ]) {
     await page.goto(legacy);
     await expect(page).toHaveURL(new RegExp(canonical.replace("?", "\\?")));
@@ -173,6 +175,7 @@ test("Learn saves, masters, and resumes a versioned lesson", async ({ page }) =>
   await page.getByRole("button", { name: "Submit knowledge check" }).click();
   await expect(page.getByText("Mastery score reached")).toBeVisible();
   await page.getByRole("button", { name: "← Learning hub" }).click();
+  await page.getByText("Browse all learning paths").click();
   await expect(page.getByText("1/1 mastered")).toBeVisible();
 });
 
@@ -234,6 +237,7 @@ test("partial widget failure preserves successful evidence and narration", async
   await buildBoard(page);
   await expect(page.getByText("Widget unavailable")).toBeVisible();
   await expect(page.getByText("The validated return evidence is available.")).toBeVisible();
+  await page.getByRole("button", { name: "Load detailed chart or table" }).click();
   await expect(page.getByRole("strong").filter({ hasText: "10.0%" })).toBeVisible();
 });
 
@@ -244,8 +248,9 @@ test("no-portfolio mode still provides cached company research", async ({ page }
   await page.goto("/research?view=stocks");
   await page.getByLabel("Stock, ETF, or company").fill("AAPL");
   await page.getByRole("button", { name: "Open research →" }).click();
-  await expect(page.getByRole("heading", { name: "Bear, base, and bull cases" })).toBeVisible();
-  await expect(page.getByText("Apple Inc.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /AAPL Apple Inc\./ })).toBeVisible();
+  await page.getByRole("button", { name: /09 \/ Portfolio relevance/ }).click();
+  await expect(page.getByText("Select/connect a portfolio to calculate.")).toBeVisible();
 });
 
 test("ETF Builder produces disclosed ranges, costs, and a benchmark", async ({ page }) => {
@@ -277,11 +282,11 @@ test("Stock Basket Builder discloses its universe, risk contribution, and benchm
   await expect(page.getByText("Paired paths browser-shared-paths")).toBeVisible();
 });
 
-test("retired Decisions URLs preserve ticker context in unified Research", async ({ page }) => {
+test("Decisions URLs preserve ticker context in the progressive decision workspace", async ({ page }) => {
   await installApiMock(page);
   await signIn(page);
   await page.goto("/decisions?ticker=AAPL");
-  await expect(page).toHaveURL(/\/research\?ticker=AAPL/);
+  await expect(page).toHaveURL(/\/decisions\?ticker=AAPL/);
   await expect(page.getByRole("heading", { name: /AAPL Apple Inc\./ })).toBeVisible();
 });
 
@@ -290,8 +295,8 @@ test("unified Research exposes watchlist and Ask without a thesis editor", async
   await signIn(page);
   await page.goto("/research?ticker=AAPL");
   await expect(page.getByRole("heading", { name: /AAPL Apple Inc\./ })).toBeVisible();
-  await expect(page.getByRole("button", { name: "✓ On watchlist" })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Ask EagleEyes →" })).toHaveAttribute("href", "/ask?ticker=AAPL");
+  await expect(page.getByRole("button", { name: "Watching ✓" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "What changed? ↗" })).toHaveAttribute("href", /\/ask\?ticker=AAPL/);
   await expect(page.getByRole("button", { name: "Confirm and save thesis" })).toHaveCount(0);
 });
 
@@ -301,7 +306,6 @@ test("default presentation stays detailed and Expert mode lives under More", asy
   await buildBoard(page);
   await expect(page.getByText("Evidence", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "Simple" })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Detailed" })).toHaveCount(0);
   await page.getByLabel("Open secondary navigation").click();
   const menuSignOut=page.locator(".secondary-menu").getByRole("button",{name:"↪ Sign out"});
   await expect(menuSignOut).toBeVisible();

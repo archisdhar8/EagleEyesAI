@@ -10,7 +10,7 @@ test("Learn is a canonical workspace with versioned lesson routes", async () => 
   assert.match(routes, /"learn", "◇", "Learn"/);
   assert.match(routes, /pathname\.match\(\/\^\\\/learn\\\//);
   const dashboard = await read("app/Dashboard.tsx");
-  assert.match(dashboard, /import \{ LearnPage \}/);
+  assert.match(dashboard, /LazyLearnPage=lazy\(\(\)=>import\("\.\/components\/learn\/LearnPage"\)/);
   assert.match(dashboard, /tab === "learn"/);
 });
 

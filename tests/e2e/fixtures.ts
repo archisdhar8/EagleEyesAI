@@ -49,6 +49,46 @@ function researchOverview(ticker:string,holdings:Array<{ticker:string;weight?:nu
   };
 }
 
+function researchReadModel(ticker:string,holdings:Array<{ticker:string;weight?:number|null;market_value?:number|null}>,watchlist:string[]){
+  const normalized=ticker.toUpperCase();
+  const security=research.find(item=>item.ticker===normalized)||research[0];
+  const field=(key:string,label:string,value:unknown,status="AVAILABLE",evidence_type="VERIFIED_FACT")=>({key,label,value,status,evidence_type,provider:"fixture",as_of:now,freshness_policy:"browser fixture"});
+  const fields=Object.fromEntries([
+    field("header.ticker","Ticker",normalized),field("header.company_name","Company",security.company),
+    field("header.exchange","Exchange","XNAS"),field("header.sector_industry","Sector / industry",`${security.sector} / ${security.industry}`),
+    field("header.price","Price",security.price),field("header.price_change_percent","Price change",.01),
+    field("header.price_history","Price history",[{date:"2026-08-09",close:Number(security.price)-1},{date:"2026-08-10",close:security.price}]),
+    field("summary.what_it_does","What it does",`${security.company} fixture company description.`),
+    field("summary.improving","Is it improving?","Reported fundamentals are stable."),
+    field("summary.cheap","Is it cheap?","Reasonable versus the stored fixture range."),
+    field("summary.moves","What moves it?","Next verified earnings update."),
+    field("summary.breaks","What breaks it?","Material deterioration in validated evidence."),
+    field("overview.description","Business description",`${security.company} fixture company description.`),
+    field("financial.revenue_growth","Revenue growth YoY",security.revenue_growth),
+    field("financial.net_margin","Net margin",security.net_margin),
+    field("valuation.pe_ttm","P/E TTM",28),
+    field("valuation.price_sales","Price / sales",8),
+    field("earnings.call_highlight","Earnings call highlight",null,"UNAVAILABLE","UNAVAILABLE"),
+    field("thesis.bull.statement","Bull case",["Growth and margins improve"],"AVAILABLE","OPINION"),
+    field("thesis.bear.statement","Bear case",["Device demand and margins weaken"],"AVAILABLE","OPINION"),
+    field("catalyst.event","Primary catalyst","Next verified earnings update."),
+    field("risk.explanation","Primary risk","Material earnings deterioration."),
+    field("technical.beta","Beta",1.1),
+    field("ownership.institutional","Institutional ownership",.7),
+    field("portfolio.correlation","Portfolio correlation",holdings.length?.5:null,holdings.length?"AVAILABLE":"REQUIRES_CONTEXT",holdings.length?"MODEL_OUTPUT":"UNAVAILABLE"),
+    field("decision.rating","Research state","RESEARCH","AVAILABLE","OPINION"),
+    field("decision.invalidation","Invalidation","Material deterioration in validated evidence.","AVAILABLE","OPINION"),
+  ].map(item=>[item.key,item]));
+  const sectionIds=["header","summary","overview","financial_health","valuation","earnings","thesis","catalysts_risks","market_technical","ownership_sentiment","portfolio_relevance","decision_summary","sources"];
+  const sections=Object.fromEntries(sectionIds.map(id=>[id,{status:id==="earnings"?"UNAVAILABLE":"PARTIAL",coverage:id==="earnings"?0:.75}]));
+  return {
+    ticker:normalized,
+    membership:{holding:holdings.some(item=>item.ticker===normalized),watchlist:watchlist.includes(normalized),holding_detail:holdings.find(item=>item.ticker===normalized)||null},
+    partial:true,stage:"core",cache:{status:"hit"},
+    research_capabilities:{ticker:normalized,version:"research-read-model-v2",generated_at:now,status:"PARTIAL",coverage:.75,fields,sections},
+  };
+}
+
 const learnLesson = {
   id: "why-invest", module_id: "start-safely", title: "Why save and invest?", estimated_minutes: 8,
   concept_ids: ["saving", "investing", "compounding", "inflation"], source_refs: ["investor-gov"],
@@ -295,7 +335,10 @@ export async function installApiMock(page: Page, options: { portfolio?: boolean;
     if (path === "/research" || path.startsWith("/research?")) return json(route, research);
     if (/^\/evidence\/securities\/[^/]+\/changes$/.test(path)) return json(route, { baseline: { as_of: now, source: "fixture", fallback_reason: null }, current_as_of: now, changes: [], coverage: [] });
     if (/^\/forecasting\/securities\/[^/]+\/markets$/.test(path)) return json(route, { markets: [] });
+    if (path === "/forecasting/markets") return json(route, { markets: [], disagreements: [], as_of: now });
     if (/^\/research\/security\/[^/]+\/overview$/.test(path)) return json(route,researchOverview(path.split("/")[3],state.holdings,profile.watchlist));
+    if (/^\/research\/security\/[^/]+\/(header|core)$/.test(path)) return json(route,researchReadModel(path.split("/")[3],state.holdings,profile.watchlist));
+    if (/^\/research\/security\/[^/]+\/sections\/[^/]+$/.test(path)) return json(route,researchReadModel(path.split("/")[3],state.holdings,profile.watchlist));
     if (/^\/research\/[^/]+\/earnings$/.test(path)) return json(route, { status: "UNAVAILABLE", actual_vs_expectations: {}, changes: [], guidance_changes: [], estimate_revisions: [], warnings: ["No fixture earnings period"] });
     if (/^\/watchlist\/[^/]+$/.test(path)&&(method==="PUT"||method==="DELETE")) return json(route,{tickers:profile.watchlist});
     if (path === "/research/search") return json(route, { query: url.searchParams.get("q") || "", filters: {}, universe: { definition: "Browser fixture universe", source: "fixture", total: research.length, holdings: state.holdings.length, watchlist: 2, explicitly_requested: 0, sector_or_broad_etfs: 1, tickers: research.map(row => row.ticker) }, results: research.map((row, index) => ({ ...row, relative_rank: index + 1, evidence_bucket: index ? "Constructive evidence" : "Leading evidence", bucket_explanation: "Deterministic fixture bucket", strengths: [{ label: "Fundamentals", evidence: row.fundamental_score }], weaknesses: [{ label: "Valuation", evidence: row.valuation_score }], valuation_range: { label: "Reasonable", basis: "Fixture valuation" }, fundamental_trend: { label: "Stable", revenue_growth: row.revenue_growth, net_margin: row.net_margin }, price_behavior: { label: "Positive", one_year_change: row.price_change_1y }, catalysts: [], thesis_risks: row.risk_flags, portfolio_fit: "Review concentration", what_would_change_the_view: "Material earnings deterioration", freshness: { status: "current", price_as_of: now, fundamentals_as_of: now, coverage: "high", confidence_reasons: ["fixture"] }, disclaimer: "Research only" })), method: { name: "fixture", version: "v1", ranking_use: "ordering" }, disclaimer: "Not a recommendation" });

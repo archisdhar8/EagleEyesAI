@@ -74,7 +74,94 @@ class AnswerValidation(BaseModel):
     missing_required_claims: list[str] = Field(default_factory=list)
 
 
+class AnswerMode(StrEnum):
+    COMPACT = "COMPACT"
+    STANDARD = "STANDARD"
+    DETAILED = "DETAILED"
+
+
 _STATUS_WORDS = {"SUCCESS", "PARTIAL", "UNAVAILABLE"}
+
+_DETAILED_INTENTS = {
+    "PORTFOLIO_ANALYSIS", "PORTFOLIO_RISK", "HIDDEN_RISK", "MULTI_SCENARIO",
+    "WATCHLIST_COMPARISON", "COMPANY_COMPARISON", "OPPORTUNITY_RANKING",
+    "VALUATION_RANKING", "THESIS_REPLACEMENT", "RECOMMENDATION_COUNTERCASE",
+    "PORTFOLIO_REBALANCE", "CASH_ALLOCATION", "COMPOSED_ANALYSIS",
+}
+
+
+def answer_mode(intent: str, question: str) -> AnswerMode:
+    """Choose response density from the registered intent and narrow question shape."""
+    if intent in _DETAILED_INTENTS:
+        return AnswerMode.DETAILED
+    text = " ".join(question.lower().split())
+    narrow = (
+        re.search(r"\b(?:p\s*/?\s*e|price[- ]to[- ]earnings)\b", text)
+        or re.search(r"\bwhat (?:sector|industry)\b|\bwhich (?:sector|industry)\b", text)
+        or re.search(r"\b(?:largest|biggest|top) holding\b", text)
+        or re.search(r"\bwhat changed\b.*\bscore\b|\bscore\b.*\bwhat changed\b", text)
+    )
+    return AnswerMode.COMPACT if narrow else AnswerMode.STANDARD
+
+
+def _nested_metric(value: Any, keys: set[str]) -> tuple[Any, dict[str, Any] | None]:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).lower().replace("-", "_").replace(" ", "_")
+            if normalized in keys or any(normalized.endswith(f".{candidate}") for candidate in keys):
+                return (item.get("value"), item) if isinstance(item, dict) and "value" in item else (item, None)
+        for item in value.values():
+            found, metadata = _nested_metric(item, keys)
+            if found is not None:
+                return found, metadata
+    elif isinstance(value, list):
+        for item in value:
+            found, metadata = _nested_metric(item, keys)
+            if found is not None:
+                return found, metadata
+    return None, None
+
+
+def apply_answer_mode(
+    answer: str, *, intent: str, question: str, tool_results: list[dict[str, Any]],
+) -> tuple[str, AnswerMode]:
+    """Render known narrow questions from typed results; never truncate rich analysis blindly."""
+    mode = answer_mode(intent, question)
+    if mode != AnswerMode.COMPACT:
+        return answer, mode
+    text = question.lower()
+    summaries = _summaries(tool_results)
+    ticker = next((str(row.get("ticker")) for row in summaries if row.get("ticker")), "The security")
+    if re.search(r"\b(?:p\s*/?\s*e|price[- ]to[- ]earnings)\b", text):
+        value, metadata = _nested_metric(summaries, {"pe_ttm", "p_e_ttm", "price_to_earnings", "valuation.pe_ttm"})
+        number = _num(value)
+        if number is not None:
+            as_of = (metadata or {}).get("as_of")
+            return f"**{ticker}'s trailing P/E is {number:.2f}×.**\n\nSource: verified Research valuation evidence" + (f" · as of {as_of}." if as_of else "."), mode
+        return f"**{ticker}'s trailing P/E is unavailable in the current verified evidence.**\n\nNo substitute or forward estimate was inferred.", mode
+    if re.search(r"\b(?:sector|industry)\b", text):
+        sector, _ = _nested_metric(summaries, {"sector"})
+        industry, _ = _nested_metric(summaries, {"industry"})
+        if sector is not None:
+            detail = f"; industry: **{industry}**" if industry else ""
+            return f"**{ticker} is in the {sector} sector**{detail}.\n\nSource: verified company identity data.", mode
+        return f"**{ticker}'s sector is unavailable in the current verified company identity data.**", mode
+    if re.search(r"\b(?:largest|biggest|top) holding\b", text):
+        positions, _ = _nested_metric(summaries, {"positions", "all_holdings"})
+        if isinstance(positions, list) and positions:
+            ranked = sorted((row for row in positions if isinstance(row, dict)), key=lambda row: _num(row.get("weight")) or -1, reverse=True)
+            if ranked:
+                row = ranked[0]
+                weight = _num(row.get("weight"))
+                return f"**{row.get('ticker')} is your largest saved holding" + (f" at {weight:.1%}" if weight is not None else "") + ".**\n\nSource: current saved portfolio weights.", mode
+    if "score" in text and "changed" in text:
+        changes, _ = _nested_metric(summaries, {"changes", "material_changes"})
+        score_changes = [row for row in changes or [] if isinstance(row, dict) and "score" in str(row.get("metric") or "").lower()]
+        if score_changes:
+            lines = [f"- {row.get('metric')}: {row.get('previous')} → {row.get('current')} ({str(row.get('materiality') or 'materiality unavailable').lower()})" for row in score_changes[:2]]
+            return f"**{ticker}'s supported score change:**\n\n" + "\n".join(lines) + "\n\nSource: compatible point-in-time Research snapshots.", mode
+        return f"**No supported {ticker} score component crossed its deterministic materiality threshold.**\n\nSource: compatible point-in-time Research snapshots.", mode
+    return answer, AnswerMode.STANDARD
 
 
 def _event_expired(row: dict[str, Any], now: datetime) -> bool:

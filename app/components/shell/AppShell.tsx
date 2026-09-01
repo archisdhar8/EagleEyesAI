@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { isPrimaryTab, navigationLabel, PRIMARY_NAV_ITEMS, SECONDARY_NAV_ITEMS, type Tab } from "../../lib/routes";
 import type { PresentationLevel } from "../../lib/presentation-level";
 import { ConceptGlossary } from "../learn/ConceptGlossary";
+import { RouteErrorBoundary } from "../shared/RouteErrorBoundary";
 
 export function AppShell({
   activeTab, density, connected, connectionChecked, dark, email, freshness, presentationLevel, children,
@@ -68,7 +69,7 @@ export function AppShell({
       {drawer}
       {status && <div className="progress" role="status"><span />{status}…</div>}
       {notice && <div className="notice"><span>i</span>{notice}<button onClick={onDismissNotice} aria-label="Dismiss">×</button></div>}
-      {children}
+      <RouteErrorBoundary route={activeTab}>{children}</RouteErrorBoundary>
     </main>
   </div>;
 }

@@ -6,7 +6,44 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 from backend import database, main
+from backend.auth import AuthenticatedUser
 from backend.research_read_model import build_shared_research_model
+
+
+def test_research_payload_projections_are_bounded_and_nonduplicative() -> None:
+    fields = {
+        "header.ticker": {"value": "AAPL"},
+        "summary.cheap": {"value": "Fair"},
+        "financial.revenue_growth": {"value": 0.1},
+        "valuation.pe": {"value": 25},
+        "earnings.surprise.eps": {"value": [0.02]},
+        "thesis.bull.statement": {"value": ["Growth"]},
+        "portfolio.correlation": {"value": 0.4},
+    }
+    model = {"ticker": "AAPL", "version": "v1", "generated_at": "now", "status": "PARTIAL",
+             "coverage": 0.75, "fields": fields, "sections": {key: {"status": "PARTIAL"}
+             for key in ("header", "summary", "financial_health", "valuation", "earnings", "thesis", "portfolio_relevance")}}
+    header = main._research_header_projection(model)
+    core = main._research_core_projection(model)
+    thesis = main._project_research_model(model, ("thesis",), main._RESEARCH_SECTION_PREFIXES["thesis"])
+    assert set(header["fields"]) == {"header.ticker", "summary.cheap"}
+    assert set(core["fields"]) == {"financial.revenue_growth", "valuation.pe", "earnings.surprise.eps"}
+    assert set(thesis["fields"]) == {"thesis.bull.statement"}
+    assert not (set(header["fields"]) & set(core["fields"]))
+    assert "portfolio.correlation" not in core["fields"]
+
+
+def test_research_header_projection_bounds_visible_price_history() -> None:
+    history = [{"date": f"day-{index}", "close": index} for index in range(800)]
+    model = {"ticker": "AAPL", "version": "v1", "generated_at": "now", "status": "SUCCESS",
+             "coverage": 1.0, "fields": {"header.ticker": {"value": "AAPL"},
+             "header.price_history": {"value": history, "provider": "stored"}},
+             "sections": {"header": {"status": "SUCCESS"}}}
+    projected = main._research_header_projection(model)
+    visible = projected["fields"]["header.price_history"]["value"]
+    assert len(visible) == 253
+    assert visible[0] == {"date": history[-253]["date"], "close": history[-253]["close"]}
+    assert len(model["fields"]["header.price_history"]["value"]) == 800
 
 
 class _Rows:
@@ -135,6 +172,33 @@ def test_research_core_cache_is_bounded(monkeypatch) -> None:
     for ticker in ("AAPL", "MSFT", "AMZN"):
         main._cached_research_core(ticker)
     assert len(main._RESEARCH_CORE_CACHE) == 2
+
+
+def test_core_only_section_bypasses_full_portfolio_overlay_and_reports_timing(monkeypatch) -> None:
+    model = {
+        "ticker": "AAPL", "version": "v1", "generated_at": "now", "status": "PARTIAL", "coverage": .5,
+        "fields": {"overview.description": {"key": "overview.description", "value": "Company description"}},
+        "sections": {"overview": {"status": "PARTIAL", "coverage": .5}},
+    }
+    monkeypatch.setattr(main, "_cached_research_core", lambda _ticker: (model, "hit"))
+    monkeypatch.setattr(main, "_selected_research_portfolio", lambda *_args: (None, []))
+    monkeypatch.setattr(main, "get_profile", lambda _user: {"watchlist": []})
+    monkeypatch.setattr(
+        main, "consolidated_research_security_overview",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("full overlay must not run")),
+    )
+    captured: list[tuple[str, float, dict]] = []
+    monkeypatch.setattr(main, "record_metric", lambda name, value, tags: captured.append((name, value, tags)))
+
+    result = main.research_security_section(
+        "AAPL", "overview", portfolio_id=None,
+        user=AuthenticatedUser("research-user", "research@example.com"),
+    )
+
+    assert result["timing"]["source_path"] == "core_projection"
+    assert result["timing"]["cache_status"] == "hit"
+    assert result["research_capabilities"]["fields"]["overview.description"]["value"] == "Company description"
+    assert captured[0][0] == "research.section.latency"
 
 
 def test_research_and_portfolio_overlay_share_only_research_semaphore(monkeypatch) -> None:

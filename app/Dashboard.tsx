@@ -1,19 +1,17 @@
 "use client";
 
-import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppShell } from "./components/shell/AppShell";
 import { TodayPage, type PortfolioOverview, type TodayBriefing } from "./components/today/TodayPage";
 import { PlanPage } from "./components/plan/PlanPage";
 import { PortfolioPage } from "./components/portfolio/PortfolioPage";
 import { ExplorePage } from "./components/research/ExplorePage";
-import { LearnPage } from "./components/learn/LearnPage";
 import { AskPage } from "./components/ask/AskPage";
-import { DecisionsPage } from "./components/decisions/DecisionsPage";
-import { MarketClimatePage } from "./components/markets/MarketClimatePage";
 import { AdvancedPage, ResearchTerminal } from "./components/terminal/AdvancedPage";
 import { adaptDashboardSpecification, type DashboardAction, type DashboardActionResult } from "./components/ask/contracts";
 import { adaptTerminalWidgets, type TerminalLayout, type TerminalWidgetConfig, type TerminalWidgetType } from "./components/terminal/contracts";
 import { normalizePresentationLevel } from "./lib/presentation-level";
+import {recordFrontendBudget} from "./lib/frontend-budget-telemetry";
 import { navigationLabel, pathForTab, resolveAppRoute, type AdvancedView, type ExploreView, type PortfolioView, type RouteState, type Tab } from "./lib/routes";
 import {
   defaultPolicy, defaultProfile, defaultTerminalWidgets, seededScenarios, terminalCatalog,
@@ -31,6 +29,30 @@ const NEW_CHAT_STORAGE_VALUE = "__new_chat__";
 type SavedPortfolio = { id: string | number; name: string; holdings: Holding[]; updated_at?: string | null };
 type CachedToday = { cachedAt:number; briefing:TodayBriefing; macro?:Macro; macroFactors?:MacroFactor[]; dataStatus?:DataStatus };
 type CachedConversation = { conversationId:string; workspace:"research"|"portfolio"; portfolioId:string; messages:ChatMessage[]; artifacts:ChatArtifact[]; cachedAt:number };
+type ConversationCacheEntry = {messages:ChatMessage[];artifacts:ChatArtifact[];bytes:number};
+const CONVERSATION_CACHE_ENTRIES=3;
+const CONVERSATION_CACHE_BYTES=2_000_000;
+const CONVERSATION_SNAPSHOT_MESSAGES=40;
+const CONVERSATION_SNAPSHOT_BYTES=500_000;
+
+const LazyLearnPage=lazy(()=>import("./components/learn/LearnPage").then(module=>({default:module.LearnPage})));
+const LazyDecisionsPage=lazy(()=>import("./components/decisions/DecisionsPage").then(module=>({default:module.DecisionsPage})));
+const LazyMarketClimatePage=lazy(()=>import("./components/markets/MarketClimatePage").then(module=>({default:module.MarketClimatePage})));
+
+function RouteSkeleton({label}:{label:string}){return <section className="workspace route-skeleton" role="status" aria-live="polite"><span/><div><strong>Opening {label}…</strong><small>Your navigation and current workspace remain available.</small></div></section>}
+
+function serializedBytes(value:unknown){return new TextEncoder().encode(JSON.stringify(value)).byteLength;}
+function compactSnapshotMessage(message:ChatMessage):ChatMessage{
+  const structured=message.structured_content;
+  if(!structured)return message;
+  const operation=structured.dashboard_operation;
+  return {...message,structured_content:{
+    answer_mode:structured.answer_mode,
+    sources:structured.sources?.slice(0,12),actions:structured.actions?.slice(0,8),visual_suggestion:structured.visual_suggestion,
+    analysis_context:structured.analysis_context,grounding:structured.grounding,client_timing:structured.client_timing,
+    dashboard_operation:operation?{...operation,action_result:operation.action_result?{status:operation.action_result.status,error:operation.action_result.error}:undefined}:undefined,
+  }};
+}
 export default function Dashboard({ accessToken, email, onSignOut }: { accessToken: string; email: string; onSignOut: () => void }) {
   const [tab, setTab] = useState<Tab>("today");
   const [exploreView, setExploreView] = useState<ExploreView>("stocks");
@@ -90,6 +112,9 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   const [selectedDashboardView, setSelectedDashboardView] = useState<string | null>(null);
   const [dashboardBusy, setDashboardBusy] = useState(false);
   const [dashboardSourceConversationId,setDashboardSourceConversationId]=useState<string|null>(null);
+  const dashboardStreamController=useRef<AbortController|null>(null);
+  const researchDetailController=useRef<AbortController|null>(null);
+  const researchDetailTicker=useRef("");
   const [researchChatMessages, setResearchChatMessages] = useState<ChatMessage[]>([]);
   const [researchChatQuestion, setResearchChatQuestion] = useState("");
   const [researchChatBusy, setResearchChatBusy] = useState(false);
@@ -97,7 +122,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   const [researchConversationId, setResearchConversationId] = useState<string | null>(null);
   const [researchConversations,setResearchConversations]=useState<ChatConversation[]>([]);
   const [researchChatArtifacts,setResearchChatArtifacts]=useState<ChatArtifact[]>([]);
-  const conversationCache=useRef<Record<"research"|"portfolio",Map<string,{messages:ChatMessage[];artifacts:ChatArtifact[]}>>>({research:new Map(),portfolio:new Map()});
+  const conversationCache=useRef<Record<"research"|"portfolio",Map<string,ConversationCacheEntry>>>({research:new Map(),portfolio:new Map()});
   const [portfolioChatMessages, setPortfolioChatMessages] = useState<ChatMessage[]>([]);
   const [portfolioChatQuestion, setPortfolioChatQuestion] = useState("");
   const [portfolioChatBusy, setPortfolioChatBusy] = useState(false);
@@ -123,10 +148,22 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   const chatScope=()=>`${email}-${resolvedChatPortfolioId()}`;
   const chatStorageKey=(workspace:"research"|"portfolio")=>`eagleeyes-${workspace}-conversation-${chatScope()}`;
   const chatSnapshotKey=(workspace:"research"|"portfolio")=>`eagleeyes-${workspace}-conversation-snapshot-${chatScope()}`;
+  const cacheConversation=(workspace:"research"|"portfolio",conversationId:string,messages:ChatMessage[],artifacts:ChatArtifact[])=>{
+    const cache=conversationCache.current[workspace];
+    const entry={messages,artifacts,bytes:serializedBytes({messages,artifacts})};
+    cache.delete(conversationId);cache.set(conversationId,entry);
+    let bytes=[...cache.values()].reduce((sum,item)=>sum+item.bytes,0);
+    while(cache.size>CONVERSATION_CACHE_ENTRIES||bytes>CONVERSATION_CACHE_BYTES){const oldest=cache.keys().next().value;if(!oldest||oldest===conversationId&&cache.size===1)break;const removed=cache.get(oldest);cache.delete(oldest);bytes-=removed?.bytes||0;}
+    recordFrontendBudget({route:"ask.cache",conversation_cache_entries:cache.size,conversation_cache_bytes:bytes});
+  };
   const storeConversationSnapshot=(workspace:"research"|"portfolio",conversationId:string,messages:ChatMessage[],artifacts:ChatArtifact[])=>{
     try{
-      const snapshot:CachedConversation={conversationId,workspace,portfolioId:resolvedChatPortfolioId(),messages,artifacts,cachedAt:Date.now()};
-      window.localStorage.setItem(chatSnapshotKey(workspace),JSON.stringify(snapshot));
+      let recent=messages.slice(-CONVERSATION_SNAPSHOT_MESSAGES).map(compactSnapshotMessage);
+      const snapshotBase={conversationId,workspace,portfolioId:resolvedChatPortfolioId(),artifacts:artifacts.slice(-12),cachedAt:Date.now()};
+      let snapshot:CachedConversation={...snapshotBase,messages:recent};let encoded=JSON.stringify(snapshot);
+      while(new TextEncoder().encode(encoded).byteLength>CONVERSATION_SNAPSHOT_BYTES&&recent.length>4){recent=recent.slice(2);snapshot={...snapshotBase,messages:recent};encoded=JSON.stringify(snapshot);}
+      window.localStorage.setItem(chatSnapshotKey(workspace),encoded);
+      recordFrontendBudget({route:"ask.snapshot",local_snapshot_bytes:new TextEncoder().encode(encoded).byteLength,snapshot_messages:recent.length});
     }catch{/* Durable server history remains authoritative when browser storage is unavailable. */}
   };
 
@@ -151,7 +188,36 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     }
     throw lastError instanceof Error?lastError:new Error("Request failed");
   }, [accessToken]);
-  const apiRequest = useCallback((path: string, init?: RequestInit) => apiFetch(`${API}${path}`, init), [apiFetch]);
+  const apiRequest = useCallback(async (path: string, init: RequestInit = {}) => {
+    const detailMatch=path.match(/^\/research\/security\/([^/]+)\/sections\//);
+    const headerMatch=path.match(/^\/research\/security\/([^/]+)\/header/);
+    if(headerMatch&&researchDetailTicker.current&&researchDetailTicker.current!==headerMatch[1]){
+      researchDetailController.current?.abort(new DOMException("Research ticker changed","AbortError"));
+      researchDetailController.current=null;
+      researchDetailTicker.current="";
+    }
+    if(!detailMatch)return apiFetch(`${API}${path}`,init);
+    researchDetailController.current?.abort(new DOMException("Research detail request replaced","AbortError"));
+    const controller=new AbortController();
+    researchDetailController.current=controller;
+    researchDetailTicker.current=detailMatch[1];
+    if(init.signal){
+      if(init.signal.aborted)controller.abort(init.signal.reason);
+      else init.signal.addEventListener("abort",()=>controller.abort(init.signal?.reason),{once:true});
+    }
+    try{return await apiFetch(`${API}${path}`,{...init,signal:controller.signal});}
+    finally{
+      if(researchDetailController.current===controller){
+        researchDetailController.current=null;
+        researchDetailTicker.current="";
+      }
+    }
+  }, [apiFetch]);
+
+  useEffect(()=>{
+    if(tab!=="explore")researchDetailController.current?.abort(new DOMException("Research route closed","AbortError"));
+    return()=>researchDetailController.current?.abort(new DOMException("Dashboard unmounted","AbortError"));
+  },[tab]);
 
   useEffect(() => {
     let active = true;
@@ -197,7 +263,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
           try{
             const cached=JSON.parse(window.localStorage.getItem(chatSnapshotKey(activeWorkspace))||"null") as CachedConversation|null;
             if(cached?.conversationId===initiallyRemembered&&cached.workspace===activeWorkspace&&cached.portfolioId===resolvedChatPortfolioId()){
-              conversationCache.current[activeWorkspace].set(cached.conversationId,{messages:cached.messages||[],artifacts:cached.artifacts||[]});
+              cacheConversation(activeWorkspace,cached.conversationId,cached.messages||[],cached.artifacts||[]);
               if(activeWorkspace==="research"){
                 setResearchConversationId(cached.conversationId);setResearchChatMessages(cached.messages||[]);setResearchChatArtifacts(cached.artifacts||[]);
               }else{
@@ -221,7 +287,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
         if(!detailResponse.ok||!active||window.localStorage.getItem(storageKey)!==selected)return;
         const detail=await detailResponse.json();
         if(!active||window.localStorage.getItem(storageKey)!==selected)return;
-        conversationCache.current[activeWorkspace].set(selected,{messages:detail.messages||[],artifacts:detail.artifacts||[]});
+        cacheConversation(activeWorkspace,selected,detail.messages||[],detail.artifacts||[]);
         storeConversationSnapshot(activeWorkspace,selected,detail.messages||[],detail.artifacts||[]);
         if(activeWorkspace==="research"){
           setResearchConversationId(selected);setResearchChatMessages(detail.messages||[]);setResearchChatArtifacts(detail.artifacts||[]);
@@ -481,7 +547,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   }
 
   function showPortfolio(portfolio:SavedPortfolio){
-    if(String(portfolioOverview?.portfolio.id||"")!==String(portfolio.id))setPortfolioOverview(null);
+    setPortfolioOverview(current => String(current?.portfolio?.id || "") === String(portfolio.id) ? current : null);
     setPortfolioId(portfolio.id);setPortfolioName(portfolio.name);setHoldings(portfolio.holdings);
     setSavedPortfolioSnapshot(portfolioSignature(portfolio.name,portfolio.holdings));
     setPersistedTickers(portfolio.holdings.map(row=>row.ticker.trim().toUpperCase()));
@@ -510,7 +576,9 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       if(diagnosticsResponse.ok)setPortfolioDiagnostics(await diagnosticsResponse.json());
       if(analysisResponse.ok){const payload=await analysisResponse.json();setAnalysis(payload.analysis?.alternatives?.length?payload.analysis:null);}
       if(overviewResponse.ok)setPortfolioOverview(await overviewResponse.json());
-      void loadResearch(selected.holdings);
+      void loadResearch(selected.holdings).catch(() => {
+        setNotice(`${selected.name} is open. Background Research refresh is temporarily unavailable.`);
+      });
     }catch{setNotice(`${selected.name} is open. Some linked analysis is still loading.`);}
   }
 
@@ -777,11 +845,14 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   }
 
   async function streamDashboard(jobId: string) {
+    dashboardStreamController.current?.abort();
+    const lifecycleController=new AbortController();dashboardStreamController.current=lifecycleController;
+    recordFrontendBudget({route:"ask.dashboard",active_streams:1});
     const maxReconnects = 4;
     for (let reconnect = 0; reconnect <= maxReconnects; reconnect += 1) {
       let streamError: unknown;
       try {
-        const response = await apiFetch(`${API}/dashboard/drafts/${jobId}/events`);
+        const response = await apiFetch(`${API}/dashboard/drafts/${jobId}/events`,{signal:lifecycleController.signal});
         if (!response.ok || !response.body) throw new Error(await apiError(response, "Dashboard stream unavailable"));
         const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let terminal = false;
         while (true) {
@@ -799,25 +870,43 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
             }
             if (event === "done") terminal = true;
           }
-          if (terminal) { await reader.cancel(); return; }
+          if (terminal) { await reader.cancel();dashboardStreamController.current=null;recordFrontendBudget({route:"ask.dashboard",active_streams:0});return; }
         }
       } catch (error) {
+        if(lifecycleController.signal.aborted)return;
         streamError = error;
       }
 
       try {
         const job = await dashboardStatus(jobId);
-        if (DASHBOARD_TERMINAL_STATES.has(job.state)) return;
+        if (DASHBOARD_TERMINAL_STATES.has(job.state)) {
+          dashboardStreamController.current=null;
+          recordFrontendBudget({route:"ask.dashboard",active_streams:0});
+          return;
+        }
       } catch (statusError) {
-        if (reconnect === maxReconnects) throw statusError;
+        if (reconnect === maxReconnects) {
+          dashboardStreamController.current=null;
+          recordFrontendBudget({route:"ask.dashboard",active_streams:0});
+          throw statusError;
+        }
       }
       if (reconnect === maxReconnects) {
+        dashboardStreamController.current=null;
+        recordFrontendBudget({route:"ask.dashboard",active_streams:0});
         if (streamError instanceof Error) throw streamError;
         throw new Error("Dashboard connection ended before the job completed");
       }
       await new Promise(resolve => window.setTimeout(resolve, Math.min(4_000, 500 * 2 ** reconnect)));
     }
   }
+
+  const stopDashboardStream=useCallback(()=>{
+    dashboardStreamController.current?.abort();dashboardStreamController.current=null;
+    recordFrontendBudget({route:"ask.dashboard",active_streams:0});
+  },[]);
+  useEffect(()=>{if(tab!=="ask")stopDashboardStream();return stopDashboardStream;},[tab,stopDashboardStream]);
+  useEffect(()=>{window.addEventListener("eagleeyes:canvas-closed",stopDashboardStream);return()=>window.removeEventListener("eagleeyes:canvas-closed",stopDashboardStream);},[stopDashboardStream]);
 
   async function createAIDashboard(prompt = dashboardPrompt) {
     if (!prompt.trim() || dashboardBusy) return;
@@ -852,7 +941,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     if(!response.ok){setNotice(await apiError(response,"Unable to open conversation"));return;}
     const detail=await response.json();
     if(detail.workspace!==workspace){setNotice("That conversation belongs to a different workspace.");return;}
-    conversationCache.current[workspace].set(conversationId,{messages:detail.messages||[],artifacts:detail.artifacts||[]});
+    cacheConversation(workspace,conversationId,detail.messages||[],detail.artifacts||[]);
     storeConversationSnapshot(workspace,conversationId,detail.messages||[],detail.artifacts||[]);
     if(window.localStorage.getItem(chatStorageKey(workspace))!==conversationId)return;
     if(workspace==="research"){
@@ -968,7 +1057,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       if(data.conversation_id)window.localStorage.setItem(chatStorageKey("research"),data.conversation_id);
       setResearchChatMessages(items => {
         const next=[...items,data.message];
-        if(data.conversation_id)storeConversationSnapshot("research",data.conversation_id,next,researchChatArtifacts);
+        if(data.conversation_id){cacheConversation("research",data.conversation_id,next,researchChatArtifacts);storeConversationSnapshot("research",data.conversation_id,next,researchChatArtifacts);}
         return next;
       });
       window.requestAnimationFrame(()=>window.requestAnimationFrame(()=>{
@@ -1022,7 +1111,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       if(data.conversation_id)window.localStorage.setItem(chatStorageKey("portfolio"),data.conversation_id);
       setPortfolioChatMessages(items => {
         const next=[...items,data.message];
-        if(data.conversation_id)storeConversationSnapshot("portfolio",data.conversation_id,next,portfolioChatArtifacts);
+        if(data.conversation_id){cacheConversation("portfolio",data.conversation_id,next,portfolioChatArtifacts);storeConversationSnapshot("portfolio",data.conversation_id,next,portfolioChatArtifacts);}
         return next;
       });
       void refreshConversationList("portfolio");
@@ -1156,10 +1245,10 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
         {tab === "today" && <TodayPage loading={loading} refreshing={busy === "Refreshing market and macro data"||busy==="Refreshing portfolio intelligence"} briefing={homeBriefing} overview={portfolioOverview} portfolios={portfolios} selectedPortfolioId={portfolioId} hasSavedPortfolio={holdings.length>0} macroFactors={macroFactors.filter(item => preferences.macro_widgets.includes(item.key))} dataStatus={dataStatus} onRefresh={refreshToday} onRefreshOverview={refreshPortfolioOverview} onSelectPortfolio={id=>void selectPortfolio(id)} onOverviewChange={setPortfolioOverview} onNavigate={navigate} onExplore={navigateExplore} onPortfolio={navigatePortfolio} onAdvanced={navigateAdvanced} request={apiRequest} />}
         {tab === "plan" && <PlanPage profile={profile} setProfile={setProfile} goals={goals} projections={goalProjections} policy={investmentPolicy} setPolicy={setInvestmentPolicy} guidance={planGuidance} onSavePolicy={()=>saveInvestmentPolicy(false)} onApprovePolicy={()=>saveInvestmentPolicy(true)} onSaveProfile={savePlanProfile} onSaveGoal={saveGoal} onDeleteGoal={deleteGoal} onProject={projectGoal} onOpenPortfolio={()=>navigatePortfolio("analysis")} />}
         {tab === "portfolio" && <PortfolioPage view={portfolioView} setView={navigatePortfolio} request={apiRequest} portfolioId={portfolioId} portfolios={portfolios} onSelectPortfolio={id=>void selectPortfolio(id)} onNewPortfolio={newPortfolio} holdings={holdings} setHoldings={setHoldings} name={portfolioName} setName={setPortfolioName} total={currentWeightTotal} dirty={portfolioDirty} errors={portfolioErrors} saving={busy === "Saving portfolio"} onSave={savePortfolio} onImport={importCsv} profile={profile} goals={goals} setProfile={setProfile} onObjectiveProfileChange={updateObjectiveProfile} analysis={analysis} monitoring={monitoring} guidance={planGuidance} diagnostics={portfolioDiagnostics} performance={terminalPerformance} presentationLevel={preferences.presentation_level} selected={selectedAlternative} setSelected={setSelectedAlternative} onRun={runOptimization} analysisBusy={busy === "Running scenario analysis"} narrative={narrative} onNarrative={generateNarrative} portfolioChatMessages={portfolioChatMessages} portfolioChatQuestion={portfolioChatQuestion} setPortfolioChatQuestion={setPortfolioChatQuestion} onAskPortfolio={askPortfolioChat} portfolioChatBusy={portfolioChatBusy} portfolioConversationControls={{conversations:portfolioConversations,currentId:portfolioConversationId,artifacts:portfolioChatArtifacts,onNew:()=>void newChatConversation("portfolio"),onOpen:id=>void openChatConversation("portfolio",id),onRename:id=>void renameChatConversation("portfolio",id),onDelete:id=>void deleteChatConversation("portfolio",id),onBuildBoard:()=>buildBoardFromConversation("portfolio")}} />}
-        {tab === "climate" && <MarketClimatePage macro={macro} factors={macroFactors} scenarios={scenarios} regimeHistory={regimeHistory} request={apiRequest} onRefresh={refreshMarkets} onAsk={question=>{setResearchChatQuestion(question);navigate("ask");}} />}
+        {tab === "climate" && <Suspense fallback={<RouteSkeleton label="Market Climate"/>}><LazyMarketClimatePage macro={macro} factors={macroFactors} scenarios={scenarios} regimeHistory={regimeHistory} request={apiRequest} onRefresh={refreshMarkets} onAsk={question=>{setResearchChatQuestion(question);navigate("ask");}} /></Suspense>}
         {tab === "explore" && <ExplorePage view={exploreView} setView={navigateExplore} request={(path,init)=>apiFetch(`${API}${path}`,init)} onManageUniverse={()=>navigatePortfolio("holdings")} scenarios={scenarios} contracts={contracts} fetchedAt={scenarioFetchedAt} regimeHistory={regimeHistory} warnings={scenarioWarnings} onRefreshMarkets={refreshMarkets} rows={sortedResearch} holdings={holdings} profile={profile} presentationLevel={preferences.presentation_level} sortKey={sortKey} setSortKey={setSortKey} onRefreshResearch={refreshResearch} widgets={preferences.research_widgets} macro={macro} macroFactors={macroFactors} watchlist={profile.watchlist} portfolioId={portfolioId} onWatchlistChange={tickers=>setProfile(current=>({...current,watchlist:tickers}))} researchChatMessages={researchChatMessages} researchChatQuestion={researchChatQuestion} setResearchChatQuestion={setResearchChatQuestion} onAskResearch={askResearchChat} researchChatBusy={researchChatBusy} researchConversationControls={{conversations:researchConversations,currentId:researchConversationId,artifacts:researchChatArtifacts,onNew:()=>void newChatConversation("research"),onOpen:id=>void openChatConversation("research",id),onRename:id=>void renameChatConversation("research",id),onDelete:id=>void deleteChatConversation("research",id),onBuildBoard:()=>buildBoardFromConversation("research")}} />}
-        {tab === "decisions" && <DecisionsPage request={apiRequest} portfolioId={portfolioId} holdings={holdings} profile={profile} goals={goals} onOpenPortfolio={()=>navigatePortfolio("holdings")} />}
-        {tab === "learn" && <LearnPage request={apiRequest} moduleSlug={learningModule} lessonId={learningLesson} onOpenLesson={navigateLearn} onOpenHub={()=>navigateLearn()} onDeepLink={navigateDeepLink} />}
+        {tab === "decisions" && <Suspense fallback={<RouteSkeleton label="Theses & decisions"/>}><LazyDecisionsPage request={apiRequest} portfolioId={portfolioId} holdings={holdings} profile={profile} goals={goals} onOpenPortfolio={()=>navigatePortfolio("holdings")} /></Suspense>}
+        {tab === "learn" && <Suspense fallback={<RouteSkeleton label="Learn"/>}><LazyLearnPage request={apiRequest} moduleSlug={learningModule} lessonId={learningLesson} onOpenLesson={navigateLearn} onOpenHub={()=>navigateLearn()} onDeepLink={navigateDeepLink} /></Suspense>}
         {tab === "ask" && <AskPage messages={researchChatMessages} question={researchChatQuestion} setQuestion={setResearchChatQuestion} onSend={askResearchChat} loading={researchChatBusy} controls={{conversations:researchConversations,currentId:researchConversationId,artifacts:researchChatArtifacts,onNew:()=>void newChatConversation("research"),onOpen:id=>void openChatConversation("research",id),onRename:id=>void renameChatConversation("research",id),onDelete:id=>void deleteChatConversation("research",id),onBuildBoard:()=>buildBoardFromConversation("research"),onOpenArtifact:artifact=>{if(artifact.artifact_type==="dashboard_view")void openDashboardView(artifact.artifact_id);}}} contextTicker={new URL(window.location.href).searchParams.get("ticker")} enabledContext={askEnabledContext} onToggleContext={key=>setAskEnabledContext(items=>items.includes(key)?items.filter(item=>item!==key):[...items,key])} job={dashboardJob} views={dashboardViews} catalog={dashboardCatalog} selectedView={selectedDashboardView} prompt={dashboardPrompt} setPrompt={setDashboardPrompt} busy={dashboardBusy} presentationLevel={preferences.presentation_level} onCreate={createAIDashboard} onRevise={reviseAIDashboard} onCancel={cancelAIDashboard} onSave={saveAIDashboard} onDiscard={() => { setDashboardJob(null); setSelectedDashboardView(null); setDashboardSourceConversationId(null); }} onOpenView={openDashboardView} onRefreshView={refreshDashboardView} onDuplicateView={duplicateDashboardView} onRenameView={renameDashboardView} onDeleteView={deleteDashboardView} onMoveWidget={moveDashboardWidget} onResizeWidget={resizeDashboardWidget} onRemoveWidget={removeDashboardWidget} onAddWidget={addDashboardWidget} />}
         {tab === "advanced" && <AdvancedPage view={advancedView} setView={navigateAdvanced} layouts={terminalLayouts} selectedLayout={selectedTerminalLayout} onOpenLayout={openTerminalLayout} onSaveLayout={saveTerminalLayout} onDuplicateLayout={duplicateTerminalLayout} onDeleteLayout={deleteTerminalLayout} terminal={<ResearchTerminal widgets={preferences.terminal_widgets} catalogOpen={terminalCatalogOpen} setCatalogOpen={setTerminalCatalogOpen} onAdd={addTerminalWidget} onRemove={id=>saveTerminalWidgets(preferences.terminal_widgets.filter(widget=>widget.id!==id))} onMove={moveTerminalWidget} onResize={resizeTerminalWidget} onReset={()=>saveTerminalWidgets(defaultTerminalWidgets)} dragged={draggedTerminalWidget} setDragged={setDraggedTerminalWidget} onDrop={dropTerminalWidget} performance={terminalPerformance} holdings={holdings} macro={macro} macroFactors={macroFactors} marketIndicators={terminalMarketIndicators} scenarios={scenarios} contracts={contracts} research={research} analysis={analysis} monitoring={monitoring} dataStatus={dataStatus} selectedTicker={terminalTicker} setSelectedTicker={setTerminalTicker} contractSearch={terminalContractSearch} setContractSearch={setTerminalContractSearch} />} analysis={analysis} monitoring={monitoring} dataStatus={dataStatus} regimeHistory={regimeHistory} request={apiRequest} />}
     </AppShell>
