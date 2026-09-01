@@ -1,5 +1,6 @@
-# The production Blueprint intentionally contains only the Free web service.
-# Paid workers and cron jobs must be provisioned separately when explicitly approved.
+# Owner self-test production topology: one Free web service. Scheduled provider
+# ingestion and maintenance run in GitHub Actions. Durable heavy jobs stay
+# fail-closed until the private-beta worker topology is explicitly provisioned.
 services:
   - type: web
     name: eagleeyes-api
@@ -50,15 +51,15 @@ services:
       - key: ASK_GEMINI_ENRICHMENT
         value: "0"
       - key: HEAVY_ANALYTICS_ENABLED
-        value: "1"
+        value: "0"
       - key: SIMULATION_ENABLED
-        value: "1"
+        value: "0"
       - key: OPTIMIZER_ENABLED
-        value: "1"
+        value: "0"
       - key: BACKTESTING_ENABLED
-        value: "1"
+        value: "0"
       - key: DEEP_COMPANY_RESEARCH_ENABLED
-        value: "1"
+        value: "0"
       - key: PREDICTION_MARKET_ENRICHMENT_ENABLED
         value: "1"
       - key: CONVERSATIONAL_DASHBOARDS_ENABLED

@@ -47,6 +47,10 @@ def main() -> int:
     parser.add_argument("--api-url", default=os.getenv("PRODUCTION_API_URL"))
     parser.add_argument("--token", default=os.getenv("PRODUCTION_OWNER_SMOKE_TOKEN"))
     parser.add_argument("--portfolio-id", default=os.getenv("PRODUCTION_OWNER_PORTFOLIO_ID"))
+    parser.add_argument(
+        "--gate", choices=("owner-self-test", "private-beta"), default="private-beta",
+        help="Owner self-test skips durable heavy-job assertions because that topology has no worker.",
+    )
     parser.add_argument("--keep-test-data", action="store_true")
     args = parser.parse_args()
     if os.getenv("RUN_CONTROLLED_PRODUCTION_SMOKE") != "1":
@@ -102,35 +106,42 @@ def main() -> int:
             assert str(reopened.json()["id"]) == dashboard_view_id
             report["cases"].append({"name": "dashboard_save_close_reopen", "status": "pass"})
 
-            heavy = client.post("/api/chat/messages", json={
-                "question": "Run a five-year backtest of this portfolio against SPY.",
-                "conversation_id": conversation_id,
-                "workspace": "portfolio",
-                "page_context": {"workspace": "portfolio", "portfolio_id": args.portfolio_id},
-                "request_id": f"production-smoke:heavy:{uuid.uuid4()}",
-            })
-            heavy.raise_for_status()
-            job_ids = [str(value) for value in find_values(heavy.json(), "job_id") if value]
-            job_id = job_ids[0] if job_ids else None
-            assert job_id, "Heavy request did not return a durable job reference"
-            deadline = time.monotonic() + 180
-            job: dict[str, Any] = {}
-            while time.monotonic() < deadline:
-                job_response = client.get(f"/api/analytics/jobs/{job_id}")
-                job_response.raise_for_status()
-                job = job_response.json()
-                if job.get("status") in {"SUCCESS", "PARTIAL", "FAILED", "CANCELLED", "EXPIRED"}:
-                    break
-                time.sleep(2)
-            assert job.get("status") in {"SUCCESS", "PARTIAL"}, job
-            assert job.get("worker_id") and job.get("result_reference")
-            report["cases"].append({"name": "heavy_job_creation_completion", "status": "pass", "terminal_state": job["status"]})
+            if args.gate == "private-beta":
+                heavy = client.post("/api/chat/messages", json={
+                    "question": "Run a five-year backtest of this portfolio against SPY.",
+                    "conversation_id": conversation_id,
+                    "workspace": "portfolio",
+                    "page_context": {"workspace": "portfolio", "portfolio_id": args.portfolio_id},
+                    "request_id": f"production-smoke:heavy:{uuid.uuid4()}",
+                })
+                heavy.raise_for_status()
+                job_ids = [str(value) for value in find_values(heavy.json(), "job_id") if value]
+                job_id = job_ids[0] if job_ids else None
+                assert job_id, "Heavy request did not return a durable job reference"
+                deadline = time.monotonic() + 180
+                job: dict[str, Any] = {}
+                while time.monotonic() < deadline:
+                    job_response = client.get(f"/api/analytics/jobs/{job_id}")
+                    job_response.raise_for_status()
+                    job = job_response.json()
+                    if job.get("status") in {"SUCCESS", "PARTIAL", "FAILED", "CANCELLED", "EXPIRED"}:
+                        break
+                    time.sleep(2)
+                assert job.get("status") in {"SUCCESS", "PARTIAL"}, job
+                assert job.get("worker_id") and job.get("result_reference")
+                report["cases"].append({"name": "heavy_job_creation_completion", "status": "pass", "terminal_state": job["status"]})
 
-            operations = client.get("/api/operations/metrics")
-            operations.raise_for_status()
-            health = operations.json()["analytics_jobs"]
-            assert health["status"] == "healthy" and health.get("worker_heartbeat_age_seconds") is not None
-            report["worker"] = health
+                operations = client.get("/api/operations/metrics")
+                operations.raise_for_status()
+                health = operations.json()["analytics_jobs"]
+                assert health["status"] == "healthy" and health.get("worker_heartbeat_age_seconds") is not None
+                report["worker"] = health
+            else:
+                report["cases"].append({
+                    "name": "heavy_jobs_disabled_by_topology",
+                    "status": "pass",
+                    "note": "Durable worker assertions are intentionally excluded from the owner self-test gate.",
+                })
         finally:
             if not args.keep_test_data:
                 if dashboard_view_id:

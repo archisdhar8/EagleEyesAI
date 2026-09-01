@@ -1,18 +1,22 @@
-name: Refresh prediction markets
+name: Owner self-test read-model maintenance
 
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "5 5 * * *"
   workflow_dispatch:
 
 concurrency:
-  group: investment-dashboard-market-ingestion
+  group: eagleeyes-owner-self-test-maintenance
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
-  refresh:
+  maintain:
+    environment: production
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,10 +24,7 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: pip install -r backend/requirements.txt
-      - run: python -m backend.ingestion refresh --providers markets
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      - name: Reconcile read models after ingestion
+      - name: Reconcile persisted read models
         run: python scripts/reconcile_read_models.py
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}

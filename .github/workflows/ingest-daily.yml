@@ -36,3 +36,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+      - name: Reconcile read models after ingestion
+        run: python scripts/reconcile_read_models.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}

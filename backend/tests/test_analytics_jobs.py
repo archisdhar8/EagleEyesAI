@@ -59,8 +59,11 @@ def test_per_user_active_job_limit_prevents_queue_saturation(job_db, monkeypatch
 
 def test_heavy_analytics_feature_flag_fails_closed(job_db, monkeypatch):
     monkeypatch.setenv("HEAVY_ANALYTICS_ENABLED", "0")
-    with pytest.raises(analytics_jobs.HeavyAnalyticsDisabledError):
-        submit()
+    for job_type in analytics_jobs.JobType:
+        with pytest.raises(analytics_jobs.HeavyAnalyticsDisabledError):
+            submit({"unique": job_type.value}, job_type=job_type)
+    with database.sqlite_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM analytical_jobs").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize(

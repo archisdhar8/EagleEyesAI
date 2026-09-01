@@ -1,0 +1,69 @@
+{
+  "schema_version": "eagleeyes-production-identity-v1",
+  "environment": "production",
+  "release": {
+    "expected_git_revision": "REPLACE_WITH_EXACT_40_CHARACTER_GIT_SHA",
+    "clean_worktree_required": true,
+    "candidate_clean_when_recorded": true
+  },
+  "database": {
+    "expected_host": "aws-0-us-east-2.pooler.supabase.com",
+    "expected_name": "postgres",
+    "identity_verified": true,
+    "connection_method": "supabase_ipv4_session_pooler"
+  },
+  "supabase": {
+    "expected_project_ref": "ootsfffufoervvjpemdg",
+    "identity_verified": true
+  },
+  "deployment": {
+    "profile": "owner_self_test",
+    "expected_target_id": "vercel:prj_FZ1O0Zji2HGNCJ7pvuLbL9r8ldDr|render:exs-da1a8t0jo6nc73876g0g",
+    "environment_marker": "production",
+    "production_branch": "main",
+    "services": {
+      "frontend": {"name": "eagle-eyes-ai", "id": "prj_FZ1O0Zji2HGNCJ7pvuLbL9r8ldDr", "provider": "vercel"},
+      "api": {"name": "eagleeyes-api", "id": "srv-da1aar49v7es73auj8t0", "provider": "render", "plan": "free"},
+      "worker": {"name": "eagleeyes-analytics-worker", "id": null, "mode": "disabled"},
+      "recovery": {"name": "eagleeyes-job-recovery", "id": null, "mode": "disabled"},
+      "reconciliation": {"name": "eagleeyes-read-model-reconciliation", "id": "github-actions:.github/workflows/self-test-maintenance.yml", "provider": "github_actions", "schedule": "5 5 * * *"},
+      "ingestion": [
+        {"name": "eagleeyes-market-ingestion", "id": "github-actions:.github/workflows/ingest-daily.yml", "provider": "github_actions", "schedule": "35 2 * * 1-5"},
+        {"name": "eagleeyes-fundamentals-ingestion", "id": "github-actions:.github/workflows/ingest-sec.yml", "provider": "github_actions", "schedule": "45 3 * * 0"},
+        {"name": "eagleeyes-prediction-ingestion", "id": "github-actions:.github/workflows/ingest-markets.yml", "provider": "github_actions", "schedule": "17 * * * *"}
+      ]
+    }
+  },
+  "cors": {
+    "allowed_origins": ["https://eagle-eyes-ai.vercel.app"],
+    "allow_credentials": false,
+    "wildcard_allowed": false
+  },
+  "feature_flags": {
+    "ASK_ROUTER_V2": "1",
+    "ASK_CAPABILITY_PLANNER_GEMINI": "0",
+    "ASK_GEMINI_ENRICHMENT": "0",
+    "PREDICTION_MARKET_ENRICHMENT_ENABLED": "1",
+    "CONVERSATIONAL_DASHBOARDS_ENABLED": "1",
+    "HEAVY_ANALYTICS_ENABLED": "0",
+    "SIMULATION_ENABLED": "0",
+    "OPTIMIZER_ENABLED": "0",
+    "BACKTESTING_ENABLED": "0",
+    "DEEP_COMPANY_RESEARCH_ENABLED": "0"
+  },
+  "expected_pending_migrations": [],
+  "evidence": {
+    "backup_verified": false,
+    "backup_identifier": null,
+    "backup_completed_at": null,
+    "restore_verified": false,
+    "alert_delivery_verified": false
+  },
+  "self_test_deployable": false,
+  "deployable": false,
+  "notes": [
+    "Copy this template outside the Git worktree and replace release and evidence values after verification.",
+    "Set self_test_deployable=true only after owner-self-test identity, backup, migration, and topology checks pass.",
+    "Paid worker, Sentry delivery, and disposable restore evidence remain mandatory before setting deployable=true for private beta."
+  ]
+}
