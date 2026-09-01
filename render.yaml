@@ -30,12 +30,20 @@ services:
         value: "20"
       - key: ASK_RESEARCH_NODE_TIMEOUT_MS
         value: "18000"
+      - key: DASHBOARD_JOB_WORKERS
+        value: "2"
+      - key: DASHBOARD_TASK_WORKERS
+        value: "3"
+      - key: MEMORY_CACHE_SIZE_ESTIMATES
+        value: "1"
       # Research is single-flight until the bounded path is verified against
       # real Render RSS. This does not serialize Ask.
       - key: RESEARCH_CORE_CONCURRENCY
         value: "1"
       - key: RESEARCH_CORE_CACHE_MAX_ENTRIES
         value: "2"
+      - key: RESEARCH_DETAIL_CACHE_MAX_ENTRIES
+        value: "4"
       - key: RESEARCH_OVERVIEW_CACHE_MAX_ENTRIES
         value: "2"
       - key: RESEARCH_OVERVIEW_CONCURRENCY

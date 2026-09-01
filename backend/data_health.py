@@ -33,6 +33,7 @@ MAX_AGE_DAYS = {
 
 _CACHE_TTL_SECONDS = 45.0
 _DERIVED_CACHE: dict[tuple[str, str], tuple[float, list[DataHealthDomain]]] = {}
+_DERIVED_CACHE_MAX_ENTRIES = 256
 
 
 def _parse(value: Any) -> datetime | None:
@@ -88,6 +89,8 @@ def derive(user_id: str, portfolio_id: str, *, field_coverage: dict[str, float] 
         ))
     if field_coverage is None:
         _DERIVED_CACHE[cache_key] = (time.monotonic(), [state.model_copy(deep=True) for state in states])
+        while len(_DERIVED_CACHE) > _DERIVED_CACHE_MAX_ENTRIES:
+            _DERIVED_CACHE.pop(next(iter(_DERIVED_CACHE)), None)
     return states
 
 

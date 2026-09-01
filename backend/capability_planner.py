@@ -335,6 +335,7 @@ def score_capability_plan(plan: CapabilityPlan) -> float:
 
 
 _PLAN_CACHE: dict[str, CapabilityPlan] = {}
+_PLAN_CACHE_MAX_ENTRIES = 128
 
 
 def normalized_plan_cache_key(question: str, entities: list[ResolvedEntity]) -> str:
@@ -474,6 +475,8 @@ def plan_with_model(question: str, entities: list[ResolvedEntity], *, portfolio_
             validation_started = time.monotonic(); validate_capability_plan(plan, context)
             validation_ms = (time.monotonic() - validation_started) * 1000
             _PLAN_CACHE[cache_key] = plan.model_copy(deep=True)
+            while len(_PLAN_CACHE) > _PLAN_CACHE_MAX_ENTRIES:
+                _PLAN_CACHE.pop(next(iter(_PLAN_CACHE)), None)
             return plan, PlannerTelemetry(True, model_name, (time.monotonic() - started) * 1000,
                                           validation_ms, repaired, len(plan.steps),
                                           raw.get("input_tokens"), raw.get("output_tokens"))

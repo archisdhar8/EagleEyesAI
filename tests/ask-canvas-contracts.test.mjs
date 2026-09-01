@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const ask = readFileSync("app/components/ask/AskPage.tsx", "utf8");
+const dashboard = readFileSync("app/Dashboard.tsx", "utf8");
 const shared = readFileSync("app/components/shared/workspace-implementations.tsx", "utf8");
 const css = readFileSync("app/globals.css", "utf8");
 
@@ -40,9 +41,18 @@ test("analysis can close and reopen as a contextual split surface", () => {
 });
 
 test("conversation changes close visible canvas context without deleting artifacts", () => {
-  assert.match(ask, /onNew: \(\) => \{ pendingQuestionRef\.current = null; setHistoryOpen\(false\); closeCanvas\(\); controls\.onNew\(\); \}/);
-  assert.match(ask, /onOpen: id => \{ pendingQuestionRef\.current = null; setHistoryOpen\(false\); closeCanvas\(\); controls\.onOpen\(id\); \}/);
+  assert.match(ask, /onNew: \(\) => \{ setHistoryOpen\(false\); closeCanvas\(\); controls\.onNew\(\); \}/);
+  assert.match(ask, /onOpen: id => \{ setHistoryOpen\(false\); closeCanvas\(\); controls\.onOpen\(id\); \}/);
   assert.match(ask, /onOpenArtifact: artifact =>[\s\S]{0,140}openCanvas\(\)/);
+});
+
+test("closing canvas aborts only the visual Ask request owned by canvas", () => {
+  assert.match(ask, /const abortOwnedRequest = pendingQuestionRef\.current !== null/);
+  assert.match(ask, /CustomEvent\("eagleeyes:canvas-closed", \{ detail: \{ abortOwnedRequest \} \}\)/);
+  assert.match(dashboard, /researchChatRequestController\.current\?\.abort\(\)/);
+  assert.match(dashboard, /if\(!abortOwnedRequest\)return/);
+  assert.match(dashboard, /signal: requestController\.signal/);
+  assert.match(dashboard, /error instanceof DOMException&&error\.name==="AbortError"/);
 });
 
 test("successful dashboard operations reveal their resulting analysis", () => {

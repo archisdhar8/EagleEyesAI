@@ -47,6 +47,15 @@ class TTLCache:
                 self._values.pop(oldest, None)
             self._values[key] = (time.monotonic() + ttl_seconds, value)
 
+    def stats(self) -> dict[str, int]:
+        """Return bounded, content-free telemetry about this disposable cache."""
+        now = time.monotonic()
+        with self._lock:
+            expired = [key for key, (expires_at, _) in self._values.items() if expires_at <= now]
+            for key in expired:
+                self._values.pop(key, None)
+            return {"entries": len(self._values), "max_entries": self.max_entries}
+
 
 def retry_call(
     operation: Callable[[], T],

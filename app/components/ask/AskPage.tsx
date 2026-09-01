@@ -16,7 +16,7 @@ type AskProps = DashboardProps & {
   contextTicker?: string | null;
   enabledContext: string[];
   onToggleContext: (key: "evidence" | "thesis" | "portfolio") => void;
-  onCanvasClosed?: () => void;
+  onCanvasClosed?: (abortOwnedRequest: boolean) => void;
 };
 
 export function shouldOpenCanvasForQuestion(question: string, hasAnalysis: boolean) {
@@ -58,10 +58,12 @@ export function AskPage({ messages, question, setQuestion, onSend, loading, cont
   }
 
   function closeCanvas() {
+    const abortOwnedRequest = pendingQuestionRef.current !== null;
+    pendingQuestionRef.current = null;
     setCanvasState("closed");
     setMobilePane("chat");
-    onCanvasClosed?.();
-    window.dispatchEvent(new Event("eagleeyes:canvas-closed"));
+    onCanvasClosed?.(abortOwnedRequest);
+    window.dispatchEvent(new CustomEvent("eagleeyes:canvas-closed", { detail: { abortOwnedRequest } }));
   }
 
   function sendFromChat(value?: string) {
@@ -74,8 +76,8 @@ export function AskPage({ messages, question, setQuestion, onSend, loading, cont
 
   const workspaceControls: ConversationControls = {
     ...controls,
-    onNew: () => { pendingQuestionRef.current = null; setHistoryOpen(false); closeCanvas(); controls.onNew(); },
-    onOpen: id => { pendingQuestionRef.current = null; setHistoryOpen(false); closeCanvas(); controls.onOpen(id); },
+    onNew: () => { setHistoryOpen(false); closeCanvas(); controls.onNew(); },
+    onOpen: id => { setHistoryOpen(false); closeCanvas(); controls.onOpen(id); },
     onBuildBoard: () => {
       setHistoryOpen(false);
       controls.onBuildBoard();

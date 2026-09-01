@@ -58,6 +58,13 @@ ISSUER_PATTERNS = (
 )
 _LOOKUP_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 LOOKUP_CACHE_SECONDS = 3600
+LOOKUP_CACHE_MAX_ENTRIES = 128
+
+
+def _cache_lookup(ticker: str, result: dict[str, Any]) -> None:
+    _LOOKUP_CACHE[ticker] = (time.monotonic(), result)
+    while len(_LOOKUP_CACHE) > LOOKUP_CACHE_MAX_ENTRIES:
+        _LOOKUP_CACHE.pop(next(iter(_LOOKUP_CACHE)), None)
 
 
 def _iso_date(value: str) -> str:
@@ -281,12 +288,12 @@ def ensure_fund_data(ticker: str, force: bool = False) -> dict[str, Any]:
     if snapshot is None:
         result = {"status": "missing", "provider": profile["provider"], "reason": "; ".join(dict.fromkeys(errors)) or "The issuer has no connected machine-readable holdings feed.", "source_url": profile.get("source_url"), "freshness": holdings_freshness(None)}
         database.record_etf_refresh(str(profile["provider"]), "holdings", "failed", normalized, error=result["reason"])
-        _LOOKUP_CACHE[normalized] = (time.monotonic(), result)
+        _cache_lookup(normalized, result)
         return result
     database.upsert_etf_catalog([{"ticker": normalized, "name": profile["name"], "issuer": profile["provider"], "expense_ratio": profile.get("expense_ratio"), "provider": snapshot["provider"], "source_url": snapshot["source_url"], "effective_at": snapshot["as_of"], "holdings_count": len(snapshot["holdings"]), "metadata": {"holdings_frequency": "daily" if normalized in ARK_HOLDINGS or normalized in STATE_STREET_FUNDS else "unknown"}}])
     database.save_fund_reference_snapshot(normalized, profile.get("expense_ratio"), snapshot["provider"], snapshot["source_url"], snapshot["as_of"], snapshot["holdings"], metadata={"name": profile["name"], "retrieval": "on-demand ETF research"})
     database.rebuild_etf_sector_exposures(normalized, snapshot["as_of"], snapshot["source_url"])
     database.record_etf_refresh(snapshot["provider"], "holdings", "success", normalized, len(snapshot["holdings"]), metadata={"as_of": snapshot["as_of"]})
     result = {"status": "available", "provider": snapshot["provider"], "reason": f"Loaded {len(snapshot['holdings'])} holdings as of {snapshot['as_of']}.", "source_url": snapshot["source_url"], "freshness": holdings_freshness(snapshot["as_of"], "daily" if normalized in ARK_HOLDINGS or normalized in STATE_STREET_FUNDS else None)}
-    _LOOKUP_CACHE[normalized] = (time.monotonic(), result)
+    _cache_lookup(normalized, result)
     return result

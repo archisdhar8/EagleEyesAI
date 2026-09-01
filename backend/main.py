@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gc
 import hashlib
 import logging
 import math
@@ -25,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import analytics_jobs, database, data_health, ask_execution, ask_orchestration, ask_portfolio, ask_resolution, attention, capability_planner, dashboard_chat, dashboard_presentation, decision_journal, earnings_intelligence, evidence, feature_flags, forecasting, model_portfolios, phase6_domains, portfolio_intelligence, portfolio_overview, product_preferences, read_models, thesis_monitor, theses
+from . import analytics_jobs, database, data_health, ask_execution, ask_orchestration, ask_portfolio, ask_resolution, attention, capability_planner, dashboard_chat, dashboard_presentation, dashboard_workspace, decision_journal, earnings_intelligence, evidence, feature_flags, forecasting, fund_data, model_portfolios, phase6_domains, portfolio_intelligence, portfolio_overview, product_preferences, read_models, thesis_monitor, theses
 from .ask_runtime import (
     PortfolioContext, attach_coverage as attach_ask_coverage, build_portfolio_context,
     enforce_output_symbol_boundary, parse_scenario_factors, scenario_payload, verify_results,
@@ -151,6 +152,76 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="InvestmentDashboard Local API", version="0.1.0", lifespan=lifespan)
 ERROR_MONITORING = configure_error_monitoring()
 app.middleware("http")(production_guard)
+
+
+def _memory_route_name(path: str) -> str | None:
+    if path.startswith("/chat/"):
+        return "ask"
+    if path.startswith("/api/research/"):
+        return "research"
+    if path.startswith("/api/portfolios/") and "/overview" in path:
+        return "portfolio_overview"
+    if path.startswith("/api/today") or path.startswith("/api/home"):
+        return "today"
+    if path.startswith("/api/decisions") or path.startswith("/api/decision"):
+        return "decisions"
+    if path.startswith("/dashboard/") or path.startswith("/api/dashboard/"):
+        return "dashboard_canvas"
+    return None
+
+
+def _bounded_runtime_counts() -> dict[str, Any]:
+    with dashboard_workspace.ACTIVE_LOCK:
+        active_dashboard_jobs = len(dashboard_workspace.ACTIVE_JOBS)
+    counts: dict[str, Any] = {
+        "active_requests": memory_telemetry.active_requests(),
+        "active_dashboard_jobs": active_dashboard_jobs,
+        "thread_count": threading.active_count(),
+        "gc_generation_counts": list(gc.get_count()),
+        "data_health_cache_entries": len(data_health._DERIVED_CACHE),
+        "fund_lookup_cache_entries": len(fund_data._LOOKUP_CACHE),
+        "planner_cache_entries": len(capability_planner._PLAN_CACHE),
+        "evidence_change_cache": evidence._CHANGE_CACHE.stats(),
+        "thesis_monitor_cache": thesis_monitor._CACHE.stats(),
+    }
+    for name, cache_name in (
+        ("research_core_cache_entries", "_RESEARCH_CORE_CACHE"),
+        ("research_overview_cache_entries", "_RESEARCH_OVERVIEW_CACHE"),
+        ("research_detail_cache_entries", "_RESEARCH_DETAIL_CACHE"),
+    ):
+        cache = globals().get(cache_name)
+        counts[name] = len(cache) if isinstance(cache, dict) else 0
+        if isinstance(cache, dict) and os.getenv("MEMORY_CACHE_SIZE_ESTIMATES", "0") == "1":
+            counts[name.replace("_entries", "_estimated_bytes")] = memory_telemetry.estimated_size_bytes(cache)
+    chat_cache = globals().get("_CHAT_RESEARCH_CACHE")
+    if isinstance(chat_cache, TTLCache):
+        counts["ask_research_cache"] = chat_cache.stats()
+    return counts
+
+
+@app.middleware("http")
+async def bounded_route_memory_telemetry(request: Request, call_next):
+    route = _memory_route_name(request.url.path)
+    if route is None:
+        return await call_next(request)
+    active_at_start, started_rss, started_at = memory_telemetry.begin_request()
+    memory_telemetry.emit(route, "request_start", started_rss=started_rss,
+                          details={"method": request.method, "active_requests": active_at_start})
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        active_after = memory_telemetry.end_request()
+        details = _bounded_runtime_counts()
+        details.update({
+            "method": request.method,
+            "status_code": getattr(response, "status_code", 500),
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            "response_content_length": (getattr(response, "headers", {}) or {}).get("content-length"),
+            "active_requests_after": active_after,
+        })
+        memory_telemetry.emit(route, "request_complete", started_rss=started_rss, details=details)
 
 
 @app.exception_handler(analytics_jobs.JobCapacityError)
@@ -979,6 +1050,9 @@ def _calculate_portfolio_overview(user_id: str, portfolio_id: str | int,
 
 def _recalculate_portfolio_overview_safely(user_id: str, portfolio_id: str | int, trigger: str) -> None:
     try:
+        if analytics_jobs.disabled_reason(analytics_jobs.JobType.COMPANY_RESEARCH_BUILD):
+            _calculate_portfolio_overview(user_id, portfolio_id, trigger)
+            return
         _queue_portfolio_overview_rebuild(user_id, portfolio_id, trigger)
     except Exception as exc:
         record_metric("portfolio.overview.refresh.failure", tags={"error_type": type(exc).__name__, "trigger": trigger})
@@ -1015,6 +1089,11 @@ def get_portfolio_overview(portfolio_id: str, user: AuthenticatedUser = Depends(
     cached = database.latest_portfolio_health(user.id, portfolio_id)
     if cached:
         return _portfolio_overview_response(user.id, portfolio_id, cached)
+    # Owner self-test has no durable analytics worker. Portfolio overview is a
+    # deterministic read model, so build it on the request path rather than
+    # turning an ordinary Today/Portfolio read into a disabled heavy job.
+    if analytics_jobs.disabled_reason(analytics_jobs.JobType.COMPANY_RESEARCH_BUILD):
+        return _calculate_portfolio_overview(user.id, portfolio_id, "MANUAL")
     job = _queue_portfolio_overview_rebuild(user.id, portfolio_id, "MANUAL")
     return analytics_jobs.pending_analysis(job, "portfolio_overview").model_dump(mode="json")
 
@@ -1027,6 +1106,8 @@ def recalculate_portfolio_overview(portfolio_id: str, background_tasks: Backgrou
     except KeyError as exc:
         raise HTTPException(404, "Portfolio not found") from exc
     cached = database.latest_portfolio_health(user.id, portfolio_id)
+    if analytics_jobs.disabled_reason(analytics_jobs.JobType.COMPANY_RESEARCH_BUILD):
+        return _calculate_portfolio_overview(user.id, portfolio_id, "MANUAL")
     if cached:
         job = _queue_portfolio_overview_rebuild(user.id, portfolio_id, "MANUAL")
         response = _portfolio_overview_response(user.id, portfolio_id, cached)
@@ -3305,9 +3386,17 @@ def _thesis_monitor_chat_tools(user_id: str, question: str) -> tuple[list[dict[s
         fingerprint = stable_fingerprint(job_payload)
         completed = analytics_jobs.compatible_completed(user_id=user_id, job_type=analytics_jobs.JobType.THESIS_MONITOR,
                                                          input_fingerprint=fingerprint)
-        job = completed or analytics_jobs.submit_job(job_type=analytics_jobs.JobType.THESIS_MONITOR, user_id=user_id,
-                                                      payload=job_payload, input_fingerprint=fingerprint)
         payload = result.model_dump(mode="json")
+        try:
+            job = completed or analytics_jobs.submit_job(job_type=analytics_jobs.JobType.THESIS_MONITOR, user_id=user_id,
+                                                          payload=job_payload, input_fingerprint=fingerprint)
+        except analytics_jobs.HeavyAnalyticsDisabledError as exc:
+            tools.append({"tool_name": "thesis_monitor", "status": "partial",
+                          "title": f"{ticker} thesis monitor", "ticker": ticker,
+                          "summary": {**payload, "qualitative_classification": "unavailable", "limitation": str(exc)}})
+            grounded.append({"label": f"{ticker} deterministic thesis monitor", "as_of": result.evaluated_at.isoformat(),
+                             "url": None, "data": payload})
+            continue
         tools.append({"tool_name": "thesis_monitor", "status": "complete" if completed else "pending",
                       "title": f"{ticker} thesis monitor", "ticker": ticker, "job_id": job.job_id,
                       "summary": {**payload, "qualitative_classification": "complete" if completed else "pending"}})
@@ -3328,8 +3417,13 @@ def _company_research_chat_tools(question: str, user_id: str = "anonymous") -> t
         return ([{"tool_name": "company_research_refresh", "status": "complete",
                   "title": "Materialized company research", "job_id": completed.job_id,
                   "summary": completed.result.data}], [])
-    job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD,
-                                    user_id=user_id, payload=payload, input_fingerprint=fingerprint)
+    try:
+        job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD,
+                                        user_id=user_id, payload=payload, input_fingerprint=fingerprint)
+    except analytics_jobs.HeavyAnalyticsDisabledError as exc:
+        disabled = {"tool_name": "company_research_refresh", "status": "unavailable",
+                    "title": "Deep company research", "summary": {"tickers": tickers, "message": str(exc)}}
+        return ([with_canonical_result(disabled, adapt_legacy_tool_result(disabled, capability="company_research"))], [])
     return ([{"tool_name": "company_research_refresh", "status": "pending",
               "title": "Company research rebuild", "job_id": job.job_id, "summary": {"tickers": tickers,
               "message": "The deep company research build is queued; no provider refresh or broad calculation ran in Ask."}}], [])
@@ -3392,6 +3486,11 @@ def _portfolio_chat_tools(user_id: str, question: str, portfolio_id: str | None 
                     tool_results.append({"tool_name": "portfolio_decision_lab", "status": "pending",
                         "title": "Portfolio simulation", "job_id": job.job_id,
                         "summary": {"message": "An updated compatible simulation is queued. Current concentration and risk evidence remain available now."}})
+            except analytics_jobs.HeavyAnalyticsDisabledError as exc:
+                tool_results.append({
+                    "tool_name": "portfolio_decision_lab", "status": "unavailable",
+                    "title": "Portfolio simulation", "summary": {"message": str(exc)},
+                })
             except Exception as exc:
                 tool_results.append({
                     "tool_name": "portfolio_decision_lab", "status": "failed", "title": "Portfolio simulation",
@@ -3445,12 +3544,16 @@ def _portfolio_chat_tools(user_id: str, question: str, portfolio_id: str | None 
         completed_research = analytics_jobs.compatible_completed(user_id=user_id,
             job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD, input_fingerprint=research_fingerprint)
         if not completed_research:
-            research_job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD,
-                user_id=user_id, portfolio_id=str((active_portfolio or {}).get("id")) if (active_portfolio or {}).get("id") else None,
-                payload=research_payload, input_fingerprint=research_fingerprint)
-            tool_results.append({"tool_name": "portfolio_exit_review", "status": "pending",
-                "title": "Portfolio exit review", "job_id": research_job.job_id,
-                "summary": {"message": "Deep holding research is queued; no broad company calculation ran in Ask."}})
+            try:
+                research_job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.COMPANY_RESEARCH_BUILD,
+                    user_id=user_id, portfolio_id=str((active_portfolio or {}).get("id")) if (active_portfolio or {}).get("id") else None,
+                    payload=research_payload, input_fingerprint=research_fingerprint)
+                tool_results.append({"tool_name": "portfolio_exit_review", "status": "pending",
+                    "title": "Portfolio exit review", "job_id": research_job.job_id,
+                    "summary": {"message": "Deep holding research is queued; no broad company calculation ran in Ask."}})
+            except analytics_jobs.HeavyAnalyticsDisabledError as exc:
+                tool_results.append({"tool_name": "portfolio_exit_review", "status": "unavailable",
+                    "title": "Portfolio exit review", "summary": {"message": str(exc)}})
             exit_review_requested = False
     if exit_review_requested and active_portfolio and active_portfolio.get("holdings"):
         holdings = list(active_portfolio.get("holdings") or [])
@@ -4625,6 +4728,10 @@ def _execute_ask_tool(tool: str, user_id: str, question: str,
                     tools.append({"tool_name": f"{tool}_job", "status": job_status, "title": "Updated analysis status",
                                   "job_id": job.job_id, "job_kind": job.job_type.value,
                                   "summary": {"message": job_message}})
+            except analytics_jobs.HeavyAnalyticsDisabledError as exc:
+                disabled = {"tool_name": f"{tool}_job", "status": "unavailable",
+                            "title": "Heavy analytics unavailable", "summary": {"message": str(exc)}}
+                tools.append(with_canonical_result(disabled, adapt_legacy_tool_result(disabled, capability=tool)))
             except Exception as exc:
                 # The generated migration is intentionally not applied by this
                 # phase. A missing job table must not turn the existing safe
@@ -4691,10 +4798,15 @@ def _execute_ask_tool(tool: str, user_id: str, question: str,
         if completed and completed.result:
             canonical = completed.result
         else:
-            job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.BACKTEST, user_id=user_id,
-                                            portfolio_id=context.portfolio_id, payload=payload,
-                                            input_fingerprint=fingerprint)
-            canonical = analytics_jobs.pending_analysis(job, "portfolio_backtest")
+            try:
+                job = analytics_jobs.submit_job(job_type=analytics_jobs.JobType.BACKTEST, user_id=user_id,
+                                                portfolio_id=context.portfolio_id, payload=payload,
+                                                input_fingerprint=fingerprint)
+                canonical = analytics_jobs.pending_analysis(job, "portfolio_backtest")
+            except analytics_jobs.HeavyAnalyticsDisabledError as exc:
+                disabled = {"tool_name": tool, "status": "unavailable", "title": "Portfolio backtest",
+                            "summary": {"message": str(exc)}}
+                canonical = adapt_legacy_tool_result(disabled, capability=tool)
         status = canonical.status.value.lower()
         return [with_canonical_result({"tool_name": tool, "status": status, "title": "Portfolio backtest",
                  "job_id": canonical.job.id if canonical.job else None,

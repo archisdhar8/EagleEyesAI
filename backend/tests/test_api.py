@@ -8,7 +8,7 @@ from backend import ask_portfolio, database, read_models
 from backend.ask_runtime import build_portfolio_context
 from backend.main import (
     _benchmark_outlook_chat_tools, _chat_narration_fallback, _company_research_chat_tools, _conversation_summary, _deterministic_chat_answer,
-    _interactive_performance_chat_tool,
+    _interactive_performance_chat_tool, _execute_ask_tool,
     _cors_allowed_origins, _cors_allow_origin_regex, _decision_workspace_inputs, _execute_chat_plan_tools, _portfolio_chat_tools, _portfolio_risk_chat_tools,
     _resolve_chat_tickers, _security_ranking_chat_tools, app,
 )
@@ -550,6 +550,59 @@ def test_portfolio_import_invalidates_inputs_and_queues_lightweight_read_models(
     assert response.status_code == 200
     assert invalidations and invalidations[0][0][1] == "portfolio_holdings"
     assert rebuilds and rebuilds[0][0][2] == "PORTFOLIO_CHANGE"
+
+
+@pytest.mark.parametrize("method,path_suffix", [("get", ""), ("post", "/recalculate")])
+def test_owner_mode_portfolio_overview_uses_deterministic_path(monkeypatch, method, path_suffix) -> None:
+    monkeypatch.setenv("HEAVY_ANALYTICS_ENABLED", "0")
+    with TestClient(app) as client:
+        portfolio = client.post("/api/portfolios", json={
+            "name": "Owner fast path", "holdings": [{"ticker": "SPY", "weight": 1}],
+        }).json()
+        calls = []
+        monkeypatch.setattr("backend.main.database.latest_portfolio_health", lambda *_args: None)
+        monkeypatch.setattr("backend.main._calculate_portfolio_overview",
+                            lambda user_id, portfolio_id, trigger: calls.append((user_id, portfolio_id, trigger)) or {"status": "current"})
+        monkeypatch.setattr("backend.main._queue_portfolio_overview_rebuild",
+                            lambda *_args: pytest.fail("owner-mode overview must not enqueue a heavy job"))
+        response = getattr(client, method)(f"/api/portfolios/{portfolio['id']}/overview{path_suffix}")
+    assert response.status_code == 200
+    assert response.json() == {"status": "current"}
+    assert calls and calls[0][2] == "MANUAL"
+
+
+def test_owner_mode_deep_research_is_unavailable_not_failed(monkeypatch) -> None:
+    monkeypatch.setenv("HEAVY_ANALYTICS_ENABLED", "0")
+    monkeypatch.setattr("backend.main._resolve_chat_tickers", lambda _question: ["AAPL"])
+    monkeypatch.setattr("backend.main.database.security_data", lambda *_args, **_kwargs: {"securities": []})
+    monkeypatch.setattr("backend.main.analytics_jobs.compatible_completed", lambda **_kwargs: None)
+    tools, _ = _company_research_chat_tools("Deep research on AAPL", "user-1")
+    assert tools[0]["status"] == "unavailable"
+    assert tools[0]["analysis_result"]["status"] == "UNAVAILABLE"
+    assert "owner self-test mode" in tools[0]["summary"]["message"]
+
+
+def test_owner_mode_backtest_is_unavailable_not_failed(monkeypatch) -> None:
+    monkeypatch.setenv("HEAVY_ANALYTICS_ENABLED", "0")
+    monkeypatch.setattr("backend.main.analytics_jobs.compatible_completed", lambda **_kwargs: None)
+    context = build_portfolio_context({"id": "portfolio-1", "holdings": [{"ticker": "AAPL", "weight": 1.0}]})
+    tools, _ = _execute_ask_tool("portfolio_backtest", "user-1", "Backtest this for five years", context=context)
+    assert tools[0]["status"] == "unavailable"
+    assert tools[0]["analysis_result"]["status"] == "UNAVAILABLE"
+    assert "owner self-test mode" in tools[0]["summary"]["message"]
+
+
+@pytest.mark.parametrize("tool", ["portfolio_scenario", "portfolio_analysis"])
+def test_owner_mode_simulation_and_optimizer_are_unavailable_not_failed(monkeypatch, tool) -> None:
+    monkeypatch.setenv("HEAVY_ANALYTICS_ENABLED", "0")
+    monkeypatch.setattr("backend.main.ask_portfolio.run",
+                        lambda *_args, **_kwargs: ([{"tool_name": tool, "status": "unavailable", "summary": {}}], []))
+    context = build_portfolio_context({"id": "portfolio-1", "holdings": [{"ticker": "AAPL", "weight": 1.0}]})
+    tools, _ = _execute_ask_tool(tool, "user-1", "Stress my portfolio" if tool == "portfolio_scenario" else "Optimize my portfolio",
+                                 context=context)
+    assert any(row["status"] == "unavailable" and "owner self-test mode" in row.get("summary", {}).get("message", "")
+               for row in tools)
+    assert all(row["status"] != "failed" for row in tools)
 
 
 def test_users_can_keep_and_reopen_multiple_saved_portfolios() -> None:

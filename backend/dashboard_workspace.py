@@ -1466,8 +1466,14 @@ def unsupported_evidence_feedback(prompt: str, issues: list[str]) -> str:
     ])
 
 
-JOB_EXECUTOR=ThreadPoolExecutor(max_workers=4,thread_name_prefix="dashboard-job")
-TASK_EXECUTOR=ThreadPoolExecutor(max_workers=8,thread_name_prefix="dashboard-task")
+JOB_EXECUTOR=ThreadPoolExecutor(
+    max_workers=max(1,min(4,int(os.getenv("DASHBOARD_JOB_WORKERS","2")))),
+    thread_name_prefix="dashboard-job",
+)
+TASK_EXECUTOR=ThreadPoolExecutor(
+    max_workers=max(1,min(8,int(os.getenv("DASHBOARD_TASK_WORKERS","3")))),
+    thread_name_prefix="dashboard-task",
+)
 ACTIVE_JOBS: dict[str,Future[Any]]={}
 ACTIVE_LOCK=threading.Lock()
 TASK_RETRY_POLICY=RetryPolicy(attempts=max(1,min(3,int(os.getenv("DASHBOARD_TASK_MAX_ATTEMPTS","2")))))
@@ -1509,7 +1515,13 @@ def submit_dashboard_job(job: dict[str, Any], user_id: str) -> None:
     with ACTIVE_LOCK:
         existing=ACTIVE_JOBS.get(job["id"])
         if existing and not existing.done(): return
-        ACTIVE_JOBS[job["id"]]=JOB_EXECUTOR.submit(run_dashboard_job,job["id"],user_id)
+        future=JOB_EXECUTOR.submit(run_dashboard_job,job["id"],user_id)
+        ACTIVE_JOBS[job["id"]]=future
+    def release(completed: Future[Any], *, job_id: str = job["id"]) -> None:
+        with ACTIVE_LOCK:
+            if ACTIVE_JOBS.get(job_id) is completed:
+                ACTIVE_JOBS.pop(job_id, None)
+    future.add_done_callback(release)
 
 
 def run_dashboard_job(job_id: str, user_id: str) -> None:

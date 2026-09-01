@@ -66,6 +66,20 @@ def test_heavy_analytics_feature_flag_fails_closed(job_db, monkeypatch):
         assert conn.execute("SELECT COUNT(*) FROM analytical_jobs").fetchone()[0] == 0
 
 
+def test_owner_mode_reports_intentional_unavailability(monkeypatch):
+    monkeypatch.setenv("HEAVY_ANALYTICS_ENABLED", "0")
+    reason = analytics_jobs.disabled_reason(analytics_jobs.JobType.BACKTEST)
+    assert reason is not None
+    assert "intentionally disabled in owner self-test mode" in reason
+    assert "deterministic evidence is still shown" in reason
+
+
+def test_enabled_job_has_no_disabled_reason(monkeypatch):
+    monkeypatch.setenv("HEAVY_ANALYTICS_ENABLED", "1")
+    monkeypatch.setenv("BACKTESTING_ENABLED", "1")
+    assert analytics_jobs.disabled_reason(analytics_jobs.JobType.BACKTEST) is None
+
+
 @pytest.mark.parametrize(
     "job_type,flag",
     [

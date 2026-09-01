@@ -137,10 +137,30 @@ def main() -> int:
                 assert health["status"] == "healthy" and health.get("worker_heartbeat_age_seconds") is not None
                 report["worker"] = health
             else:
+                for name, response in (
+                    ("portfolio_overview", client.get(f"/api/portfolios/{args.portfolio_id}/overview")),
+                    ("portfolio_overview_recalculate", client.post(f"/api/portfolios/{args.portfolio_id}/overview/recalculate")),
+                ):
+                    response.raise_for_status()
+                    payload = response.json()
+                    assert not find_values(payload, "job_id"), f"{name} incorrectly created a heavy job"
+                    report["cases"].append({"name": name, "status": "pass"})
+                heavy = client.post("/api/chat/messages", json={
+                    "question": "Run a five-year backtest of this portfolio against SPY.",
+                    "conversation_id": conversation_id,
+                    "workspace": "portfolio",
+                    "page_context": {"workspace": "portfolio", "portfolio_id": args.portfolio_id},
+                    "request_id": f"production-smoke:disabled-heavy:{uuid.uuid4()}",
+                })
+                heavy.raise_for_status()
+                heavy_payload = heavy.json()
+                assert not [value for value in find_values(heavy_payload, "job_id") if value]
+                statuses = [str(value).upper() for value in find_values(heavy_payload, "status")]
+                assert "UNAVAILABLE" in statuses and "FAILED" not in statuses and "PENDING" not in statuses, statuses
                 report["cases"].append({
                     "name": "heavy_jobs_disabled_by_topology",
                     "status": "pass",
-                    "note": "Durable worker assertions are intentionally excluded from the owner self-test gate.",
+                    "note": "The heavy request returned intentional UNAVAILABLE without creating a durable job.",
                 })
         finally:
             if not args.keep_test_data:

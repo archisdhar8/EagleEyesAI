@@ -1,3 +1,5 @@
+from concurrent.futures import Future
+
 import pytest
 import numpy as np
 import pandas as pd
@@ -9,8 +11,21 @@ from backend.dashboard_workspace import (
     review_dashboard_answer, run_dashboard_job, validate_dag,
     verify_required_evidence, verify_widget_result,
 )
-from backend import database
+from backend import dashboard_workspace, database
 from backend.main import app
+
+
+def test_completed_dashboard_future_is_removed_from_active_registry(monkeypatch) -> None:
+    class ImmediateExecutor:
+        def submit(self, *_args, **_kwargs):
+            future = Future()
+            future.set_result(None)
+            return future
+
+    monkeypatch.setattr(dashboard_workspace, "JOB_EXECUTOR", ImmediateExecutor())
+    dashboard_workspace.ACTIVE_JOBS.clear()
+    dashboard_workspace.submit_dashboard_job({"id": "job-finished"}, "user-1")
+    assert dashboard_workspace.ACTIVE_JOBS == {}
 
 
 def test_planner_returns_typed_goal_relevant_widget_plan() -> None:

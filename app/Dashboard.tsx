@@ -113,6 +113,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
   const [dashboardBusy, setDashboardBusy] = useState(false);
   const [dashboardSourceConversationId,setDashboardSourceConversationId]=useState<string|null>(null);
   const dashboardStreamController=useRef<AbortController|null>(null);
+  const researchChatRequestController=useRef<AbortController|null>(null);
   const researchDetailController=useRef<AbortController|null>(null);
   const researchDetailTicker=useRef("");
   const [researchChatMessages, setResearchChatMessages] = useState<ChatMessage[]>([]);
@@ -905,8 +906,19 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     dashboardStreamController.current?.abort();dashboardStreamController.current=null;
     recordFrontendBudget({route:"ask.dashboard",active_streams:0});
   },[]);
+  const stopCanvasRequest=useCallback((abortOwnedRequest:boolean)=>{
+    stopDashboardStream();
+    if(!abortOwnedRequest)return;
+    researchChatRequestController.current?.abort();
+    researchChatRequestController.current=null;
+    setResearchChatBusy(false);
+  },[stopDashboardStream]);
   useEffect(()=>{if(tab!=="ask")stopDashboardStream();return stopDashboardStream;},[tab,stopDashboardStream]);
-  useEffect(()=>{window.addEventListener("eagleeyes:canvas-closed",stopDashboardStream);return()=>window.removeEventListener("eagleeyes:canvas-closed",stopDashboardStream);},[stopDashboardStream]);
+  useEffect(()=>{
+    const onCanvasClosed=(event:Event)=>stopCanvasRequest(Boolean((event as CustomEvent<{abortOwnedRequest?:boolean}>).detail?.abortOwnedRequest));
+    window.addEventListener("eagleeyes:canvas-closed",onCanvasClosed);
+    return()=>window.removeEventListener("eagleeyes:canvas-closed",onCanvasClosed);
+  },[stopCanvasRequest]);
 
   async function createAIDashboard(prompt = dashboardPrompt) {
     if (!prompt.trim() || dashboardBusy) return;
@@ -1028,6 +1040,8 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
     setResearchChatMessages(items => [...items, userMessage]);
     setResearchChatQuestion("");
     setResearchChatBusy(true);
+    const requestController=new AbortController();
+    researchChatRequestController.current=requestController;
     const requestId=crypto.randomUUID();
     const dispatchStarted=performance.now();
     try {
@@ -1041,6 +1055,7 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       const response = await apiRequest("/chat/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: requestController.signal,
         body: JSON.stringify({ request_id:requestId,question: cleanQuestion, conversation_id: researchConversationId, workspace: "research", page_context:{route:currentUrl.pathname,workspace:tab==="ask"?"ask":"research",entity_type:contextTicker?"security":undefined,ticker:contextTicker,portfolio_id:portfolioId?String(portfolioId):undefined,research_section:researchSection,research_capabilities:researchCapabilities,dashboard_resource_type:dashboardResourceType,dashboard_resource_id:dashboardResourceId,enabled_context:askEnabledContext} }),
       });
       const responseReceived=performance.now();
@@ -1087,9 +1102,13 @@ export default function Dashboard({ accessToken, email, onSignOut }: { accessTok
       void refreshConversationList("research");
       if(data.conversation_id)void refreshConversationArtifacts("research",data.conversation_id);
     } catch (error) {
+      if(error instanceof DOMException&&error.name==="AbortError")return;
       setResearchChatMessages(items => [...items, { role: "assistant", content: error instanceof Error ? error.message : "The research answer is temporarily unavailable." }]);
     } finally {
-      setResearchChatBusy(false);
+      if(researchChatRequestController.current===requestController){
+        researchChatRequestController.current=null;
+        setResearchChatBusy(false);
+      }
     }
   }
 

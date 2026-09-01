@@ -52,6 +52,14 @@ class JobType(StrEnum):
     THESIS_MONITOR = "THESIS_MONITOR"
 
 
+JOB_FLAGS = {
+    JobType.SIMULATION: "SIMULATION_ENABLED",
+    JobType.OPTIMIZATION: "OPTIMIZER_ENABLED",
+    JobType.BACKTEST: "BACKTESTING_ENABLED",
+    JobType.COMPANY_RESEARCH_BUILD: "DEEP_COMPANY_RESEARCH_ENABLED",
+}
+
+
 TERMINAL = {JobStatus.SUCCESS, JobStatus.PARTIAL, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.EXPIRED}
 CALCULATION_VERSIONS = {
     JobType.SIMULATION: "portfolio-simulation-job-v1",
@@ -198,21 +206,27 @@ def deduplication_key(job_type: JobType | str, input_fingerprint: str, calculati
                                "calculation_version": calculation_version})
 
 
+def disabled_reason(job_type: JobType) -> str | None:
+    """Return the configured unavailability reason without touching the job store."""
+    if os.getenv("HEAVY_ANALYTICS_ENABLED", "1").strip().lower() in {"0", "false", "off", "no"}:
+        return (
+            "This heavy calculation is intentionally disabled in owner self-test mode because "
+            "no durable analytics worker is provisioned. Available deterministic evidence is still shown."
+        )
+    job_flag = JOB_FLAGS.get(job_type)
+    if job_flag and os.getenv(job_flag, "1").strip().lower() in {"0", "false", "off", "no"}:
+        label = job_type.value.replace("_", " ").title()
+        return f"{label} is intentionally disabled by the current production capability configuration."
+    return None
+
+
 def submit_job(*, job_type: JobType, user_id: str, payload: dict[str, Any], portfolio_id: str | None = None,
                request_id: str | None = None, input_fingerprint: str | None = None,
                calculation_version: str | None = None, max_retries: int = 2,
                expires_at: datetime | None = None) -> AnalyticsJob:
-    if os.getenv("HEAVY_ANALYTICS_ENABLED", "1").strip().lower() in {"0", "false", "off", "no"}:
-        raise HeavyAnalyticsDisabledError("Heavy analytics are temporarily unavailable")
-    job_flag = {
-        JobType.SIMULATION: "SIMULATION_ENABLED",
-        JobType.OPTIMIZATION: "OPTIMIZER_ENABLED",
-        JobType.BACKTEST: "BACKTESTING_ENABLED",
-        JobType.COMPANY_RESEARCH_BUILD: "DEEP_COMPANY_RESEARCH_ENABLED",
-    }.get(job_type)
-    if job_flag and os.getenv(job_flag, "1").strip().lower() in {"0", "false", "off", "no"}:
-        label = job_type.value.replace("_", " ").title()
-        raise HeavyAnalyticsDisabledError(f"{label} is temporarily unavailable")
+    reason = disabled_reason(job_type)
+    if reason:
+        raise HeavyAnalyticsDisabledError(reason)
     calculation = calculation_version or CALCULATION_VERSIONS[job_type]
     fingerprint = input_fingerprint or stable_fingerprint(payload)
     key = deduplication_key(job_type, fingerprint, calculation)

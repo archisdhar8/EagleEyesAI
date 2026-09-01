@@ -51,3 +51,9 @@ def test_ttl_cache_expires_disposable_results() -> None:
     assert cache.get("answer") == {"ok": True}
     time.sleep(.02)
     assert cache.get("answer") is None
+
+
+def test_ttl_cache_stats_exposes_only_bounded_counts() -> None:
+    cache = TTLCache(max_entries=2)
+    cache.put("answer", {"private": "content"}, ttl_seconds=60)
+    assert cache.stats() == {"entries": 1, "max_entries": 2}
